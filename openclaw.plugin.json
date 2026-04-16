@@ -1,0 +1,23 @@
+{
+  "id": "8080",
+  "name": "8080.ai",
+  "description": "Integrates the 8080.ai AI software development platform into OpenClaw.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "siteUrl": {
+        "type": "string",
+        "description": "Override the 8080.ai website URL (used for browser login). Default: https://8080.ai/"
+      },
+      "apiBaseUrl": {
+        "type": "string",
+        "description": "Override the 8080.ai API base URL. Default: https://api.8080.ai/api/v1"
+      },
+      "pollingTimeoutMs": {
+        "type": "number",
+        "description": "Max milliseconds to poll project status before giving up. Default: 600000 (10 min)"
+      }
+    }
+  }
+}
