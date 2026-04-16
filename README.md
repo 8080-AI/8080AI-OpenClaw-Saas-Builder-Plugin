@@ -1,0 +1,1 @@
+# mostlyagent2-openclaw-plugin
