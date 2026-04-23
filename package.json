@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0",
+    "eventsource-parser": "^3.0.8",
     "open": "^10.1.0",
     "openclaw": ">=2026.3.0"
   },

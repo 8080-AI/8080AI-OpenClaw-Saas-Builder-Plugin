@@ -3,6 +3,7 @@
 //
 // Base URL: https://api.8080.ai/api/v1 (paths below are relative to this).
 // ---------------------------------------------------------------------------
+import { createParser } from "eventsource-parser";
 
 export class ApiError extends Error {
   constructor(
@@ -55,13 +56,26 @@ export type ProjectPhase =
   | "complete"
   | "failed";
 
+export type BuildStep = {
+  name: string;
+  status: "pending" | "in_progress" | "completed" | "failed" | string;
+};
+
 export type ProjectStatus = {
   id: string;
   phase: ProjectPhase;
+  status?: string;
+  title?: string;
   activeAgent?: string;
   agentMessage?: string;
   requirementDocUrl?: string;
   error?: string;
+  // Build step tracking
+  current_step?: string;
+  steps?: BuildStep[];
+  progress?: number;
+  // Raw fields that might come from API
+  [key: string]: unknown;
 };
 
 type ClientOpts = {
@@ -100,6 +114,10 @@ async function apiFetch(
   const data = text ? JSON.parse(text) : null;
   if (path === "/projects/") {
     console.log("[8080.ai API] /projects/ response sample:", JSON.stringify(data?.[0] ?? "null"));
+  }
+  // Debug log for project detail calls
+  if (path.match(/^\/projects\/[^/]+$/) && path !== "/projects/") {
+    console.log("[8080.ai API] Project detail response:", JSON.stringify(data, null, 2));
   }
   return data;
 }
@@ -148,9 +166,103 @@ export function createApiClient(opts: ClientOpts) {
       return { projectId: res.project_id };
     },
 
+    async streamProjectCreation(
+      requirements: string,
+      onToken: (text: string) => void,
+      onRaw?: (raw: string) => void
+    ): Promise<{ projectId: string }> {
+      // 1. Create the project first to get the ID
+      const initRes = (await post("/chat/messages", {
+        content: requirements,
+        plan_auto: true,
+      })) as { project_id: string };
+      
+      const projectId = initRes.project_id;
+
+      // 2. Start the stream using the returned project ID
+      const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/chat/messages/ai/stream-trigger`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${opts.token}`,
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify({
+          project_id: projectId
+        }),
+      });
+
+      if (res.status === 401) throw new AuthError();
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try {
+          msg += `: ${await res.text()}`;
+        } catch {}
+        throw new ApiError(res.status, msg);
+      }
+      
+      console.log(`[8080.ai] Stream connection established for project: ${projectId}`);
+
+      if (!res.body) {
+        throw new Error("No response body in stream");
+      }
+
+      const body = res.body;
+
+      return new Promise((resolve, reject) => {
+        const parser = createParser({
+          onEvent: (event) => {
+            if (onRaw) onRaw(event.data);
+            try {
+              const data = JSON.parse(event.data);
+              if (data.type === "token" && data.content) {
+                onToken(data.content);
+              }
+            } catch (err) {
+              // ignore unparseable chunks
+            }
+          }
+        });
+
+        const reader = body.getReader();
+        const decoder = new TextDecoder("utf-8");
+
+        function pump() {
+          reader.read().then(({ done, value }) => {
+            if (done) {
+              resolve({ projectId });
+              return;
+            }
+            if (value) {
+              parser.feed(decoder.decode(value, { stream: true }));
+            }
+            pump();
+          }).catch(reject);
+        }
+        pump();
+      });
+    },
+
     // 8080.ai uses /projects/{id} (no slash) for detail
     async getProjectStatus(projectId: string): Promise<ProjectStatus> {
-      return get(`/projects/${projectId}`) as Promise<ProjectStatus>;
+      const raw = await get(`/projects/${projectId}`) as Record<string, unknown>;
+      // Spread ALL raw fields so nothing is lost, then overlay our typed aliases
+      const status: ProjectStatus = {
+        ...raw,                               // preserve every field from API
+        id: (raw.id as string) ?? projectId,
+        phase: (raw.phase ?? raw.status ?? "unknown") as ProjectPhase,
+        status: raw.status as string | undefined,
+        title: (raw.title ?? raw.name ?? raw.project_name) as string | undefined,
+        activeAgent: (raw.activeAgent ?? raw.active_agent) as string | undefined,
+        agentMessage: (raw.agentMessage ?? raw.agent_message) as string | undefined,
+        requirementDocUrl: (raw.requirementDocUrl ?? raw.requirement_doc_url) as string | undefined,
+        error: raw.error as string | undefined,
+        current_step: (raw.current_step ?? raw.currentStep ?? raw.step) as string | undefined,
+        steps: raw.steps as BuildStep[] | undefined,
+        progress: raw.progress as number | undefined,
+      };
+      return status;
     },
 
     // 8080.ai uses /projects/{id}/build (no slash) to start/continue building

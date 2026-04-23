@@ -1,6 +1,6 @@
 import open from "open";
 import { writeToken, clearToken, requireToken, AuthRequiredError } from "./auth.ts";
-import { AuthError, createApiClient } from "./api-client.ts";
+import { AuthError, createApiClient, type BuildStep } from "./api-client.ts";
 import { readActiveProject, writeActiveProject } from "./project-state.ts";
 import { readActiveModel, writeActiveModel, MODEL_OPTIONS } from "./model-state.ts";
 
@@ -57,10 +57,26 @@ export function create8080Command(
 
           try {
             const client = createApiClient({ token, apiBaseUrl });
-            const result = await client.createProject(requirements);
+            let accumulatedText = "";
+            let rawLog = "";
+            console.log("[8080.ai] Initializing project and connecting to stream...");
+            const result = await client.streamProjectCreation(
+              requirements,
+              (text) => {
+                accumulatedText += text;
+              },
+              (raw) => {
+                rawLog += `data: ${raw}\n\n`;
+              }
+            );
+            
+            const streamDisplay = accumulatedText ? `\n\n**Tech Lead:**\n${accumulatedText}` : "";
+            const rawDisplay = rawLog ? `\n\n---\n**Raw Network Stream:**\n\`\`\`text\n${rawLog.slice(0, 500)}${rawLog.length > 500 ? "..." : ""}\n\`\`\`` : "";
+            
             return {
               text:
-                `🚀 Project created on 8080.ai!\n\n` +
+                `✅ **Stream connection established**\n` +
+                `🚀 Project created on 8080.ai!${streamDisplay}${rawDisplay}\n\n` +
                 `Project ID: ${result.projectId}\n\n` +
                 `The 8080.ai agents are now working on your requirements. ` +
                 `Run \`/ai8080 status ${result.projectId}\` to check progress.`,
@@ -284,14 +300,71 @@ export function create8080Command(
           try {
             const client = createApiClient({ token, apiBaseUrl });
             const s = await client.getProjectStatus(projectId);
-            const lines = [
-              `Project: ${projectId}`,
-              `Phase:   ${s.phase}`,
+
+            // --- Build the step progress display ---
+            const KNOWN_STEPS = [
+              { key: "ai-overview",   label: "AI Overview" },
+              { key: "requirements",  label: "Requirements" },
+              { key: "design",        label: "Design" },
+              { key: "architecture",  label: "Architecture" },
+              { key: "implementation",label: "Implementation" },
+              { key: "testing",       label: "Testing" },
+              { key: "deployment",    label: "Deployment" },
             ];
-            if (s.activeAgent) lines.push(`Agent:   ${s.activeAgent}`);
-            if (s.agentMessage) lines.push(`Status:  ${s.agentMessage}`);
-            if (s.requirementDocUrl) lines.push(`Req Doc: ${s.requirementDocUrl}`);
-            if (s.error) lines.push(`Error:   ${s.error}`);
+
+            const lines: string[] = [];
+            lines.push(`### 📊 Project Status`);
+            if (s.title) lines.push(`**Project:** ${s.title}`);
+            lines.push(`**ID:** ${projectId}`);
+            lines.push(`**Phase:** ${s.phase ?? s.status ?? "unknown"}`);
+            if (s.activeAgent) lines.push(`**Agent:** ${s.activeAgent}`);
+            if (s.agentMessage) lines.push(`**Message:** ${s.agentMessage}`);
+            if (s.progress !== undefined) lines.push(`**Progress:** ${s.progress}%`);
+
+            // Show steps if available from the API
+            if (s.steps && Array.isArray(s.steps) && s.steps.length > 0) {
+              lines.push("");
+              lines.push("**Build Steps:**");
+              for (const step of s.steps) {
+                const icon =
+                  step.status === "completed" ? "✅" :
+                  step.status === "in_progress" ? "🔄" :
+                  step.status === "failed" ? "❌" : "⏳";
+                lines.push(`  ${icon} ${step.name}`);
+              }
+            }
+            // If we have current_step but no steps array, show it inline
+            else if (s.current_step) {
+              lines.push("");
+              lines.push("**Build Steps:**");
+              let foundCurrent = false;
+              for (const known of KNOWN_STEPS) {
+                if (foundCurrent) {
+                  lines.push(`  ⏳ ${known.label}`);
+                } else if (known.key === s.current_step || known.label.toLowerCase() === s.current_step.toLowerCase()) {
+                  lines.push(`  🔄 ${known.label}  ← current`);
+                  foundCurrent = true;
+                } else {
+                  lines.push(`  ✅ ${known.label}`);
+                }
+              }
+              // If current_step didn't match any known step, show it anyway
+              if (!foundCurrent) {
+                lines.push(`  🔄 ${s.current_step}  ← current`);
+              }
+            }
+
+            if (s.requirementDocUrl) lines.push(`\n**Req Doc:** ${s.requirementDocUrl}`);
+            if (s.error) lines.push(`\n❌ **Error:** ${s.error}`);
+
+            // Dump the FULL raw API response for field discovery
+            lines.push("");
+            lines.push("---");
+            lines.push("**Raw API Response (for debugging):**");
+            lines.push("```json");
+            lines.push(JSON.stringify(s, null, 2));
+            lines.push("```");
+
             return { text: lines.join("\n") };
           } catch (err) {
             if (err instanceof AuthError) return { text: (err as Error).message };

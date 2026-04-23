@@ -42,14 +42,46 @@ export function createProjectStatusTool(deps: {
       try {
         const status = await client.getProjectStatus(params.projectId);
         const lines = [
-          `Project: ${params.projectId}`,
-          `Phase:   ${status.phase}`,
+          `### 📊 Project Status`,
         ];
-        if (status.activeAgent) lines.push(`Agent:   ${status.activeAgent}`);
-        if (status.agentMessage) lines.push(`Status:  ${status.agentMessage}`);
+        if (status.title) lines.push(`**Project:** ${status.title}`);
+        lines.push(`**ID:** ${params.projectId}`);
+        lines.push(`**Phase:** ${status.phase ?? status.status ?? "unknown"}`);
+        if (status.activeAgent) lines.push(`**Agent:** ${status.activeAgent}`);
+        if (status.agentMessage) lines.push(`**Message:** ${status.agentMessage}`);
+        if (status.progress !== undefined) lines.push(`**Progress:** ${status.progress}%`);
+
+        // Show steps if available
+        if (status.steps && Array.isArray(status.steps) && status.steps.length > 0) {
+          lines.push("");
+          lines.push("**Build Steps:**");
+          for (const step of status.steps) {
+            const icon =
+              step.status === "completed" ? "✅" :
+              step.status === "in_progress" ? "🔄" :
+              step.status === "failed" ? "❌" : "⏳";
+            lines.push(`  ${icon} ${step.name}`);
+          }
+        } else if (status.current_step) {
+          lines.push("");
+          lines.push(`**Current Step:** 🔄 ${status.current_step}`);
+        }
+
         if (status.requirementDocUrl)
-          lines.push(`Req Doc: ${status.requirementDocUrl}`);
-        if (status.error) lines.push(`Error:   ${status.error}`);
+          lines.push(`\n**Req Doc:** ${status.requirementDocUrl}`);
+        if (status.error) lines.push(`\n❌ **Error:** ${status.error}`);
+
+        // Show extra fields from API for discovery
+        const knownKeys = new Set(["id", "phase", "status", "title", "activeAgent", "agentMessage", "requirementDocUrl", "error", "current_step", "steps", "progress"]);
+        const extraKeys = Object.keys(status).filter(k => !knownKeys.has(k) && status[k] !== undefined && status[k] !== null);
+        if (extraKeys.length > 0) {
+          lines.push("");
+          lines.push("**Other fields:**");
+          for (const k of extraKeys) {
+            const val = typeof status[k] === "object" ? JSON.stringify(status[k]) : String(status[k]);
+            lines.push(`  ${k}: ${val.length > 100 ? val.slice(0, 100) + "…" : val}`);
+          }
+        }
 
         return { content: [{ type: "text", text: lines.join("\n") }] };
       } catch (err) {

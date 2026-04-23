@@ -64,8 +64,23 @@ export function createStartProjectTool(deps: {
 
       // --- Create project ---
       let projectId: string;
+      let accumulatedText = "";
+
       try {
-        const result = await client.createProject(params.requirements);
+        const result = await client.streamProjectCreation(
+          params.requirements,
+          (text) => {
+            accumulatedText += text;
+            onUpdate?.({
+              content: [
+                {
+                  type: "text",
+                  text: `[8080.ai] ${accumulatedText}`,
+                },
+              ],
+            });
+          }
+        );
         projectId = result.projectId;
       } catch (err) {
         if (err instanceof AuthError) {
@@ -77,11 +92,15 @@ export function createStartProjectTool(deps: {
         };
       }
 
+      const streamCompleteText = accumulatedText
+        ? `[8080.ai] ${accumulatedText}\n\n`
+        : "";
+
       onUpdate?.({
         content: [
           {
             type: "text",
-            text: `[8080.ai] Project created (ID: ${projectId}). Starting agents…`,
+            text: `${streamCompleteText}[8080.ai] Project created (ID: ${projectId}). Transitioning to build phase…`,
           },
         ],
       });
@@ -112,7 +131,7 @@ export function createStartProjectTool(deps: {
 
         if (msg !== lastMessage) {
           onUpdate?.({
-            content: [{ type: "text", text: `[8080.ai] ${msg}` }],
+            content: [{ type: "text", text: `${streamCompleteText}[8080.ai] ${msg}` }],
           });
           lastMessage = msg;
         }
