@@ -2,6 +2,8 @@ import open from "open";
 import { writeToken, clearToken, requireToken, AuthRequiredError } from "./auth.ts";
 import { AuthError, createApiClient, type BuildStep } from "./api-client.ts";
 import { readActiveProject, writeActiveProject } from "./project-state.ts";
+import { buildSuggestedAgentsText } from "./review-continue.ts";
+import { writeLatestSuggestions, readLatestSuggestions } from "./suggestions-state.ts";
 import { readActiveModel, writeActiveModel, MODEL_OPTIONS } from "./model-state.ts";
 
 const HELP_TEXT = `8080.ai plugin commands:
@@ -18,8 +20,14 @@ const HELP_TEXT = `8080.ai plugin commands:
   /ai8080 status [projectId]     Show status of the active (or specified) project
   /ai8080 review [projectId]     Open requirement document for the project
   /ai8080 continue [projectId]   Proceed past requirement review
+  /ai8080 message <text>         Send follow-up message to the AI (uses active project)
+  /ai8080 select-button <number> Trigger suggested agents by their number
 
 To build a project with 8080.ai, you can also just ask: "Use 8080.ai to build a todo app"`;
+
+function generateSessionId(): string {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+}
 
 export function create8080Command(
   api: {
@@ -28,6 +36,7 @@ export function create8080Command(
   urls: { siteUrl: string; apiBaseUrl: string }
 ) {
   const { siteUrl, apiBaseUrl } = urls;
+  const sessionId = generateSessionId();
 
   return {
     name: "ai8080",
@@ -57,29 +66,48 @@ export function create8080Command(
 
           try {
             const client = createApiClient({ token, apiBaseUrl });
-            let accumulatedText = "";
-            let rawLog = "";
-            console.log("[8080.ai] Initializing project and connecting to stream...");
+            
+            const activeModel = await readActiveModel(stateDir);
+            let responseText = "";
+            let suggestedAgents: string[] = [];
+
+            // Call chat/messages API to create project and stream initial thoughts
             const result = await client.streamProjectCreation(
               requirements,
-              (text) => {
-                accumulatedText += text;
+              (token) => {
+                responseText += token;
               },
-              (raw) => {
-                rawLog += `data: ${raw}\n\n`;
-              }
+              undefined,
+              (agents) => {
+                suggestedAgents.push(...agents);
+              },
+              { model: activeModel }
             );
             
-            const streamDisplay = accumulatedText ? `\n\n**Tech Lead:**\n${accumulatedText}` : "";
-            const rawDisplay = rawLog ? `\n\n---\n**Raw Network Stream:**\n\`\`\`text\n${rawLog.slice(0, 500)}${rawLog.length > 500 ? "..." : ""}\n\`\`\`` : "";
+            const projectId = result.projectId;
             
+            // Store project_id in session state
+            await writeActiveProject(stateDir, projectId, sessionId);
+            
+            if (suggestedAgents.length > 0) {
+              await writeLatestSuggestions(stateDir, sessionId, {
+                projectId,
+                agents: suggestedAgents,
+                messageId: "", // streamProjectCreation doesn't always have a msgId, but triggerAgents needs one. 8080 seems to allow empty or placeholder for initial.
+              });
+            }
+
+            const agentList = suggestedAgents.length > 0 
+              ? buildSuggestedAgentsText(suggestedAgents)
+              : "";
+
             return {
               text:
-                `✅ **Stream connection established**\n` +
-                `🚀 Project created on 8080.ai!${streamDisplay}${rawDisplay}\n\n` +
-                `Project ID: ${result.projectId}\n\n` +
-                `The 8080.ai agents are now working on your requirements. ` +
-                `Run \`/ai8080 status ${result.projectId}\` to check progress.`,
+                `✅ Project created on 8080.ai!\n\n` +
+                (responseText ? `**Tech Lead:**\n${responseText}\n\n` : "") +
+                `**Project ID:** ${projectId}\n\n` +
+                `The project has been set as active for this session. ` +
+                `Run \`/ai8080 status\` to check progress.${agentList}`,
             };
           } catch (err) {
             if (err instanceof AuthError) return { text: (err as Error).message };
@@ -171,7 +199,7 @@ export function create8080Command(
             const projects = await client.listProjects();
             if (projects.length === 0) return { text: "No projects found." };
 
-            const activeProjectId = await readActiveProject(stateDir);
+            const activeProjectId = await readActiveProject(stateDir, sessionId);
 
             const lines = projects.map((p, i) => {
               const isActive = p.id === activeProjectId;
@@ -212,7 +240,7 @@ export function create8080Command(
 
             const num = parseInt(choice, 10);
             if (isNaN(num) || num < 1 || num > projects.length) {
-              const activeProjectId = await readActiveProject(stateDir);
+              const activeProjectId = await readActiveProject(stateDir, sessionId);
               const lines = projects.map((p, i) => {
                 const isActive = p.id === activeProjectId;
                 const marker = isActive ? "👉" : "  ";
@@ -227,7 +255,7 @@ export function create8080Command(
             }
 
             const selected = projects[num - 1];
-            await writeActiveProject(stateDir, selected.id);
+            await writeActiveProject(stateDir, selected.id, sessionId);
             return {
               text: `✅ Project \`${selected.title}\` is now active. (${selected.id})`,
             };
@@ -281,7 +309,7 @@ export function create8080Command(
         case "status": {
           let projectId = rest[0]?.trim();
           if (!projectId) {
-            projectId = (await readActiveProject(stateDir)) ?? "";
+            projectId = (await readActiveProject(stateDir, sessionId)) ?? "";
           }
 
           if (!projectId) {
@@ -377,7 +405,7 @@ export function create8080Command(
         case "review": {
           let projectId = rest[0]?.trim();
           if (!projectId) {
-            projectId = (await readActiveProject(stateDir)) ?? "";
+            projectId = (await readActiveProject(stateDir, sessionId)) ?? "";
           }
 
           if (!projectId) {
@@ -416,7 +444,7 @@ export function create8080Command(
         case "continue": {
           let projectId = rest[0]?.trim();
           if (!projectId) {
-            projectId = (await readActiveProject(stateDir)) ?? "";
+            projectId = (await readActiveProject(stateDir, sessionId)) ?? "";
           }
 
           if (!projectId) {
@@ -444,6 +472,109 @@ export function create8080Command(
             if (err instanceof AuthError) return { text: (err as Error).message };
             const msg = err instanceof Error ? err.message : String(err);
             return { text: `8080.ai error: ${msg}` };
+          }
+        }
+
+        // ------------------------------------------------------------------
+        case "message": {
+          const content = rest.join(" ").trim();
+          if (!content) {
+            return { text: "Usage: /ai8080 message <text>" };
+          }
+
+          let projectId = (await readActiveProject(stateDir, sessionId)) ?? "";
+          if (!projectId) {
+            return {
+              text: "No project active. Use `/ai8080 list` to select one or start a new project first.",
+            };
+          }
+
+          let token: string;
+          try {
+            token = await requireToken(stateDir);
+          } catch (err) {
+            if (err instanceof AuthRequiredError) return { text: err.message };
+            throw err;
+          }
+
+          try {
+            const client = createApiClient({ token, apiBaseUrl });
+            const activeModel = await readActiveModel(stateDir);
+            let responseText = "";
+            let suggestedAgents: string[] = [];
+            let lastMessageId = "";
+
+            await client.streamSendMessage(projectId, content, (token) => {
+              responseText += token;
+            }, {
+              model: activeModel,
+              onSuggestedAgents: (agents, msgId) => {
+                suggestedAgents.push(...agents);
+                lastMessageId = msgId;
+              }
+            });
+
+            if (suggestedAgents.length > 0) {
+              await writeLatestSuggestions(stateDir, sessionId, {
+                projectId,
+                agents: suggestedAgents,
+                messageId: lastMessageId
+              });
+            }
+
+            const agentList = suggestedAgents.length > 0 
+              ? buildSuggestedAgentsText(suggestedAgents)
+              : "";
+
+            return {
+              text: `🤖 **AI Response:**\n\n${responseText}${agentList}`,
+            };
+          } catch (err) {
+            if (err instanceof AuthError) return { text: (err as Error).message };
+            const msg = err instanceof Error ? err.message : String(err);
+            return { text: `8080.ai error: ${msg}` };
+          }
+        }
+
+        // ------------------------------------------------------------------
+        case "select-button": {
+          const choice = rest[0]?.trim();
+          if (!choice) {
+            return { text: "Usage: `/ai8080 select-button <number>`" };
+          }
+
+          const suggestions = await readLatestSuggestions(stateDir, sessionId);
+          if (!suggestions || suggestions.agents.length === 0) {
+            return { text: "No suggested agents found to select from." };
+          }
+
+          const num = parseInt(choice, 10);
+          if (isNaN(num) || num < 1 || num > suggestions.agents.length) {
+            return { text: `⚠️  "${choice}" is not valid. Pick a number between 1 and ${suggestions.agents.length}.` };
+          }
+
+          const selectedAgent = suggestions.agents[num - 1];
+
+          let token: string;
+          try {
+            token = await requireToken(stateDir);
+          } catch (err) {
+            if (err instanceof AuthRequiredError) return { text: err.message };
+            throw err;
+          }
+
+          try {
+            const client = createApiClient({ token, apiBaseUrl });
+            const activeModel = await readActiveModel(stateDir);
+            await client.triggerAgents(suggestions.projectId, [selectedAgent], suggestions.messageId, activeModel);
+            
+            return {
+              text: `✅ **${selectedAgent}** is now running (using **${activeModel}**) to build the project.`,
+            };
+          } catch (err) {
+            if (err instanceof AuthError) return { text: (err as Error).message };
+            const msg = err instanceof Error ? err.message : String(err);
+            return { text: `Failed to trigger agent: ${msg}` };
           }
         }
 

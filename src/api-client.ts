@@ -42,6 +42,18 @@ export type Subscription = {
   };
 };
 
+export const AGENT_DISPLAY_NAMES: Record<string, string> = {
+  'System Requirements Agent': '📋 Requirements',
+  'Design Agent': '🎨 Design',
+  'Project Manager': '📊 Tasks',
+  'System Architect Agent': '🏗️ Architecture',
+  'System Architect': '🏗️ Architecture',
+  'User Flow Planner Agent': '🔀 User Flows',
+  'User Flow Planner': '🔀 User Flows',
+  'plan_all': '🚀 Run Plan All',
+  'start_build': '🛠️ Start Building',
+};
+
 export type Project = {
   id: string;
   title: string;
@@ -169,14 +181,16 @@ export function createApiClient(opts: ClientOpts) {
     async streamProjectCreation(
       requirements: string,
       onToken: (text: string) => void,
-      onRaw?: (raw: string) => void
+      onRaw?: (raw: string) => void,
+      onAgents?: (agents: string[], messageId: string) => void,
+      options?: { model?: string }
     ): Promise<{ projectId: string }> {
       // 1. Create the project first to get the ID
       const initRes = (await post("/chat/messages", {
         content: requirements,
         plan_auto: true,
       })) as { project_id: string };
-      
+
       const projectId = initRes.project_id;
 
       // 2. Start the stream using the returned project ID
@@ -189,7 +203,8 @@ export function createApiClient(opts: ClientOpts) {
           Accept: "text/event-stream",
         },
         body: JSON.stringify({
-          project_id: projectId
+          project_id: projectId,
+          model: options?.model || "-"
         }),
       });
 
@@ -198,10 +213,10 @@ export function createApiClient(opts: ClientOpts) {
         let msg = `HTTP ${res.status}`;
         try {
           msg += `: ${await res.text()}`;
-        } catch {}
+        } catch { }
         throw new ApiError(res.status, msg);
       }
-      
+
       console.log(`[8080.ai] Stream connection established for project: ${projectId}`);
 
       if (!res.body) {
@@ -218,6 +233,8 @@ export function createApiClient(opts: ClientOpts) {
               const data = JSON.parse(event.data);
               if (data.type === "token" && data.content) {
                 onToken(data.content);
+              } else if (data.type === "suggested_agents" && data.agents && onAgents) {
+                onAgents(data.agents, data.message_id || "");
               }
             } catch (err) {
               // ignore unparseable chunks
@@ -269,6 +286,126 @@ export function createApiClient(opts: ClientOpts) {
     async continueProject(projectId: string, activeModel: string): Promise<void> {
       await post(`/projects/${projectId}/build`, {
         default_model: "super_large",
+      });
+    },
+
+    // Send follow-up message to AI and stream the response
+    async streamSendMessage(
+      projectId: string,
+      content: string,
+      onToken: (text: string) => void,
+      options?: {
+        model?: string;
+        mediaUrls?: string[];
+        onSuggestedAgents?: (agents: string[], messageId: string) => void;
+      }
+    ): Promise<{ suggestedAgents?: string[]; messageId?: string }> {
+      const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/chat/messages/ai/stream`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${opts.token}`,
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
+        body: JSON.stringify({
+          content,
+          project_id: projectId,
+          model: options?.model ?? "gpt-4o",
+          media_urls: options?.mediaUrls ?? [],
+          plan_auto: false,
+        }),
+      });
+
+      if (res.status === 401) throw new AuthError();
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try {
+          msg += `: ${await res.text()}`;
+        } catch { }
+        throw new ApiError(res.status, msg);
+      }
+
+      if (!res.body) {
+        throw new Error("No response body in stream");
+      }
+
+      const body = res.body;
+      const suggestedAgents: string[] = [];
+      let lastMessageId = "";
+
+      return new Promise((resolve, reject) => {
+        const parser = createParser({
+          onEvent: (event) => {
+            try {
+              const data = JSON.parse(event.data);
+              // Debug: log all non-token events to help troubleshoot
+              if (data.type !== "token") {
+                console.log("[8080.ai stream] event:", JSON.stringify(data));
+              }
+              if (data.type === "token" && data.content) {
+                onToken(data.content);
+              }
+
+              // Detect suggested_agents in various possible formats
+              const agents = data.agents || data.suggested_agents || data.suggestedAgents || data.pending_suggested_agents;
+
+              if (data.type === "suggested_agents" && agents) {
+                console.log("[8080.ai stream] suggested_agents found:", JSON.stringify(agents));
+                // Handle both array and object formats
+                let agentList: string[] = [];
+                if (Array.isArray(agents)) {
+                  agentList = agents;
+                } else if (typeof agents === "object" && agents !== null) {
+                  // If it's an object, try to extract agent names from values
+                  agentList = Object.values(agents).filter((v): v is string => typeof v === "string");
+                }
+
+                if (agentList.length > 0) {
+                  const msgId = data.message_id || data.messageId || "";
+                  suggestedAgents.push(...agentList);
+                  lastMessageId = msgId;
+                  options?.onSuggestedAgents?.(agentList, msgId);
+                }
+              }
+            } catch (err) {
+              // ignore unparseable chunks
+            }
+          },
+        });
+
+        const reader = body.getReader();
+        const decoder = new TextDecoder("utf-8");
+
+        function pump() {
+          reader
+            .read()
+            .then(({ done, value }) => {
+              if (done) {
+                resolve({
+                  suggestedAgents: suggestedAgents.length > 0 ? suggestedAgents : undefined,
+                  messageId: lastMessageId
+                });
+                return;
+              }
+              if (value) {
+                parser.feed(decoder.decode(value, { stream: true }));
+              }
+              pump();
+            })
+            .catch(reject);
+        }
+        pump();
+      });
+    },
+
+    // Trigger specific agents for a project (used when user clicks agent suggestion button)
+    async triggerAgents(projectId: string, agents: string[], messageId: string, model?: string): Promise<void> {
+      await post("/chat/trigger-agents", {
+        project_id: projectId,
+        agents,
+        message_id: messageId,
+        model: model || "gpt-4o",
       });
     },
   };

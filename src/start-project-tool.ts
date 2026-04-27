@@ -1,9 +1,14 @@
 import { Type } from "@sinclair/typebox";
 import { AuthRequiredError, requireToken } from "./auth.ts";
 import { AuthError, createApiClient, type ProjectStatus } from "./api-client.ts";
-import { buildReviewContinueJsonl } from "./review-continue.ts";
+import { buildReviewContinueJsonl, buildSuggestedAgentsText } from "./review-continue.ts";
 
 const POLL_INTERVAL_MS = 3_000;
+
+// AgentToolResult shape required by the OpenClaw SDK's onUpdate callback.
+type ToolContent = { type: "text"; text: string };
+type ToolResult<T = unknown> = { content: ToolContent[]; details: T };
+type OnUpdate = (partial: ToolResult) => void;
 
 const AGENT_LABELS: Record<string, string> = {
   tech_lead: "Tech Lead",
@@ -17,6 +22,12 @@ const AGENT_LABELS: Record<string, string> = {
 function friendlyAgent(raw?: string): string {
   if (!raw) return "Agent";
   return AGENT_LABELS[raw.toLowerCase()] ?? raw;
+}
+
+// Emit a streaming update — each call replaces the previous partial content in
+// OpenClaw's UI, so pass the full accumulated text every time.
+function stream(onUpdate: OnUpdate | undefined, text: string): void {
+  onUpdate?.({ content: [{ type: "text", text }], details: null });
 }
 
 export function createStartProjectTool(deps: {
@@ -42,8 +53,8 @@ export function createStartProjectTool(deps: {
       _id: string,
       params: { requirements: string },
       _signal: AbortSignal | undefined,
-      onUpdate: ((update: { content: { type: string; text: string }[] }) => void) | undefined
-    ) {
+      onUpdate: OnUpdate | undefined
+    ): Promise<ToolResult> {
       const stateDir = deps.stateDir();
       const { apiBaseUrl, pollingTimeoutMs } = deps;
 
@@ -53,59 +64,48 @@ export function createStartProjectTool(deps: {
         token = await requireToken(stateDir);
       } catch (err) {
         if (err instanceof AuthRequiredError) {
-          return {
-            content: [{ type: "text", text: err.message }],
-          };
+          return { content: [{ type: "text", text: err.message }], details: null };
         }
         throw err;
       }
 
       const client = createApiClient({ token, apiBaseUrl });
 
-      // --- Create project ---
+      // --- Create project + stream the Tech Lead's initial reply token by token ---
       let projectId: string;
       let accumulatedText = "";
 
       try {
         const result = await client.streamProjectCreation(
           params.requirements,
-          (text) => {
-            accumulatedText += text;
-            onUpdate?.({
-              content: [
-                {
-                  type: "text",
-                  text: `[8080.ai] ${accumulatedText}`,
-                },
-              ],
-            });
+          (token) => {
+            // Called once per SSE token — accumulate and push the full text so
+            // OpenClaw replaces the previous partial with the longer one each time,
+            // producing a word-by-word streaming effect identical to LLM output.
+            accumulatedText += token;
+            stream(onUpdate, accumulatedText);
+          },
+          undefined,
+          (agents) => {
+            // Handle suggested agents by showing them as a text list.
+            const agentsDisplay = buildSuggestedAgentsText(agents);
+            stream(onUpdate, `${accumulatedText}${agentsDisplay}`);
           }
         );
         projectId = result.projectId;
       } catch (err) {
         if (err instanceof AuthError) {
-          return { content: [{ type: "text", text: (err as Error).message }] };
+          return { content: [{ type: "text", text: (err as Error).message }], details: null };
         }
         const msg = err instanceof Error ? err.message : String(err);
-        return {
-          content: [{ type: "text", text: `Failed to create project: ${msg}` }],
-        };
+        return { content: [{ type: "text", text: `Failed to create project: ${msg}` }], details: null };
       }
 
-      const streamCompleteText = accumulatedText
-        ? `[8080.ai] ${accumulatedText}\n\n`
-        : "";
+      // Keep streaming visible after the SSE stream closes, then add the transition message.
+      const streamedPreamble = accumulatedText ? `${accumulatedText}\n\n` : "";
+      stream(onUpdate, `${streamedPreamble}Project created (ID: ${projectId}). Working…`);
 
-      onUpdate?.({
-        content: [
-          {
-            type: "text",
-            text: `${streamCompleteText}[8080.ai] Project created (ID: ${projectId}). Transitioning to build phase…`,
-          },
-        ],
-      });
-
-      // --- Poll status ---
+      // --- Poll for phase transitions, streaming agent status updates ---
       const deadline = Date.now() + pollingTimeoutMs;
       let lastMessage = "";
 
@@ -117,10 +117,9 @@ export function createStartProjectTool(deps: {
           status = await client.getProjectStatus(projectId);
         } catch (err) {
           if (err instanceof AuthError) {
-            return { content: [{ type: "text", text: (err as Error).message }] };
+            return { content: [{ type: "text", text: (err as Error).message }], details: null };
           }
-          // Transient network error — keep polling
-          continue;
+          continue; // transient network error — keep polling
         }
 
         const msg =
@@ -130,57 +129,38 @@ export function createStartProjectTool(deps: {
             : "Working…");
 
         if (msg !== lastMessage) {
-          onUpdate?.({
-            content: [{ type: "text", text: `${streamCompleteText}[8080.ai] ${msg}` }],
-          });
+          stream(onUpdate, `${streamedPreamble}${msg}`);
           lastMessage = msg;
         }
 
         if (status.phase === "requirements" && status.requirementDocUrl) {
-          const a2ui = buildReviewContinueJsonl(
-            projectId,
-            status.requirementDocUrl
-          );
+          const a2ui = buildReviewContinueJsonl(projectId, status.requirementDocUrl);
           return {
             content: [
               {
                 type: "text",
                 text:
-                  `[8080.ai] Requirement document ready!\n\n` +
+                  `${streamedPreamble}Requirement document ready!\n\n` +
                   `Project ID: ${projectId}\n` +
                   `Doc URL: ${status.requirementDocUrl}\n\n` +
                   `Use the buttons below to Review the document or Continue building.\n\n` +
                   `<!-- a2ui\n${a2ui}\n-->`,
               },
             ],
-            details: {
-              projectId,
-              phase: "requirements",
-              requirementDocUrl: status.requirementDocUrl,
-            },
+            details: { projectId, phase: "requirements", requirementDocUrl: status.requirementDocUrl },
           };
         }
 
         if (status.phase === "complete") {
           return {
-            content: [
-              {
-                type: "text",
-                text: `[8080.ai] Project build complete!\n\nProject ID: ${projectId}`,
-              },
-            ],
+            content: [{ type: "text", text: `${streamedPreamble}Project build complete!\n\nProject ID: ${projectId}` }],
             details: { projectId, phase: "complete" },
           };
         }
 
         if (status.phase === "failed") {
           return {
-            content: [
-              {
-                type: "text",
-                text: `[8080.ai] Project failed: ${status.error ?? "Unknown error"}\n\nProject ID: ${projectId}`,
-              },
-            ],
+            content: [{ type: "text", text: `${streamedPreamble}Project failed: ${status.error ?? "Unknown error"}\n\nProject ID: ${projectId}` }],
             details: { projectId, phase: "failed" },
           };
         }
@@ -190,7 +170,7 @@ export function createStartProjectTool(deps: {
         content: [
           {
             type: "text",
-            text: `[8080.ai] Timed out waiting for project status.\n\nProject ID: ${projectId}\n\nRun \`/ai8080 status ${projectId}\` to check later.`,
+            text: `${streamedPreamble}Timed out waiting for project status.\n\nProject ID: ${projectId}\n\nRun \`/ai8080 status ${projectId}\` to check later.`,
           },
         ],
         details: { projectId, phase: "timeout" },
