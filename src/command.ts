@@ -29,6 +29,10 @@ function generateSessionId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 }
 
+function stripA2UI(text: string): string {
+  return text.replace(/<!--\s*a2ui[\s\S]*?-->/g, "").trim();
+}
+
 export function create8080Command(
   api: {
     runtime: { state: { resolveStateDir(): string } };
@@ -69,7 +73,10 @@ export function create8080Command(
             
             const activeModel = await readActiveModel(stateDir);
             let responseText = "";
+            let rawLog = "";
             let suggestedAgents: string[] = [];
+
+            console.log("[8080.ai] Initializing project and connecting to stream...");
 
             // Call chat/messages API to create project and stream initial thoughts
             const result = await client.streamProjectCreation(
@@ -77,7 +84,9 @@ export function create8080Command(
               (token) => {
                 responseText += token;
               },
-              undefined,
+              (raw) => {
+                rawLog += `data: ${raw}\n\n`;
+              },
               (agents) => {
                 suggestedAgents.push(...agents);
               },
@@ -97,14 +106,17 @@ export function create8080Command(
               });
             }
 
+            const cleanText = stripA2UI(responseText);
+            const streamDisplay = cleanText ? `\n\n**Tech Lead:**\n${cleanText}` : "";
+            const rawDisplay = rawLog ? `\n\n---\n**Raw Network Stream:**\n\`\`\`text\n${rawLog.slice(0, 500)}${rawLog.length > 500 ? "..." : ""}\n\`\`\`` : "";
             const agentList = suggestedAgents.length > 0 
               ? buildSuggestedAgentsText(suggestedAgents)
               : "";
 
             return {
               text:
-                `✅ Project created on 8080.ai!\n\n` +
-                (responseText ? `**Tech Lead:**\n${responseText}\n\n` : "") +
+                `✅ **Stream connection established**\n` +
+                `🚀 Project created on 8080.ai!${streamDisplay}${rawDisplay}\n\n` +
                 `**Project ID:** ${projectId}\n\n` +
                 `The project has been set as active for this session. ` +
                 `Run \`/ai8080 status\` to check progress.${agentList}`,
@@ -501,13 +513,19 @@ export function create8080Command(
             const client = createApiClient({ token, apiBaseUrl });
             const activeModel = await readActiveModel(stateDir);
             let responseText = "";
+            let rawLog = "";
             let suggestedAgents: string[] = [];
             let lastMessageId = "";
+
+            console.log("[8080.ai] Sending message and connecting to stream...");
 
             await client.streamSendMessage(projectId, content, (token) => {
               responseText += token;
             }, {
               model: activeModel,
+              onRaw: (raw) => {
+                rawLog += `data: ${raw}\n\n`;
+              },
               onSuggestedAgents: (agents, msgId) => {
                 suggestedAgents.push(...agents);
                 lastMessageId = msgId;
@@ -522,12 +540,15 @@ export function create8080Command(
               });
             }
 
+            const cleanText = stripA2UI(responseText);
+            const streamDisplay = cleanText ? `\n\n**AI Response:**\n${cleanText}` : "";
+            const rawDisplay = rawLog ? `\n\n---\n**Raw Network Stream:**\n\`\`\`text\n${rawLog.slice(0, 500)}${rawLog.length > 500 ? "..." : ""}\n\`\`\`` : "";
             const agentList = suggestedAgents.length > 0 
               ? buildSuggestedAgentsText(suggestedAgents)
               : "";
 
             return {
-              text: `🤖 **AI Response:**\n\n${responseText}${agentList}`,
+              text: `🤖 **Stream connection established**\n${streamDisplay}${rawDisplay}${agentList}`,
             };
           } catch (err) {
             if (err instanceof AuthError) return { text: (err as Error).message };

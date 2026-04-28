@@ -75,5 +75,8 @@ export function buildSuggestedAgentsText(
     return `${i + 1}. ${label}`;
   });
   
-  return `\n\n**Suggested Next Steps:**\n${lines.join("\n")}`;
+  const header = `\n\n**Suggested Next Steps:**\n`;
+  const footer = `\n\nType \`/ai8080 select-button <number>\` to trigger an agent.`;
+  
+  return `${header}${lines.join("\n")}${footer}`;
 }

@@ -168,11 +168,12 @@ export function createApiClient(opts: ClientOpts) {
     },
 
     // 8080.ai creates projects by sending a first message to /chat/messages.
-    // plan_auto: true triggers the supervisor agents immediately.
+    // plan_auto: false means supervisor agents are NOT triggered automatically.
+    // Users must manually trigger agents via /ai8080 select-button.
     async createProject(requirements: string): Promise<{ projectId: string }> {
       const res = (await post("/chat/messages", {
         content: requirements,
-        plan_auto: true,
+        plan_auto: false,
       })) as { project_id: string };
 
       return { projectId: res.project_id };
@@ -188,7 +189,7 @@ export function createApiClient(opts: ClientOpts) {
       // 1. Create the project first to get the ID
       const initRes = (await post("/chat/messages", {
         content: requirements,
-        plan_auto: true,
+        plan_auto: false,
       })) as { project_id: string };
 
       const projectId = initRes.project_id;
@@ -203,8 +204,7 @@ export function createApiClient(opts: ClientOpts) {
           Accept: "text/event-stream",
         },
         body: JSON.stringify({
-          project_id: projectId,
-          model: options?.model || "-"
+          project_id: projectId
         }),
       });
 
@@ -298,6 +298,7 @@ export function createApiClient(opts: ClientOpts) {
         model?: string;
         mediaUrls?: string[];
         onSuggestedAgents?: (agents: string[], messageId: string) => void;
+        onRaw?: (raw: string) => void;
       }
     ): Promise<{ suggestedAgents?: string[]; messageId?: string }> {
       const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/chat/messages/ai/stream`;
@@ -311,7 +312,7 @@ export function createApiClient(opts: ClientOpts) {
         body: JSON.stringify({
           content,
           project_id: projectId,
-          model: options?.model ?? "gpt-4o",
+          model: (options?.model && !["large", "super_large"].includes(options.model)) ? options.model : "gpt-4o",
           media_urls: options?.mediaUrls ?? [],
           plan_auto: false,
         }),
@@ -337,6 +338,7 @@ export function createApiClient(opts: ClientOpts) {
       return new Promise((resolve, reject) => {
         const parser = createParser({
           onEvent: (event) => {
+            if (options?.onRaw) options.onRaw(event.data);
             try {
               const data = JSON.parse(event.data);
               // Debug: log all non-token events to help troubleshoot
@@ -405,7 +407,7 @@ export function createApiClient(opts: ClientOpts) {
         project_id: projectId,
         agents,
         message_id: messageId,
-        model: model || "gpt-4o",
+        model: (model && !["large", "super_large"].includes(model)) ? model : "gpt-4o",
       });
     },
   };
