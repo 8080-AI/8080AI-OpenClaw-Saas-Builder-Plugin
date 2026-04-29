@@ -52,6 +52,9 @@ export const AGENT_DISPLAY_NAMES: Record<string, string> = {
   'User Flow Planner': '🔀 User Flows',
   'plan_all': '🚀 Run Plan All',
   'start_build': '🛠️ Start Building',
+  'start_building': '🛠️ Start Building',
+  'continue': '▶️ Continue',
+  'review': '🔍 Review',
 };
 
 export type Project = {
@@ -86,6 +89,8 @@ export type ProjectStatus = {
   current_step?: string;
   steps?: BuildStep[];
   progress?: number;
+  // Suggested next agents from API (from ProjectDetailResponse)
+  pending_suggested_agents?: Record<string, unknown> | null;
   // Raw fields that might come from API
   [key: string]: unknown;
 };
@@ -262,28 +267,57 @@ export function createApiClient(opts: ClientOpts) {
     },
 
     // 8080.ai uses /projects/{id} (no slash) for detail
+    // API returns ProjectDetailResponse: { project: {...}, messages: [...], pending_suggested_agents: {...} }
     async getProjectStatus(projectId: string): Promise<ProjectStatus> {
       const raw = await get(`/projects/${projectId}`) as Record<string, unknown>;
-      // Spread ALL raw fields so nothing is lost, then overlay our typed aliases
+
+      // The API wraps project data inside a `project` field (ProjectDetailResponse).
+      // Fall back to raw itself if the wrapper isn't present.
+      const projectData = (raw.project ?? raw) as Record<string, unknown>;
+
       const status: ProjectStatus = {
-        ...raw,                               // preserve every field from API
-        id: (raw.id as string) ?? projectId,
-        phase: (raw.phase ?? raw.status ?? "unknown") as ProjectPhase,
-        status: raw.status as string | undefined,
-        title: (raw.title ?? raw.name ?? raw.project_name) as string | undefined,
-        activeAgent: (raw.activeAgent ?? raw.active_agent) as string | undefined,
-        agentMessage: (raw.agentMessage ?? raw.agent_message) as string | undefined,
-        requirementDocUrl: (raw.requirementDocUrl ?? raw.requirement_doc_url) as string | undefined,
-        error: raw.error as string | undefined,
-        current_step: (raw.current_step ?? raw.currentStep ?? raw.step) as string | undefined,
-        steps: raw.steps as BuildStep[] | undefined,
-        progress: raw.progress as number | undefined,
+        ...raw,                               // preserve every top-level field (messages, pending_suggested_agents, etc.)
+        ...projectData,                       // overlay the project-level fields
+        id: (projectData.id as string) ?? projectId,
+        phase: (projectData.phase ?? projectData.status ?? "unknown") as ProjectPhase,
+        status: projectData.status as string | undefined,
+        title: (projectData.title ?? projectData.name ?? projectData.project_name) as string | undefined,
+        activeAgent: (projectData.activeAgent ?? projectData.active_agent) as string | undefined,
+        agentMessage: (projectData.agentMessage ?? projectData.agent_message) as string | undefined,
+        requirementDocUrl: (projectData.requirementDocUrl ?? projectData.requirement_doc_url) as string | undefined,
+        error: projectData.error as string | undefined,
+        current_step: (projectData.current_step ?? projectData.currentStep ?? projectData.step) as string | undefined,
+        steps: projectData.steps as BuildStep[] | undefined,
+        progress: projectData.progress as number | undefined,
+        // Extract pending_suggested_agents from the top-level response
+        pending_suggested_agents: raw.pending_suggested_agents as Record<string, unknown> | null ?? null,
       };
       return status;
     },
 
+    // Resume the design pipeline after user review gate
+    // POST /chat/resume-design with { project_id, phase }
+    async resumeDesign(projectId: string, phase: string = "all_pages"): Promise<void> {
+      await post(`/chat/resume-design`, {
+        project_id: projectId,
+        phase,
+      });
+    },
+
+    async getDesignPages(projectId: string): Promise<unknown> {
+      return get(`/projects/${projectId}/design-pages`);
+    },
+
+    async getTasks(projectId: string): Promise<unknown> {
+      return get(`/projects/${projectId}/tasks`);
+    },
+
+    async getArchitecture(projectId: string): Promise<unknown> {
+      return get(`/projects/${projectId}/architecture`);
+    },
+
     // 8080.ai uses /projects/{id}/build (no slash) to start/continue building
-    async continueProject(projectId: string, activeModel: string): Promise<void> {
+    async startBuilding(projectId: string, activeModel: string): Promise<void> {
       await post(`/projects/${projectId}/build`, {
         default_model: "super_large",
       });
@@ -409,6 +443,81 @@ export function createApiClient(opts: ClientOpts) {
         message_id: messageId,
         model: (model && !["large", "super_large"].includes(model)) ? model : "gpt-4o",
       });
+    },
+
+    // Stream events for a specific project
+    async streamProjectEvents(
+      projectId: string,
+      callbacks: {
+        onAgentLog?: (log: any) => void;
+        onChatMessage?: (msg: any) => void;
+        onSrdChunk?: (chunk: any) => void;
+        onAiOverview?: (msg: any) => void;
+        onPlanningComplete?: (data: { status: string; triggered_by?: string }) => void;
+        onRaw?: (raw: string) => void;
+      }
+    ): Promise<void> {
+      const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/projects/${projectId}/events`;
+      const res = await fetch(url, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${opts.token}`,
+          Accept: "text/event-stream",
+        },
+      });
+
+      if (res.status === 401) throw new AuthError();
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try {
+          msg += `: ${await res.text()}`;
+        } catch { }
+        throw new ApiError(res.status, msg);
+      }
+
+      if (!res.body) throw new Error("No response body");
+
+      const body = res.body;
+      let planningComplete = false;
+      const parser = createParser({
+        onEvent: (event) => {
+          if (callbacks.onRaw) callbacks.onRaw(event.data);
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === "agent_log" && callbacks.onAgentLog) {
+              callbacks.onAgentLog(data);
+            } else if (data.type === "chat_message" && callbacks.onChatMessage) {
+              callbacks.onChatMessage(data);
+            } else if (data.type === "srd_stream_chunk" && callbacks.onSrdChunk) {
+              callbacks.onSrdChunk(data);
+            } else if (data.type === "ai_overview_text" && callbacks.onAiOverview) {
+              callbacks.onAiOverview(data);
+            } else if (data.type === "planning_complete") {
+              planningComplete = true;
+              callbacks.onPlanningComplete?.({ status: data.status, triggered_by: data.triggered_by });
+            }
+          } catch (e) {
+            // ignore
+          }
+        },
+      });
+
+      const reader = body.getReader();
+      const decoder = new TextDecoder("utf-8");
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          parser.feed(decoder.decode(value, { stream: true }));
+          if (planningComplete) {
+            reader.cancel().catch(() => {});
+            break;
+          }
+        }
+      } catch (err) {
+        console.error("[8080.ai API] Stream error:", err);
+      }
     },
   };
 }

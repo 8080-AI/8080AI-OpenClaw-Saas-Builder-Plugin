@@ -170,7 +170,7 @@ export function createStartProjectTool(deps: {
         content: [
           {
             type: "text",
-            text: `${streamedPreamble}Timed out waiting for project status.\n\nProject ID: ${projectId}\n\nRun \`/ai8080 status ${projectId}\` to check later.`,
+            text: `${streamedPreamble}Timed out waiting for project status.\n\nProject ID: ${projectId}`,
           },
         ],
         details: { projectId, phase: "timeout" },
