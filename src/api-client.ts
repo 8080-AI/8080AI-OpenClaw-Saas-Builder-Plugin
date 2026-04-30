@@ -323,6 +323,12 @@ export function createApiClient(opts: ClientOpts) {
       });
     },
 
+    // Create or get a public design share link for a project
+    async createDesignShare(projectId: string): Promise<{ share_id: string; is_public: boolean; share_url?: string; [key: string]: unknown }> {
+      const res = await post(`/projects/${projectId}/design-share`) as Record<string, unknown>;
+      return res as { share_id: string; is_public: boolean; share_url?: string; [key: string]: unknown };
+    },
+
     // Send follow-up message to AI and stream the response
     async streamSendMessage(
       projectId: string,

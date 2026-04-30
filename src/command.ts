@@ -17,9 +17,6 @@ const HELP_TEXT = `8080.ai plugin commands:
   /ai8080 select <number>        Select a project by its number from the list
   /ai8080 model                  Show current AI model & available options
   /ai8080 model <number>         Switch the AI model for builds
-  /ai8080 status [projectId]     Show status of the active (or specified) project
-  /ai8080 review [projectId]     Open requirement document for the project
-  /ai8080 continue [projectId]   Proceed past requirement review
   /ai8080 message <text>         Send follow-up message to the AI (uses active project)
   /ai8080 select-button <number> Trigger suggested agents by their number
 
@@ -53,6 +50,33 @@ function extractSuggestedAgents(pending: Record<string, unknown> | null | undefi
     if (typeof val === 'string') agents.push(val);
     else if (val === true) agents.push(key); // { "plan_all": true } format
   }
+  return agents;
+}
+
+/**
+ * Groups multiple planning agents into a single "GROUP:agent1|agent2" string.
+ * This allows showing them as a single option in the UI.
+ */
+function groupAgents(agents: string[]): string[] {
+  const planningAgents = [
+    'System Requirements Agent',
+    'Design Agent',
+    'Project Manager',
+    'System Architect Agent',
+    'System Architect',
+    'User Flow Planner Agent',
+    'User Flow Planner',
+    'plan_all'
+  ];
+
+  const toGroup = agents.filter(a => planningAgents.includes(a));
+  const others = agents.filter(a => !planningAgents.includes(a));
+
+  if (toGroup.length > 1) {
+    // Combine all planning agents into one grouped entry
+    return [`GROUP:${toGroup.join('|')}`, ...others];
+  }
+
   return agents;
 }
 
@@ -110,7 +134,6 @@ export function create8080Command(
 
             const activeModel = await readActiveModel(stateDir);
             let responseText = "";
-            let rawLog = "";
             let suggestedAgents: string[] = [];
 
             console.log("[8080.ai] Initializing project and connecting to stream...");
@@ -121,9 +144,7 @@ export function create8080Command(
               (token) => {
                 responseText += token;
               },
-              (raw) => {
-                rawLog += `data: ${raw}\n\n`;
-              },
+              undefined,
               (agents) => {
                 suggestedAgents.push(...agents);
               },
@@ -135,27 +156,27 @@ export function create8080Command(
             // Store project_id in session state
             await writeActiveProject(stateDir, projectId, sessionId);
 
+            const groupedAgents = groupAgents(suggestedAgents);
             if (suggestedAgents.length > 0) {
               await writeLatestSuggestions(stateDir, sessionId, {
                 projectId,
-                agents: suggestedAgents,
+                agents: groupedAgents,
                 messageId: "", // streamProjectCreation doesn't always have a msgId, but triggerAgents needs one. 8080 seems to allow empty or placeholder for initial.
               });
             }
 
             const cleanText = stripA2UI(responseText);
             const streamDisplay = cleanText ? `\n\n**Tech Lead:**\n${cleanText}` : "";
-            const rawDisplay = rawLog ? `\n\n---\n**Raw Network Stream:**\n\`\`\`text\n${rawLog.slice(0, 500)}${rawLog.length > 500 ? "..." : ""}\n\`\`\`` : "";
-            const agentList = suggestedAgents.length > 0
-              ? buildSuggestedAgentsText(suggestedAgents)
+            const agentList = groupedAgents.length > 0
+              ? buildSuggestedAgentsText(groupedAgents)
               : "";
 
             return {
               text:
                 `✅ **Stream connection established**\n` +
-                `🚀 Project created on 8080.ai!${streamDisplay}${rawDisplay}\n\n` +
+                `🚀 Project created on 8080.ai!${streamDisplay}\n\n` +
                 `**Project ID:** ${projectId}\n\n` +
-                `The project has been set as active for this session. `,
+                `The project has been set as active for this session. ${agentList}`,
             };
           } catch (err) {
             if (err instanceof AuthError) return { text: (err as Error).message };
@@ -353,200 +374,6 @@ export function create8080Command(
           };
         }
 
-        // ------------------------------------------------------------------
-        case "status": {
-          let projectId = rest[0]?.trim();
-          if (!projectId) {
-            projectId = (await readActiveProject(stateDir, sessionId)) ?? "";
-          }
-
-          if (!projectId) {
-            return {
-              text: "No project active. Use `/ai8080 list` to select one`",
-            };
-          }
-
-          let token: string;
-          try {
-            token = await requireToken(stateDir);
-          } catch (err) {
-            if (err instanceof AuthRequiredError) return { text: err.message };
-            throw err;
-          }
-          try {
-            const client = createApiClient({ token, apiBaseUrl });
-            const s = await client.getProjectStatus(projectId);
-
-            // --- Build the step progress display ---
-            const KNOWN_STEPS = [
-              { key: "ai-overview", label: "AI Overview" },
-              { key: "requirements", label: "Requirements" },
-              { key: "design", label: "Design" },
-              { key: "architecture", label: "Architecture" },
-              { key: "implementation", label: "Implementation" },
-              { key: "testing", label: "Testing" },
-              { key: "deployment", label: "Deployment" },
-            ];
-
-            const lines: string[] = [];
-            lines.push(`### 📊 Project Status`);
-            if (s.title) lines.push(`**Project:** ${s.title}`);
-            lines.push(`**ID:** ${projectId}`);
-            lines.push(`**Phase:** ${s.phase ?? s.status ?? "unknown"}`);
-            if (s.activeAgent) lines.push(`**Agent:** ${s.activeAgent}`);
-            if (s.agentMessage) lines.push(`**Message:** ${s.agentMessage}`);
-            if (s.progress !== undefined) lines.push(`**Progress:** ${s.progress}%`);
-
-            // Show steps if available from the API
-            if (s.steps && Array.isArray(s.steps) && s.steps.length > 0) {
-              lines.push("");
-              lines.push("**Build Steps:**");
-              for (const step of s.steps) {
-                const icon =
-                  step.status === "completed" ? "✅" :
-                    step.status === "in_progress" ? "🔄" :
-                      step.status === "failed" ? "❌" : "⏳";
-                lines.push(`  ${icon} ${step.name}`);
-              }
-            }
-            // If we have current_step but no steps array, show it inline
-            else if (s.current_step) {
-              lines.push("");
-              lines.push("**Build Steps:**");
-              let foundCurrent = false;
-              for (const known of KNOWN_STEPS) {
-                if (foundCurrent) {
-                  lines.push(`  ⏳ ${known.label}`);
-                } else if (known.key === s.current_step || known.label.toLowerCase() === s.current_step.toLowerCase()) {
-                  lines.push(`  🔄 ${known.label}  ← current`);
-                  foundCurrent = true;
-                } else {
-                  lines.push(`  ✅ ${known.label}`);
-                }
-              }
-              // If current_step didn't match any known step, show it anyway
-              if (!foundCurrent) {
-                lines.push(`  🔄 ${s.current_step}  ← current`);
-              }
-            }
-
-            if (s.requirementDocUrl) lines.push(`\n**Req Doc:** ${s.requirementDocUrl}`);
-            if (s.error) lines.push(`\n❌ **Error:** ${s.error}`);
-
-            // --- Suggestions ---
-            // Extract from pending_suggested_agents in the ProjectDetailResponse
-            const pendingAgents = extractSuggestedAgents(s.pending_suggested_agents);
-            const finalAgents = [...pendingAgents];
-            if (finalAgents.length === 0 && s.status === 'active') {
-              // If no agents suggested but project is active,
-              // it likely means planning is complete and waiting for review/continue.
-              finalAgents.push('review', 'continue');
-            }
-
-            if (finalAgents.length > 0) {
-              lines.push("\n**Suggested Next Steps:**");
-              finalAgents.forEach((agent, index) => {
-                const label = AGENT_DISPLAY_NAMES[agent] ?? agent;
-                lines.push(`${index + 1}. ${label}`);
-              });
-              lines.push(`\nType \`/ai8080 select-button <number>\` to proceed.`);
-
-              // Save suggestions for select-button
-              await writeLatestSuggestions(stateDir, sessionId, {
-                projectId,
-                agents: finalAgents,
-                messageId: ""
-              });
-            }
-
-            // Dump the FULL raw API response for field discovery
-            lines.push("");
-            lines.push("---");
-            lines.push("**Raw API Response (for debugging):**");
-            lines.push("```json");
-            lines.push(JSON.stringify(s, null, 2));
-            lines.push("```");
-
-            return { text: lines.join("\n") };
-          } catch (err) {
-            if (err instanceof AuthError) return { text: (err as Error).message };
-            const msg = err instanceof Error ? err.message : String(err);
-            return { text: `8080.ai error: ${msg}` };
-          }
-        }
-
-        // ------------------------------------------------------------------
-        case "review": {
-          let projectId = rest[0]?.trim();
-          if (!projectId) {
-            projectId = (await readActiveProject(stateDir, sessionId)) ?? "";
-          }
-
-          if (!projectId) {
-            return {
-              text: "No project active. Use `/ai8080 list` to select one or provide a project ID: `/ai8080 review <projectId>`",
-            };
-          }
-
-          let token: string;
-          try {
-            token = await requireToken(stateDir);
-          } catch (err) {
-            if (err instanceof AuthRequiredError) return { text: err.message };
-            throw err;
-          }
-          try {
-            const client = createApiClient({ token, apiBaseUrl });
-            const s = await client.getProjectStatus(projectId);
-            if (!s.requirementDocUrl) {
-              return {
-                text: `No requirement document available yet for project ${projectId}. Current phase: ${s.phase}`,
-              };
-            }
-            await open(s.requirementDocUrl);
-            return {
-              text: `Opened requirement document in browser:\n${s.requirementDocUrl}`,
-            };
-          } catch (err) {
-            if (err instanceof AuthError) return { text: (err as Error).message };
-            const msg = err instanceof Error ? err.message : String(err);
-            return { text: `8080.ai error: ${msg}` };
-          }
-        }
-
-        // ------------------------------------------------------------------
-        case "continue": {
-          let projectId = rest[0]?.trim();
-          if (!projectId) {
-            projectId = (await readActiveProject(stateDir, sessionId)) ?? "";
-          }
-
-          if (!projectId) {
-            return {
-              text: "No project active. Use `/ai8080 list` to select one or provide a project ID: `/ai8080 continue <projectId>`",
-            };
-          }
-
-          let token: string;
-          try {
-            token = await requireToken(stateDir);
-          } catch (err) {
-            if (err instanceof AuthRequiredError) return { text: err.message };
-            throw err;
-          }
-          try {
-            const client = createApiClient({ token, apiBaseUrl });
-            const activeModel = await readActiveModel(stateDir);
-            await client.resumeDesign(projectId);
-            return {
-              text: `✅ Design resumed for project ${projectId}. Agents will continue generating the remaining pages.`,
-            };
-          } catch (err) {
-            if (err instanceof AuthError) return { text: (err as Error).message };
-            const msg = err instanceof Error ? err.message : String(err);
-            return { text: `8080.ai error: ${msg}` };
-          }
-        }
 
         // ------------------------------------------------------------------
         case "message": {
@@ -574,7 +401,6 @@ export function create8080Command(
             const client = createApiClient({ token, apiBaseUrl });
             const activeModel = await readActiveModel(stateDir);
             let responseText = "";
-            let rawLog = "";
             let suggestedAgents: string[] = [];
             let lastMessageId = "";
 
@@ -584,32 +410,29 @@ export function create8080Command(
               responseText += token;
             }, {
               model: activeModel,
-              onRaw: (raw) => {
-                rawLog += `data: ${raw}\n\n`;
-              },
               onSuggestedAgents: (agents, msgId) => {
                 suggestedAgents.push(...agents);
                 lastMessageId = msgId;
               }
             });
 
+            const groupedAgents = groupAgents(suggestedAgents);
             if (suggestedAgents.length > 0) {
               await writeLatestSuggestions(stateDir, sessionId, {
                 projectId,
-                agents: suggestedAgents,
+                agents: groupedAgents,
                 messageId: lastMessageId
               });
             }
 
             const cleanText = stripA2UI(responseText);
             const streamDisplay = cleanText ? `\n\n**AI Response:**\n${cleanText}` : "";
-            const rawDisplay = rawLog ? `\n\n---\n**Raw Network Stream:**\n\`\`\`text\n${rawLog.slice(0, 500)}${rawLog.length > 500 ? "..." : ""}\n\`\`\`` : "";
-            const agentList = suggestedAgents.length > 0
-              ? buildSuggestedAgentsText(suggestedAgents)
+            const agentList = groupedAgents.length > 0
+              ? buildSuggestedAgentsText(groupedAgents)
               : "";
 
             return {
-              text: `🤖 **Stream connection established**\n${streamDisplay}${rawDisplay}${agentList}`,
+              text: `🤖 **Stream connection established**\n${streamDisplay}${agentList}`,
             };
           } catch (err) {
             if (err instanceof AuthError) return { text: (err as Error).message };
@@ -693,18 +516,32 @@ export function create8080Command(
               const logsText = logs.length > 0 ? `\n\n**Activity Log:**\n${logs.map(l => `- ${l}`).join("\n")}` : "";
 
               if (isGenerated) {
-                await writeLatestSuggestions(stateDir, sessionId, {
-                  projectId: suggestions.projectId,
-                  agents: ["start_building"],
-                  messageId: suggestions.messageId || "",
-                });
+                // Create a public design share link
+                let shareUrl = "";
+                try {
+                  const share = await client.createDesignShare(suggestions.projectId);
+                  // Build the public share URL from the share_id
+                  shareUrl = share.share_url || `${siteUrl}/design/${suggestions.projectId}/${share.share_id}`;
+                } catch (shareErr) {
+                  console.error("[8080.ai] Failed to create design share:", shareErr);
+                  shareUrl = `${siteUrl}/projects/${suggestions.projectId}`;
+                }
+
                 return {
-                  text: `✅ **Generation complete!**\n${logsText}\n\nReview the design and architecture and start building.\n\nType \`/ai8080 select-button 1\` to start building.`,
+                  text:
+                    `✅ **Design generation complete!**\n${logsText}\n\n` +
+                    `🔗 **Your Design Share Link:**\n${shareUrl}\n\n` +
+                    `Share this link with anyone to preview the generated design, architecture, and requirements.\n\n` +
+                    `---\n\n` +
+                    `🚀 **Want to build this project end-to-end?**\n` +
+                    `Visit [8080.ai](${siteUrl}) and upgrade to a **Premium plan** to unlock full project building — ` +
+                    `from architecture to deployment, powered by AI agents.\n\n` +
+                    `Type \`/ai8080 list\` to see your projects anytime.`,
                 };
               } else {
                 await writeLatestSuggestions(stateDir, sessionId, {
                   projectId: suggestions.projectId,
-                  agents: ["continue", "review"],
+                  agents: groupAgents(["continue", "review"]),
                   messageId: suggestions.messageId || "",
                 });
                 return {
@@ -713,9 +550,13 @@ export function create8080Command(
               }
             }
 
-            await client.triggerAgents(suggestions.projectId, [selectedAgent], suggestions.messageId, activeModel);
+            const agentsToTrigger = selectedAgent.startsWith('GROUP:')
+              ? selectedAgent.slice(6).split('|')
+              : [selectedAgent];
 
-            const isPlanAll = selectedAgent === 'plan_all';
+            await client.triggerAgents(suggestions.projectId, agentsToTrigger, suggestions.messageId, activeModel);
+
+            const isPlanAll = selectedAgent === 'plan_all' || selectedAgent.includes('plan_all');
 
             let srdContent = "";
             const logs: string[] = [];
@@ -742,7 +583,7 @@ export function create8080Command(
             if (pausedForReview) {
               await writeLatestSuggestions(stateDir, sessionId, {
                 projectId: suggestions.projectId,
-                agents: ["continue", "review"],
+                agents: groupAgents(["continue", "review"]),
                 messageId: suggestions.messageId || "",
               });
 
@@ -763,7 +604,17 @@ export function create8080Command(
             const logsText = logs.length > 0 ? `\n\n**Activity Log:**\n${logs.map(l => `- ${l}`).join("\n")}` : "";
             const srdText = srdContent ? `\n\n---\n\n**System Requirements Document:**\n\n${srdContent}` : "";
 
-            const agentLabel = (AGENT_DISPLAY_NAMES[selectedAgent] ?? selectedAgent);
+            let agentLabel = "";
+            if (selectedAgent.startsWith("GROUP:")) {
+              const subAgents = selectedAgent.slice(6).split('|');
+              const subLabels = subAgents.map(a => {
+                const rawLabel = AGENT_DISPLAY_NAMES[a] ?? a;
+                return rawLabel.includes(" ") ? rawLabel.split(" ").slice(1).join(" ") : rawLabel;
+              });
+              agentLabel = `Group (${subLabels.join(", ")})`;
+            } else {
+              agentLabel = (AGENT_DISPLAY_NAMES[selectedAgent] ?? selectedAgent);
+            }
 
             // Fetch fresh suggestions from the project detail
             const projectStatusAfter = await client.getProjectStatus(suggestions.projectId);
@@ -775,15 +626,16 @@ export function create8080Command(
               finalAgentsAfter.push('review', 'continue');
             }
 
+            const groupedAgentsAfter = groupAgents(finalAgentsAfter);
             // Save for next select-button call
             await writeLatestSuggestions(stateDir, sessionId, {
               projectId: suggestions.projectId,
-              agents: finalAgentsAfter,
+              agents: groupedAgentsAfter,
               messageId: ""
             });
 
-            const agentList = finalAgentsAfter.length > 0
-              ? buildSuggestedAgentsText(finalAgentsAfter)
+            const agentList = groupedAgentsAfter.length > 0
+              ? buildSuggestedAgentsText(groupedAgentsAfter)
               : "";
 
             return {

@@ -69,9 +69,18 @@ export function buildSuggestedAgentsText(
   agents: string[]
 ): string {
   const lines = agents.map((agent, i) => {
-    const label = AGENT_DISPLAY_NAMES[agent] ?? agent;
-    // Remove emojis for a cleaner list if preferred, or keep them. 
-    // I'll keep them as they look good in the TUI.
+    let label = "";
+    if (agent.startsWith("GROUP:")) {
+      const subAgents = agent.slice(6).split('|');
+      const subLabels = subAgents.map(a => {
+        const rawLabel = AGENT_DISPLAY_NAMES[a] ?? a;
+        // Strip emojis/icons (anything before the first space) for the combined list
+        return rawLabel.includes(" ") ? rawLabel.split(" ").slice(1).join(" ") : rawLabel;
+      });
+      label = `🚀 Run ${subLabels.join(", ")}`;
+    } else {
+      label = AGENT_DISPLAY_NAMES[agent] ?? agent;
+    }
     return `${i + 1}. ${label}`;
   });
   
