@@ -74,9 +74,9 @@ export function createSendMessageTool(deps: {
           const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
 
           const lastSuggestions = await readLatestSuggestions(stateDir, sessionId);
-          
+
           let agents: string[] = ["plan_all"];
-          let action: "trigger" | "resume" | "review" = "trigger";
+          let action: "trigger" | "resume" | "review" | "build" = "trigger";
 
           if (numericSelection) {
             const index = parseInt(numericSelection[1], 10) - 1;
@@ -86,16 +86,18 @@ export function createSendMessageTool(deps: {
                 action = "resume";
               } else if (selected === "review") {
                 action = "review";
+              } else if (selected === "start_building") {
+                action = "build";
               } else {
                 agents = selected.startsWith("GROUP:") ? selected.slice(6).split('|') : [selected];
               }
             } else if (!isRunPlanAll) {
-               throw new Error("No suggested agents found for this selection.");
+              throw new Error("No suggested agents found for this selection.");
             }
           } else {
             agents = lastSuggestions?.agents ?? ["plan_all"];
           }
-          
+
           const messageId = lastSuggestions?.messageId ?? "";
 
           if (action === "review") {
@@ -107,7 +109,12 @@ export function createSendMessageTool(deps: {
           }
 
           let accumulatedText = "";
-          if (action === "resume") {
+          if (action === "build") {
+            accumulatedText = `🚀 Triggering **Building Phase** for project \`${activeProjectId}\`...\n\n`;
+            await stream(onUpdate, accumulatedText);
+            const model = await readActiveModel(stateDir);
+            await client.startBuilding(activeProjectId, model);
+          } else if (action === "resume") {
             accumulatedText = `🚀 Triggering **Design Agent** to continue building project \`${activeProjectId}\`...\n\n`;
             await stream(onUpdate, accumulatedText);
             await client.resumeDesign(activeProjectId);
@@ -140,29 +147,58 @@ export function createSendMessageTool(deps: {
           // Show suggestions at the end
           const statusAfter = await client.getProjectStatus(activeProjectId);
           let finalAgents: string[] = [];
-          
+
           if (statusAfter.pending_suggested_agents) {
             finalAgents = Object.keys(statusAfter.pending_suggested_agents).filter(k => statusAfter.pending_suggested_agents![k] === true);
           }
-          
+
           // Fallback to continue/review if no specific agents are suggested at this stage
           if (finalAgents.length === 0) {
             finalAgents = ["continue", "review"];
           }
-          
+
           const groupedAgentsAfter = groupAgents(finalAgents);
-          accumulatedText += `\n\n${buildSuggestedAgentsText(activeProjectId, groupedAgentsAfter)}`;
+
+          // Final Readiness Check: Architecture and Tasks
+          let readinessText = "";
+          try {
+            const [arch, tasks] = await Promise.all([
+              client.getArchitecture(activeProjectId).catch(() => null),
+              client.getTasks(activeProjectId).catch(() => null),
+            ]);
+
+            if (arch && tasks) {
+              const share = await client.createDesignShare(activeProjectId).catch(() => null);
+              readinessText = `\n\n🎉 **Project Ready for Building!**\n`;
+              if (share?.share_url) {
+                readinessText += `🎨 **Design Preview:** [${share.share_url}](${share.share_url})\n`;
+              }
+
+              // Add "Start Building" to the agents if not already there
+              if (!finalAgents.includes("start_building")) {
+                finalAgents.push("start_building");
+              }
+            }
+          } catch (err) {
+            process.stderr.write(`[8080.ai] Readiness check error: ${err}\n`);
+          }
+
+          const finalGroupedAgents = groupAgents(finalAgents);
+          accumulatedText += readinessText;
+          accumulatedText += `\n\n${buildSuggestedAgentsText(activeProjectId, finalGroupedAgents)}`;
+
+          accumulatedText += `\n\n> **Note:** Visit [8080.ai](https://8080.ai) for buying premium plan and complete your project end to end.`;
 
           // Update saved suggestions for the next selection
           await writeLatestSuggestions(stateDir, sessionId, {
             projectId: activeProjectId,
-            agents: groupedAgentsAfter,
+            agents: finalGroupedAgents,
             messageId: "",
           });
 
           return {
             content: [{ type: "text", text: accumulatedText }],
-            details: { projectId: activeProjectId, agents: groupedAgentsAfter },
+            details: { projectId: activeProjectId, agents: finalGroupedAgents },
           };
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
