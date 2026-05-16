@@ -1,8 +1,14 @@
 import open from "open";
 import { writeToken, clearToken, requireToken, AuthRequiredError } from "./auth.ts";
-import { AuthError, createApiClient, AGENT_DISPLAY_NAMES, type BuildStep } from "./api-client.ts";
+import { AuthError, createApiClient, AGENT_DISPLAY_NAMES, type BuildStep, requireAuthenticatedClient, validateToken } from "./api-client.ts";
 import { readActiveProject, writeActiveProject } from "./project-state.ts";
-import { buildSuggestedAgentsText } from "./review-continue.ts";
+import {
+  buildReviewContinueJsonl,
+  buildSuggestedAgentsJsonl,
+  buildSuggestedAgentsPresentation,
+  buildSuggestedAgentsText,
+  parseButtonValue,
+} from "./review-continue.ts";
 import { writeLatestSuggestions, readLatestSuggestions } from "./suggestions-state.ts";
 import { readActiveModel, writeActiveModel, MODEL_OPTIONS } from "./model-state.ts";
 
@@ -10,7 +16,6 @@ const HELP_TEXT = `8080.ai plugin commands:
 
   /ai8080 start <requirements>   Start a new project on 8080.ai
   /ai8080 login                  Log in to 8080.ai via browser
-  /ai8080 logout                 Log out and clear saved credentials
   /ai8080 set-token <token>      Manually set auth token (from browser console)
   /ai8080 credits                Show your remaining 8080.ai credits
   /ai8080 list                   List your projects
@@ -22,11 +27,11 @@ const HELP_TEXT = `8080.ai plugin commands:
 
 To build a project with 8080.ai, you can also just ask: "Use 8080.ai to build a todo app"`;
 
-function generateSessionId(): string {
+export function generateSessionId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 }
 
-function stripA2UI(text: string): string {
+export function stripA2UI(text: string): string {
   return text.replace(/<!--\s*a2ui[\s\S]*?-->/g, "").trim();
 }
 
@@ -57,7 +62,7 @@ function extractSuggestedAgents(pending: Record<string, unknown> | null | undefi
  * Groups multiple planning agents into a single "GROUP:agent1|agent2" string.
  * This allows showing them as a single option in the UI.
  */
-function groupAgents(agents: string[]): string[] {
+export function groupAgents(agents: string[]): string[] {
   const planningAgents = [
     'System Requirements Agent',
     'Design Agent',
@@ -111,9 +116,19 @@ export function create8080Command(
     async handler(ctx: { args?: string }) {
       const stateDir = api.runtime.state.resolveStateDir();
       const tokens = (ctx.args ?? "").trim().split(/\s+/).filter(Boolean);
-      const [subcommand, ...rest] = tokens;
+      let subcommand = tokens[0]?.toLowerCase();
+      let rest = tokens.slice(1);
 
-      switch (subcommand?.toLowerCase()) {
+      // Handle multi-word subcommands to be lenient with syntax
+      if (subcommand === "set" && rest[0]?.toLowerCase() === "token") {
+        subcommand = "set-token";
+        rest = rest.slice(1);
+      } else if (subcommand === "select" && rest[0]?.toLowerCase() === "button") {
+        subcommand = "select-button";
+        rest = rest.slice(1);
+      }
+
+      switch (subcommand) {
         // ------------------------------------------------------------------
         case "start": {
           const requirements = rest.join(" ").trim();
@@ -121,16 +136,8 @@ export function create8080Command(
             return { text: "Usage: /ai8080 start <requirements>" };
           }
 
-          let token: string;
           try {
-            token = await requireToken(stateDir);
-          } catch (err) {
-            if (err instanceof AuthRequiredError) return { text: err.message };
-            throw err;
-          }
-
-          try {
-            const client = createApiClient({ token, apiBaseUrl });
+            const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
 
             const activeModel = await readActiveModel(stateDir);
             let responseText = "";
@@ -208,37 +215,33 @@ export function create8080Command(
 
         // ------------------------------------------------------------------
         case "set-token": {
-          const token = rest[0]?.trim();
+          const token = rest.join("").replace(/\s+/g, "");
           if (!token) {
             return {
               text: "Usage: /ai8080 set-token <token>\n\nGet your token from the browser console: localStorage.getItem('auth_token')",
             };
           }
+          // Validate token before saving
+          try {
+            const isValid = await validateToken({ token, apiBaseUrl });
+            if (!isValid) {
+              return { text: "❌ Invalid token. Please check the token and try again." };
+            }
+          } catch (err) {
+            return { text: `❌ Failed to validate token: ${err instanceof Error ? err.message : String(err)}` };
+          }
+
           await writeToken(stateDir, token);
-          return { text: "✅ Token saved. You are now logged in to 8080.ai." };
+          return { text: "✅ Token validated and saved. You are now logged in to 8080.ai." };
         }
 
         // ------------------------------------------------------------------
-        case "logout": {
-          await clearToken(stateDir);
-          return {
-            text: "Logged out of 8080.ai. saved credentials cleared.",
-          };
-        }
+
 
         // ------------------------------------------------------------------
         case "credits": {
-          let token: string;
           try {
-            token = await requireToken(stateDir);
-          } catch (err) {
-            if (err instanceof AuthRequiredError) {
-              return { text: err.message };
-            }
-            throw err;
-          }
-          try {
-            const client = createApiClient({ token, apiBaseUrl });
+            const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
             const sub = await client.getSubscription();
             return {
               text:
@@ -270,16 +273,19 @@ export function create8080Command(
 
             const activeProjectId = await readActiveProject(stateDir, sessionId);
 
-            const lines = projects.map((p, i) => {
+            // We'll update projects labels to include active marker if needed
+            const projectsWithActiveMarker = projects.map((p, i) => {
               const isActive = p.id === activeProjectId;
-              const marker = isActive ? "👉" : "  ";
-              return `${marker} ${i + 1}. ${p.title} (${p.status})`;
+              const marker = isActive ? "👉 " : "";
+              return { ...p, title: `${marker}${p.title}` };
             });
+
+            const a2ui = buildProjectSelectionJsonl(projectsWithActiveMarker);
 
             return {
               text:
-                `### 8080.ai Projects:\n\n${lines.join("\n")}\n\n` +
-                `Type \`/ai8080 select <number>\` to switch the active project.`,
+                `### 8080.ai Projects:\n\nSelect a project from the list below.\n\n<!-- a2ui ${a2ui} -->\n\n` +
+                `Type \`/ai8080 select <number>\` to switch the active project if you prefer not to use the buttons.`,
             };
           } catch (err) {
             if (err instanceof AuthError) return { text: (err as Error).message };
@@ -313,7 +319,7 @@ export function create8080Command(
               const lines = projects.map((p, i) => {
                 const isActive = p.id === activeProjectId;
                 const marker = isActive ? "👉" : "  ";
-                return `${marker} ${i + 1}. ${p.title} (${p.status})`;
+                return `${marker} ${i + 1}. ${p.title} (\`${p.id}\`) [${p.status}]`;
               });
               return {
                 text:
@@ -431,8 +437,12 @@ export function create8080Command(
               ? buildSuggestedAgentsText(groupedAgents)
               : "";
 
+            const presentation = buildSuggestedAgentsPresentation(projectId, groupedAgents, cleanText);
+            const buttonsJsonl = groupedAgents.length > 0 ? `\n\n${buildSuggestedAgentsJsonl(projectId, groupedAgents)}` : "";
+
             return {
-              text: `🤖 **Stream connection established**\n${streamDisplay}${agentList}`,
+              text: `🤖 **Stream connection established**\n${streamDisplay}${agentList}${buttonsJsonl}`,
+              presentation,
             };
           } catch (err) {
             if (err instanceof AuthError) return { text: (err as Error).message };
@@ -520,8 +530,12 @@ export function create8080Command(
                 let shareUrl = "";
                 try {
                   const share = await client.createDesignShare(suggestions.projectId);
-                  // Build the public share URL from the share_id
-                  shareUrl = share.share_url || `${siteUrl}/design/${suggestions.projectId}/${share.share_id}`;
+                  // Build the public share URL, prioritizing the design-specific format with share_id
+                  if (share && (share.share_id || share.id)) {
+                    shareUrl = `${siteUrl}/design/${suggestions.projectId}/${share.share_id || share.id}`;
+                  } else {
+                    shareUrl = share.share_url || `${siteUrl}/projects/${suggestions.projectId}`;
+                  }
                 } catch (shareErr) {
                   console.error("[8080.ai] Failed to create design share:", shareErr);
                   shareUrl = `${siteUrl}/projects/${suggestions.projectId}`;

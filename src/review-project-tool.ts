@@ -1,11 +1,12 @@
 import { Type } from "@sinclair/typebox";
 import open from "open";
-import { AuthRequiredError, requireToken } from "./auth.ts";
-import { AuthError, createApiClient } from "./api-client.ts";
+import { AuthRequiredError } from "./auth.ts";
+import { AuthError, requireAuthenticatedClient } from "./api-client.ts";
 
 export function createReviewProjectTool(deps: {
   stateDir: () => string;
   apiBaseUrl: string;
+  sessionId: string;
 }) {
   return {
     name: "ai8080_open_project_requirements",
@@ -14,39 +15,38 @@ export function createReviewProjectTool(deps: {
       "Use when the user wants to view, review, or see the requirements/spec doc for a " +
       "specific 8080.ai project. Requires the project ID.",
     parameters: Type.Object({
-      projectId: Type.String({
-        description: "The 8080.ai project ID whose requirement document should be opened.",
-      }),
+      projectId: Type.Optional(Type.String({
+        description: "The 8080.ai project ID whose requirement document should be opened. Optional if a project is already active.",
+      })),
     }),
 
     async execute(
       _id: string,
-      params: { projectId: string },
+      params: { projectId?: string },
       _signal: AbortSignal | undefined,
       _onUpdate: unknown
     ) {
       const stateDir = deps.stateDir();
-      const { apiBaseUrl } = deps;
+      const { apiBaseUrl, sessionId } = deps;
 
-      let token: string;
       try {
-        token = await requireToken(stateDir);
-      } catch (err) {
-        if (err instanceof AuthRequiredError) {
-          return { content: [{ type: "text", text: err.message }] };
+        const { readActiveProject } = await import("./project-state.ts");
+        const activeProjectId = params.projectId || await readActiveProject(stateDir, sessionId);
+        
+        if (!activeProjectId) {
+          return {
+            content: [{ type: "text", text: "No active project found. Please select a project first." }],
+          };
         }
-        throw err;
-      }
 
-      try {
-        const client = createApiClient({ token, apiBaseUrl });
-        const status = await client.getProjectStatus(params.projectId);
+        const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
+        const status = await client.getProjectStatus(activeProjectId);
         if (!status.requirementDocUrl) {
           return {
             content: [
               {
                 type: "text",
-                text: `No requirement document available yet for project ${params.projectId}. Current phase: ${status.phase}`,
+                text: `No requirement document available yet for project ${activeProjectId}. Current phase: ${status.phase}`,
               },
             ],
           };

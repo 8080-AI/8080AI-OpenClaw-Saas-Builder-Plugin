@@ -1,6 +1,6 @@
 import { Type } from "@sinclair/typebox";
-import { AuthRequiredError, requireToken } from "./auth.ts";
-import { AuthError, createApiClient } from "./api-client.ts";
+import { requireAuthenticatedClient, AuthError } from "./api-client.ts";
+import { AuthRequiredError } from "./auth.ts";
 
 export function createProjectStatusTool(deps: {
   stateDir: () => string;
@@ -13,39 +13,46 @@ export function createProjectStatusTool(deps: {
       "Shows the active agent, current phase, and requirement doc URL if available. " +
       "Use when the user asks about the status, phase, or progress of a specific 8080.ai project.",
     parameters: Type.Object({
-      projectId: Type.String({
-        description: "The 8080.ai project ID to check status for.",
-      }),
+      projectId: Type.Optional(
+        Type.String({
+          description: "The 8080.ai project ID to check status for.",
+        })
+      ),
     }),
 
     async execute(
       _id: string,
-      params: { projectId: string },
+      params: { projectId?: string },
       _signal: AbortSignal | undefined,
-      _onUpdate: unknown
+      onUpdate: (partial: { content: { type: "text"; text: string }[] }) => void
     ) {
       const stateDir = deps.stateDir();
-      const { apiBaseUrl } = deps;
+      const { apiBaseUrl, sessionId } = deps;
 
-      let token: string;
       try {
-        token = await requireToken(stateDir);
-      } catch (err) {
-        if (err instanceof AuthRequiredError) {
-          return { content: [{ type: "text", text: err.message }] };
+        const { readActiveProject } = await import("./project-state.ts");
+        const projectId = params.projectId || (await readActiveProject(stateDir, sessionId));
+
+        if (!projectId) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "No active project found. Please provide a projectId or select a project first.",
+              },
+            ],
+          };
         }
-        throw err;
-      }
 
-      const client = createApiClient({ token, apiBaseUrl });
+        onUpdate?.({ content: [{ type: "text", text: `🔄 Fetching status for project ${projectId}...` }] });
 
-      try {
-        const status = await client.getProjectStatus(params.projectId);
+        const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
+        const status = await client.getProjectStatus(projectId);
         const lines = [
           `### 📊 Project Status`,
         ];
         if (status.title) lines.push(`**Project:** ${status.title}`);
-        lines.push(`**ID:** ${params.projectId}`);
+        lines.push(`**ID:** ${projectId}`);
         lines.push(`**Phase:** ${status.phase ?? status.status ?? "unknown"}`);
         if (status.activeAgent) lines.push(`**Agent:** ${status.activeAgent}`);
         if (status.agentMessage) lines.push(`**Message:** ${status.agentMessage}`);

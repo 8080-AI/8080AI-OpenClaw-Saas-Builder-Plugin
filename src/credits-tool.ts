@@ -1,6 +1,6 @@
 import { Type } from "@sinclair/typebox";
-import { AuthRequiredError, requireToken } from "./auth.ts";
-import { AuthError, createApiClient } from "./api-client.ts";
+import { AuthRequiredError } from "./auth.ts";
+import { AuthError, requireAuthenticatedClient } from "./api-client.ts";
 
 export function createCreditsTool(deps: {
   stateDir: () => string;
@@ -18,29 +18,22 @@ export function createCreditsTool(deps: {
       _id: string,
       _params: Record<string, never>,
       _signal: AbortSignal | undefined,
-      _onUpdate: unknown
+      onUpdate: (partial: { content: { type: "text"; text: string }[] }) => void
     ) {
       const stateDir = deps.stateDir();
       const { apiBaseUrl } = deps;
 
-      let token: string;
       try {
-        token = await requireToken(stateDir);
-      } catch (err) {
-        if (err instanceof AuthRequiredError) {
-          return { content: [{ type: "text", text: err.message }] };
-        }
-        throw err;
-      }
-
-      try {
-        const client = createApiClient({ token, apiBaseUrl });
+        onUpdate?.({ content: [{ type: "text", text: "🔄 Checking your 8080.ai credit balance..." }] });
+        const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
         const sub = await client.getSubscription();
         const text =
           `8080.ai Subscription\n` +
           `  Plan      : ${sub.plan_name} (${sub.status})\n` +
           `  Credits   : ${sub.credits_balance}\n` +
           (sub.renews_at ? `  Renews at : ${sub.renews_at}\n` : "");
+        
+        onUpdate?.({ content: [{ type: "text", text }] });
         return { content: [{ type: "text", text }] };
       } catch (err) {
         if (err instanceof AuthError) {

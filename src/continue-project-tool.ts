@@ -1,10 +1,11 @@
 import { Type } from "@sinclair/typebox";
-import { AuthRequiredError, requireToken } from "./auth.ts";
-import { AuthError, createApiClient } from "./api-client.ts";
+import { AuthRequiredError } from "./auth.ts";
+import { AuthError, requireAuthenticatedClient } from "./api-client.ts";
 
 export function createContinueProjectTool(deps: {
   stateDir: () => string;
   apiBaseUrl: string;
+  sessionId: string;
 }) {
   return {
     name: "ai8080_continue_project",
@@ -13,52 +14,66 @@ export function createContinueProjectTool(deps: {
       "Use when the user has reviewed the requirements and wants to continue, proceed, or approve " +
       "so the agents start building. Requires the project ID.",
     parameters: Type.Object({
-      projectId: Type.String({
-        description: "The 8080.ai project ID to continue building.",
-      }),
+      projectId: Type.Optional(Type.String({
+        description: "The 8080.ai project ID. Optional if a project is already active.",
+      })),
     }),
 
     async execute(
       _id: string,
-      params: { projectId: string },
+      params: { projectId?: string },
       _signal: AbortSignal | undefined,
-      _onUpdate: unknown
+      onUpdate: (partial: { content: { type: "text"; text: string }[] }) => void
     ) {
       const stateDir = deps.stateDir();
-      const { apiBaseUrl } = deps;
-
-      let token: string;
-      try {
-        token = await requireToken(stateDir);
-      } catch (err) {
-        if (err instanceof AuthRequiredError) {
-          return { content: [{ type: "text", text: err.message }] };
-        }
-        throw err;
-      }
+      const { apiBaseUrl, sessionId } = deps;
 
       try {
-        const client = createApiClient({ token, apiBaseUrl });
-        await client.resumeDesign(params.projectId);
-
-        let pausedForReview = false;
-        const logs: string[] = [];
-        let accumulatedText = "";
+        const { readActiveProject } = await import("./project-state.ts");
+        const activeProjectId = params.projectId || await readActiveProject(stateDir, sessionId);
         
-        await client.streamProjectEvents(params.projectId, {
+        if (!activeProjectId) {
+          return {
+            content: [{ type: "text", text: "No active project found. Please select a project first." }],
+          };
+        }
+
+        const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
+        await client.resumeDesign(activeProjectId);
+
+        onUpdate?.({ content: [{ type: "text", text: "🚀 Design agents running..." }] });
+
+        let accumulatedText = "";
+        const logs: string[] = [];
+        
+        let logCount = 0;
+        await client.streamProjectEvents(activeProjectId, {
           onAgentLog: (log) => {
-            logs.push(`[${log.agent_type}] ${log.summary}`);
+            logCount++;
+            const entry = `[${log.agent_type}] ${log.summary}`;
+            logs.push(entry);
+            accumulatedText = `🚀 Agents are working...\n\n**Activity Log:**\n${logs.map(l => `- ${l}`).join("\n")}`;
+            onUpdate?.({ content: [{ type: "text", text: accumulatedText }] });
           },
           onChatMessage: (msg) => {
-            logs.push(`[System] ${msg.content}`);
+            logCount++;
+            const entry = `[System] ${msg.content}`;
+            logs.push(entry);
+            accumulatedText = `🚀 Agents are working...\n\n**Activity Log:**\n${logs.map(l => `- ${l}`).join("\n")}`;
+            onUpdate?.({ content: [{ type: "text", text: accumulatedText }] });
           },
           onPlanningComplete: () => {}
         });
 
+        // If we got no logs after a while, or the stream closed, proceed to fetch results
+        if (logCount === 0) {
+          await new Promise(r => setTimeout(r, 2000)); // Brief pause to ensure backend processed resume
+        }
+
         const [designPages, tasks, arch] = await Promise.all([
-          client.getDesignPages(params.projectId).catch(() => null),
-          client.getTasks(params.projectId).catch(() => null),
-          client.getArchitecture(params.projectId).catch(() => null),
+          client.getDesignPages(activeProjectId).catch(() => null),
+          client.getTasks(activeProjectId).catch(() => null),
+          client.getArchitecture(activeProjectId).catch(() => null),
         ]);
 
         function hasGeneratedData(data: unknown): boolean {
@@ -76,18 +91,20 @@ export function createContinueProjectTool(deps: {
         const logsText = logs.length > 0 ? `\n\n**Activity Log:**\n${logs.map(l => `- ${l}`).join("\n")}` : "";
 
         if (isGenerated) {
-          accumulatedText = `✅ **Generation complete!**\n${logsText}\n\nReview the design and architecture and start building.`;
+          const finalResult = `✅ **Generation complete!**${logsText}\n\nReview the design and architecture and start building.`;
+          onUpdate?.({ content: [{ type: "text", text: finalResult }] });
           return {
-            content: [{ type: "text", text: accumulatedText }],
+            content: [{ type: "text", text: finalResult }],
             details: {
               status: "complete",
               suggestions: ["start_building"]
             }
           };
         } else {
-          accumulatedText = `✅ **Agent execution finished, but no new designs were generated.**\n${logsText}`;
+          const finalResult = `✅ **Agent execution finished, but no new designs were generated.**${logsText}`;
+          onUpdate?.({ content: [{ type: "text", text: finalResult }] });
           return {
-            content: [{ type: "text", text: accumulatedText }],
+            content: [{ type: "text", text: finalResult }],
             details: {
               status: "complete",
               suggestions: ["continue", "review"]

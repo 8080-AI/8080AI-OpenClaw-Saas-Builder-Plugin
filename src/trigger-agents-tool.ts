@@ -1,6 +1,9 @@
 import { Type } from "@sinclair/typebox";
 import { AuthRequiredError, requireToken } from "./auth.ts";
-import { AuthError, createApiClient, AGENT_DISPLAY_NAMES } from "./api-client.ts";
+import { AuthError, createApiClient, AGENT_DISPLAY_NAMES, requireAuthenticatedClient } from "./api-client.ts";
+import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
+import { groupAgents } from "./command.ts";
+import { readActiveModel } from "./model-state.ts";
 
 export function createTriggerAgentsTool(deps: {
   stateDir: () => string;
@@ -9,8 +12,8 @@ export function createTriggerAgentsTool(deps: {
   return {
     name: "ai8080_trigger_agents",
     description:
-      "Trigger specific AI agents on 8080.ai after the user has clicked the 'Run Requirements/Designs' button. " +
-      "This starts the suggested agents working on the project requirements or designs.",
+      "Trigger specific AI agents on 8080.ai. " +
+      "If the user sends a raw button payload like '8080_trigger_agents_<projectId>_<agentsJsonArray>', you MUST use this tool. Extract the projectId and parse the JSON array of agents to pass as arguments. This starts the suggested agents working on the project.",
     parameters: Type.Object({
       projectId: Type.String({
         description: "The 8080.ai project ID to trigger agents for.",
@@ -29,44 +32,45 @@ export function createTriggerAgentsTool(deps: {
       const stateDir = deps.stateDir();
       const { apiBaseUrl } = deps;
 
-      let token: string;
       try {
-        token = await requireToken(stateDir);
-      } catch (err) {
-        if (err instanceof AuthRequiredError) {
-          return { content: [{ type: "text", text: err.message }], details: null };
+        const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
+        const activeModel = await readActiveModel(stateDir);
+        if (params.agents.includes('continue')) {
+          await client.resumeDesign(params.projectId);
+        } else {
+          await client.triggerAgents(params.projectId, params.agents, "", activeModel);
         }
-        throw err;
-      }
-
-      try {
-        const client = createApiClient({ token, apiBaseUrl });
-        await client.triggerAgents(params.projectId, params.agents);
         
-        const displayNames = params.agents.flatMap(a => {
-          if (a === 'plan_all') {
-            return ["SRD Agent", "User Flow Agent", "Design Agent"];
-          }
-          const label = AGENT_DISPLAY_NAMES[a] ?? a;
-          // Clean up emojis for the list if they are present in the constant
-          return [label.replace(/^[^a-zA-Z0-9\s]+/, '').trim()];
-        });
-        
-        let accumulatedText = `✅ Triggered agents: ${displayNames.join(", ")}\n\n`;
-        
+        let displayNames: string[] = [];
         if (params.agents.includes('plan_all')) {
-          accumulatedText += `[Agent] SRD Agent is running...\n`;
-          accumulatedText += `[Agent] User Flow Agent is running...\n`;
-          accumulatedText += `[Agent] Design Agent is running...\n\n`;
+          displayNames = ["System Requirements Agent", "User Flow Planner", "Tech Lead Agent"];
+        } else {
+          displayNames = params.agents.map(a => AGENT_DISPLAY_NAMES[a] ?? a);
         }
+        
+        let accumulatedText = `✅ **Triggered agents:** ${displayNames.join(", ")}\n\n`;
+        
+        for (const name of displayNames) {
+          accumulatedText += `⏳ [Agent] **${name}** is running...\n`;
+        }
+        accumulatedText += `\n`;
         
         onUpdate?.({ content: [{ type: "text", text: accumulatedText }], details: null });
 
-        // Stream events live to the dashboard
+        // Stream events live to the dashboard (with 60s timeout to prevent hangs)
         let pausedForReview = false;
-        await client.streamProjectEvents(params.projectId, {
+        let hasCompletedAgent = false;
+        const streamPromise = client.streamProjectEvents(params.projectId, {
           onAgentLog: (log) => {
-            accumulatedText += `\n[Agent] ${log.summary}`;
+            if (log.action === "completed") {
+              hasCompletedAgent = true;
+              accumulatedText += `✅ [Agent] **${log.agent_type}** completed: ${log.summary}\n`;
+            } else if (log.action === "started") {
+              accumulatedText += `⏳ [Agent] **${log.agent_type}** started: ${log.summary}\n`;
+            } else {
+              accumulatedText += `ℹ️ [Agent] **${log.agent_type}**: ${log.summary}\n`;
+            }
+            
             onUpdate?.({ content: [{ type: "text", text: accumulatedText }], details: null });
           },
           onChatMessage: (msg) => {
@@ -84,6 +88,15 @@ export function createTriggerAgentsTool(deps: {
             }
           },
         });
+
+        const timeoutPromise = new Promise<void>((resolve) => {
+          setTimeout(() => {
+            console.log("[8080.ai tool] streamProjectEvents timed out after 60s");
+            resolve();
+          }, 60_000);
+        });
+
+        await Promise.race([streamPromise, timeoutPromise]);
 
         if (pausedForReview) {
           accumulatedText += `\n\n**Planning complete — ready for your review.**\n\n`;
@@ -125,11 +138,21 @@ export function createTriggerAgentsTool(deps: {
         }
 
         if (finalAgentsAfter.length > 0) {
-          accumulatedText += `\n\n**Suggested Next Steps:**\n`;
-          finalAgentsAfter.forEach((agent, index) => {
-            const label = AGENT_DISPLAY_NAMES[agent] ?? agent;
-            accumulatedText += `${index + 1}. ${label}\n`;
-          });
+          const suggestionsText = buildSuggestedAgentsText(params.projectId, groupAgents(finalAgentsAfter));
+          accumulatedText += suggestionsText;
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: accumulatedText,
+              },
+            ],
+            details: {
+              status: "complete",
+              suggestions: finalAgentsAfter
+            }
+          };
         }
 
         return {
@@ -141,7 +164,7 @@ export function createTriggerAgentsTool(deps: {
           ],
           details: {
             status: "complete",
-            suggestions: finalAgentsAfter
+            suggestions: []
           }
         };
       } catch (err) {
