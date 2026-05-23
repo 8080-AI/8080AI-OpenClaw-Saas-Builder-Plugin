@@ -8,7 +8,23 @@
     ],
     "skills": [
       "./skills"
-    ]
+    ],
+    "contracts": {
+      "tools": [
+        "ai8080_login",
+        "ai8080_start_project",
+        "ai8080_send_message",
+        "ai8080_get_credits_balance",
+        "ai8080_get_project_status",
+        "ai8080_open_project_requirements",
+        "ai8080_continue_project",
+        "ai8080_trigger_agents",
+        "ai8080_list_projects",
+        "ai8080_select_project",
+        "ai8080_task_list",
+        "ai8080_manage_models"
+      ]
+    }
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0",

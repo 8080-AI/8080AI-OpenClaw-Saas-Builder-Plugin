@@ -1,10 +1,11 @@
 import { Type } from "@sinclair/typebox";
-import { requireAuthenticatedClient, AuthError } from "./api-client.ts";
+import { requireAuthenticatedClient, AuthError, filterStartBuildingAgents } from "./api-client.ts";
 import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
 import { readActiveModel } from "./model-state.ts";
 import { stripA2UI, groupAgents } from "./command.ts";
 import { writeActiveProject } from "./project-state.ts";
 import { writeLatestSuggestions } from "./suggestions-state.ts";
+import { log } from "../logger.ts";
 
 // AgentToolResult shape required by the OpenClaw SDK's onUpdate callback.
 type ToolContent = { type: "text"; text: string };
@@ -52,10 +53,13 @@ export function createStartProjectTool(deps: {
     ): Promise<ToolResult> {
       const stateDir = deps.stateDir();
       const { apiBaseUrl, sessionId } = deps;
-
+     
       const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
-
-      // --- Create project + stream the Tech Lead's initial reply token by token ---
+      log.info("start_project execute entered", {
+        prompt: params.user_raw_prompt,
+        mediaCount: params.MediaPaths?.length ?? 0,
+      });
+        // --- Create project + stream the Tech Lead's initial reply token by token ---
       let projectId: string;
       let accumulatedText = "";
       let suggestedAgents: string[] = [];
@@ -66,11 +70,12 @@ export function createStartProjectTool(deps: {
         // 1. Handle media uploads if present
         let mediaUrls: string[] = [];
         if (params.MediaPaths && params.MediaPaths.length > 0) {
+          log.info("Uploading media files", params.MediaPaths);
           try {
             // Use 'temp' since project ID isn't known yet
             mediaUrls = await client.uploadMedia(params.MediaPaths, "temp");
           } catch (uploadErr) {
-            console.error("[8080.ai] Media upload failed:", uploadErr);
+            log.info("Media upload failed", uploadErr);
           }
         }
 
@@ -84,12 +89,11 @@ export function createStartProjectTool(deps: {
             void stream(onUpdate, accumulatedText);
           },
           undefined,
-          (agents, pid) => {
-            // Handle suggested agents by showing them as a text list.
+          (agents, _pid) => {
+            log.info("Received agent suggestions from stream", agents);
+            // Collect suggestions and show them after the strict Start Building
+            // gate has checked the project events stream.
             suggestedAgents.push(...agents);
-            const grouped = groupAgents(agents);
-            const agentsDisplay = buildSuggestedAgentsText(pid, grouped, accumulatedText);
-            stream(onUpdate, `${accumulatedText}${agentsDisplay}`);
           },
           undefined,
           {
@@ -98,7 +102,8 @@ export function createStartProjectTool(deps: {
           }
         );
         projectId = result.projectId;
-
+        log.info("Project created", { projectId });
+        log.info("Project created-------", { projectId });
         // Store project_id in session state
         await writeActiveProject(stateDir, projectId, sessionId);
 
@@ -121,10 +126,15 @@ export function createStartProjectTool(deps: {
                 }
               }
             }
-            console.log(`[8080.ai tool] Fetched pending agents from status: ${JSON.stringify(suggestedAgents)}`);
+            log.info("Fetched pending agents from status", suggestedAgents);
           } catch (statusErr) {
-            console.error("[8080.ai tool] Failed to fetch project status for agents:", statusErr);
+            log.info("Failed to fetch project status for agents", statusErr);
           }
+        }
+
+        if (suggestedAgents.length > 0) {
+          log.info("start_building suggestions decision", { projectId, pending: suggestedAgents, allowStartBuilding: false });
+          suggestedAgents = filterStartBuildingAgents(suggestedAgents, false);
         }
 
         const groupedAgents = groupAgents(suggestedAgents);
@@ -143,9 +153,9 @@ export function createStartProjectTool(deps: {
         if (!isQuestion && suggestedAgents.length > 0) {
           finalResponse += `\n\n▶️ Type **"Run Plan All"** to proceed.`;
         }
-
+        log.info("Final response ready", { isQuestion, suggestedAgents });
         void stream(onUpdate, `🤖 **AI Response:**\n\n${finalResponse}`);
-
+        log.info("Initial response streamed.");
         return {
           content: [
             {

@@ -20,6 +20,7 @@
       "ai8080_trigger_agents",
       "ai8080_list_projects",
       "ai8080_select_project",
+      "ai8080_task_list",
       "ai8080_manage_models"
     ]
   },
@@ -29,10 +30,12 @@
     "properties": {
       "siteUrl": {
         "type": "string",
+        "default": "https://8080.ai/",
         "description": "Override the 8080.ai website URL (used for browser login). Default: https://8080.ai/"
       },
       "apiBaseUrl": {
         "type": "string",
+        "default": "https://api.8080.ai/api/v1",
         "description": "Override the 8080.ai API base URL. Default: https://api.8080.ai/api/v1"
       },
       "pollingTimeoutMs": {

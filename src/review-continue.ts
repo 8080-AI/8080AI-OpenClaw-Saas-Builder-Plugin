@@ -213,5 +213,5 @@ export function buildSuggestedAgentsText(
     return `${i + 1}. ${label}`;
   });
 
-  return `### Suggested Next Steps:\n${lines.join("\n")}\n\nType the name of a step (e.g. "Continue") or its number to proceed.`;
+  return `### Suggested Next Steps:\n${lines.join("\n")}\n`;
 }

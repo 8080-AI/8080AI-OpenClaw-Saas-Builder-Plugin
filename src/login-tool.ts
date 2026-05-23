@@ -1,7 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import open from "open";
 import { writeToken, clearToken } from "./auth.ts";
-import { validateToken } from "./api-client.ts";
+import { refreshAccessToken, validateToken } from "./api-client.ts";
 
 export function createLoginTool(deps: {
   stateDir: () => string;
@@ -19,11 +19,13 @@ export function createLoginTool(deps: {
         [
           Type.Literal("login"),
           Type.Literal("set-token"),
+          Type.Literal("set-tokens"),
         ],
         {
           description:
             "'login' opens the browser and shows token setup steps. " +
-            "'set-token' saves a token the user has already copied from the browser console.",
+            "'set-token' saves an auth token. " +
+            "'set-tokens' saves auth and refresh tokens for automatic renewal.",
         }
       ),
       token: Type.Optional(
@@ -33,11 +35,18 @@ export function createLoginTool(deps: {
             "The auth token from localStorage.getItem('auth_token') in the browser console.",
         })
       ),
+      refreshToken: Type.Optional(
+        Type.String({
+          description:
+            "Required only when action is 'set-tokens'. " +
+            "The refresh token from localStorage.getItem('refresh_token') in the browser console.",
+        })
+      ),
     }),
 
     async execute(
       _id: string,
-      params: { action: "login" | "set-token"; token?: string },
+      params: { action: "login" | "set-token" | "set-tokens"; token?: string; refreshToken?: string },
       _signal: AbortSignal | undefined,
       onUpdate: (partial: { content: { type: "text"; text: string }[] }) => void
     ) {
@@ -90,6 +99,57 @@ export function createLoginTool(deps: {
         };
       }
 
+      if (params.action === "set-tokens") {
+        const tok = params.token
+          ?.trim()
+          .replace(/^["']|["']$/g, "")
+          .replace(/^token:\s*/i, "")
+          .replace(/\s+/g, "");
+        const refreshToken = params.refreshToken
+          ?.trim()
+          .replace(/^["']|["']$/g, "")
+          .replace(/^refresh_token:\s*/i, "")
+          .replace(/\s+/g, "");
+
+        if (!tok || !refreshToken) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  "Please provide both tokens. Get them from the browser console:\n\n" +
+                  "```\nlocalStorage.getItem('auth_token')\nlocalStorage.getItem('refresh_token')\n```",
+              },
+            ],
+          };
+        }
+
+        onUpdate?.({ content: [{ type: "text", text: "🔄 Validating auth and refresh tokens with 8080.ai..." }] });
+
+        try {
+          await validateToken({ token: tok, apiBaseUrl: deps.apiBaseUrl });
+          const validToken = await refreshAccessToken({ apiBaseUrl: deps.apiBaseUrl, refreshToken });
+          const isValid = await validateToken({ token: validToken, apiBaseUrl: deps.apiBaseUrl });
+          if (!isValid) {
+            return {
+              content: [{ type: "text", text: "❌ Invalid auth token and refresh token. Please check both tokens and try again." }],
+            };
+          }
+
+          await writeToken(stateDir, validToken, { refreshToken });
+          const successMsg = "✅ Auth token and refresh token validated and saved. OpenClaw can now refresh your 8080.ai session automatically.";
+          onUpdate?.({ content: [{ type: "text", text: successMsg }] });
+
+          return {
+            content: [{ type: "text", text: successMsg }],
+          };
+        } catch (err) {
+          return {
+            content: [{ type: "text", text: `❌ Failed to validate tokens: ${err instanceof Error ? err.message : String(err)}` }],
+          };
+        }
+      }
+
       // action === "login"
       try {
         await open(siteUrl);
@@ -117,7 +177,9 @@ export function createLoginTool(deps: {
               `2. Sign in to your account.\n` +
               `3. Open the browser console (F12 → Console).\n` +
               `4. Run: \`localStorage.getItem('auth_token')\`\n` +
-              `5. Copy the token and paste it here: \`set my token <token>\`\n\n` +
+              `5. Optional auto-renew: \`localStorage.getItem('refresh_token')\`\n` +
+              `6. Copy the token and paste it here: \`set my token <token>\`\n\n` +
+              `For auto-renew in slash command mode, use: \`/ai8080 set-tokens <auth_token> <refresh_token>\`\n\n` +
               `I'll save it securely for your session.`,
           },
         ],

@@ -17,6 +17,7 @@ You have access to these 8080.ai tools. Use them when the user talks about 8080.
 | "build a todo app", "create an app", "start a project on 8080" | `ai8080_start_project` with full `requirements` |
 | "check my 8080 credits", "how many credits do I have" | `ai8080_get_credits_balance` |
 | "list my projects", "show all my 8080 projects", "how many projects do I have" | `ai8080_list_projects` |
+| "/ai8080 task-list", "task-list", "show project tasks", "list tasks for active project", "fetch /projects/{project_id}/tasks" | `ai8080_task_list` |
 | "select project", "switch to project X", "activate project Y" | `ai8080_select_project` with `projectId` |
 | "what's the status of my project", "check project X" | `ai8080_get_project_status` with `projectId` |
 | "send a message to my project", "tell 8080 to add dark mode", "for specific hair type" | `ai8080_send_message` (projectId is optional if project is already active) |
@@ -49,6 +50,7 @@ The 8080.ai plugin uses the OpenClaw Dashboard v2 features:
 ## Important notes
 
 - Always call `ai8080_login` first if the user hasn't authenticated yet.
+- For task-list requests, always use `ai8080_task_list`; never use `ai8080_list_projects`.
 - For `ai8080_start_project`, **pass the EXACT requirements from the user without expanding them**. If the user provides a short sentence, pass only that short sentence. Do not invent or add features they didn't ask for.
 - After `start_project` or `send_message`, the tool will return the exact response from the 8080.ai Tech Lead. **You MUST output the Tech Lead's response EXACTLY word-for-word to the user.** Do not summarize it. Do not change it.
 - After `start_project` or `send_message`, the response may include numbered next steps — tell the user they can say "choose option N" to trigger them.
