@@ -1,6 +1,6 @@
 import open from "open";
 import { writeToken, clearToken } from "./auth.ts";
-import { AuthError, AGENT_DISPLAY_NAMES, type BuildStep, requireAuthenticatedClient, validateToken, filterStartBuildingAgents, refreshAccessToken } from "./api-client.ts";
+import { AuthError, AGENT_DISPLAY_NAMES, type BuildStep, requireAuthenticatedClient, validateToken, filterStartBuildingAgents, refreshAccessToken, isReviewArchitectureStartBuildingChatMessage } from "./api-client.ts";
 import { readActiveProject, writeActiveProject } from "./project-state.ts";
 import {
   buildProjectSelectionJsonl,
@@ -12,7 +12,9 @@ import {
 } from "./review-continue.ts";
 import { writeLatestSuggestions, readLatestSuggestions } from "./suggestions-state.ts";
 import { readActiveModel, writeActiveModel, MODEL_OPTIONS } from "./model-state.ts";
+import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
+import { getDesignPreviewText } from "./design-preview.ts";
 import { log } from "../logger.ts";
 
 const HELP_TEXT = `8080.ai plugin commands:
@@ -47,21 +49,7 @@ export function stripA2UI(text: string): string {
  * Returns an empty array if null/undefined.
  */
 function extractSuggestedAgents(pending: Record<string, unknown> | null | undefined): string[] {
-  if (!pending || typeof pending !== 'object') return [];
-
-  // The field may be { agents: [...] } or { "agent_name": true } or similar.
-  // Try the 'agents' array first.
-  if (Array.isArray(pending.agents)) {
-    return pending.agents.filter((a: unknown): a is string => typeof a === 'string');
-  }
-
-  // Fallback: collect all string values
-  const agents: string[] = [];
-  for (const [key, val] of Object.entries(pending)) {
-    if (typeof val === 'string') agents.push(val);
-    else if (val === true) agents.push(key); // { "plan_all": true } format
-  }
-  return agents;
+  return extractPendingSuggestion(pending).agents;
 }
 
 /**
@@ -273,6 +261,7 @@ export function create8080Command(
             const activeModel = await readActiveModel(stateDir);
             let responseText = "";
             let suggestedAgents: string[] = [];
+            let suggestionMessageId = "";
 
             log.info("Initializing project and connecting to stream.");
 
@@ -283,8 +272,9 @@ export function create8080Command(
                 responseText += token;
               },
               undefined,
-              (agents) => {
+              (agents, _pid, messageId) => {
                 suggestedAgents.push(...agents);
+                if (messageId) suggestionMessageId = messageId;
               },
               { model: activeModel }
             );
@@ -293,6 +283,17 @@ export function create8080Command(
 
             // Store project_id in session state
             await writeActiveProject(stateDir, projectId, sessionId);
+
+            if (suggestedAgents.length === 0 || !suggestionMessageId) {
+              try {
+                const status = await client.getProjectStatus(projectId);
+                const pending = extractPendingSuggestion(status.pending_suggested_agents);
+                if (suggestedAgents.length === 0) suggestedAgents.push(...pending.agents);
+                if (pending.messageId) suggestionMessageId = pending.messageId;
+              } catch (statusErr) {
+                log.info("Failed to fetch project status for command suggestions", statusErr);
+              }
+            }
 
             if (suggestedAgents.length > 0) {
               suggestedAgents = filterStartBuildingAgents(suggestedAgents, false);
@@ -303,7 +304,7 @@ export function create8080Command(
               await writeLatestSuggestions(stateDir, sessionId, {
                 projectId,
                 agents: groupedAgents,
-                messageId: "", // streamProjectCreation doesn't always have a msgId, but triggerAgents needs one. 8080 seems to allow empty or placeholder for initial.
+                messageId: suggestionMessageId,
               });
             }
 
@@ -562,15 +563,13 @@ export function create8080Command(
               sessionId,
               agents: defaultAgents,
             });
-            const nextStepsText = buildSuggestedAgentsText(selected.id, defaultAgents);
             const presentation = buildSuggestedAgentsPresentation(selected.id, defaultAgents);
             return {
               text:
                 `✅ Project \`${selected.title}\` is now active for this OpenClaw session. (${selected.id})\n\n` +
                 `### Suggested Next Steps:\n` +
                 `1. 🛠️ Start Building\n\n` +
-                `Type \`/ai8080 select-button 1\` or \`Start Building\` to proceed.\n\n` +
-                nextStepsText,
+                `Type \`/ai8080 select-button 1\` or \`Start Building\` to proceed.`,
               presentation,
             };
           } catch (err) {
@@ -801,6 +800,7 @@ export function create8080Command(
                 activeModel,
               });
               await client.startBuilding(suggestions.projectId, activeModel);
+              const designPreviewText = await getDesignPreviewText(client, suggestions.projectId, siteUrl);
               log.info("start_building selected build api completed", {
                 projectId: suggestions.projectId,
                 activeModel,
@@ -809,7 +809,8 @@ export function create8080Command(
               return {
                 text:
                   `✅ **Building Started!** Agents are now writing your software.` +
-                  (taskSummaryText ? `\n\n${taskSummaryText}` : ""),
+                  (taskSummaryText ? `\n\n${taskSummaryText}` : "") +
+                  designPreviewText,
               };
             }
 
@@ -836,9 +837,26 @@ export function create8080Command(
 
               let pausedForReview = false;
               const logs: string[] = [];
+              let lastProjectEvent: Record<string, unknown> | null = null;
 
               // Await stream so we can monitor generation
               await client.streamProjectEvents(suggestions.projectId, {
+                onRaw: (raw) => {
+                  try {
+                    lastProjectEvent = JSON.parse(raw) as Record<string, unknown>;
+                    log.info("command_continue /events raw event", {
+                      projectId: suggestions.projectId,
+                      type: lastProjectEvent.type,
+                      action: lastProjectEvent.action,
+                      content: typeof lastProjectEvent.content === "string"
+                        ? lastProjectEvent.content.slice(0, 240)
+                        : undefined,
+                      matchesStartBuildingReviewMessage: isReviewArchitectureStartBuildingChatMessage(lastProjectEvent),
+                    });
+                  } catch (err) {
+                    log.info("command_continue /events raw parse failed", { projectId: suggestions.projectId, raw, err });
+                  }
+                },
                 onAgentLog: (log) => {
                   logs.push(`[${log.agent_type}] ${log.summary}`);
                 },
@@ -850,7 +868,18 @@ export function create8080Command(
                     pausedForReview = true;
                   }
                 },
-                idleTimeoutMs: 600_000,
+                idleTimeoutMs: 60_000,
+                progressTimeoutMs: 45_000,
+                maxTimeoutMs: 180_000,
+              });
+              const eventEndedWithStartBuildingMessage = isReviewArchitectureStartBuildingChatMessage(lastProjectEvent);
+              log.info("command_continue /events final event decision", {
+                projectId: suggestions.projectId,
+                lastEventType: lastProjectEvent?.type,
+                lastEventContent: typeof lastProjectEvent?.content === "string"
+                  ? lastProjectEvent.content.slice(0, 240)
+                  : undefined,
+                eventEndedWithStartBuildingMessage,
               });
 
               // Check if any of the three endpoints generated data
@@ -929,34 +958,59 @@ export function create8080Command(
                 const hasCompletedAgentLog = canBuildForPlan
                   ? await client.hasLatestCompletedAgentLog(suggestions.projectId)
                   : false;
+                const canShowStartBuilding = canBuildForPlan && hasCompletedAgentLog && eventEndedWithStartBuildingMessage;
+                const statusAfterReadiness = await client.getProjectStatus(suggestions.projectId).catch(() => null);
+                const pendingAfterReadiness = extractPendingSuggestion(statusAfterReadiness?.pending_suggested_agents);
+                const backendResumeSuggestions = pendingAfterReadiness.agents.filter((agent) =>
+                  agent === "continue" || agent === "review"
+                );
+                const hasBackendContinue = backendResumeSuggestions.includes("continue");
                 log.info("agent_logs continue override decision", {
                   projectId: suggestions.projectId,
                   source: "command_continue",
                   hasCompletedAgentLog,
+                  eventEndedWithStartBuildingMessage,
+                  backendResumeSuggestions,
+                  hasBackendContinue,
                   hasTasks,
                   hasArchitecture,
                   canBuildForPlan,
-                  willOverrideToContinue: false,
-                  reason: "tasks_and_architecture_ready_agent_log_completed_is_not_ui_continue",
+                  willShowStartBuilding: canShowStartBuilding,
+                  reason: canShowStartBuilding
+                    ? "tasks_architecture_completed_agent_log_and_events_review_message_ready"
+                    : !eventEndedWithStartBuildingMessage
+                      ? "waiting_for_events_review_start_building_message"
+                      : "waiting_for_completed_agent_log_before_start_building",
                 });
-                const nextAgents = canBuildForPlan ? ["start_building"] : [];
+                const nextAgents = canShowStartBuilding
+                  ? ["start_building"]
+                  : canBuildForPlan && hasBackendContinue
+                    ? backendResumeSuggestions
+                    : [];
                 const startBuildingAgents = groupAgents(nextAgents);
                 log.info("suggestions final decision before write", {
                   projectId: suggestions.projectId,
                   source: "command_continue",
                   suggestions: startBuildingAgents,
-                  writeSuggestions: canBuildForPlan,
+                  writeSuggestions: startBuildingAgents.length > 0,
                   hasCompletedAgentLog,
+                  eventEndedWithStartBuildingMessage,
+                  backendResumeSuggestions,
+                  hasBackendContinue,
                   hasTasks,
                   hasArchitecture,
                   subscriptionTier,
                   canBuildForPlan,
                 });
-                if (canBuildForPlan) {
-                  log.info("start_building added", {
+                if (startBuildingAgents.length > 0) {
+                  log.info("post-generation suggestions updated", {
                     projectId: suggestions.projectId,
                     source: "command_continue",
-                    reason: "resume_completed_with_architecture_and_tasks",
+                    reason: canShowStartBuilding
+                      ? "resume_completed_with_architecture_tasks_completed_agent_log_and_events_review_message"
+                      : eventEndedWithStartBuildingMessage
+                        ? "waiting_for_completed_agent_log_continue_retry"
+                        : "waiting_for_events_review_start_building_message",
                   });
                   await writeLatestSuggestions(stateDir, sessionId, {
                     projectId: suggestions.projectId,
@@ -964,9 +1018,13 @@ export function create8080Command(
                     messageId: suggestions.messageId || "",
                   });
                 }
-                const buildActionText = canBuildForPlan
+                const buildActionText = canShowStartBuilding
                   ? buildSuggestedAgentsText(suggestions.projectId, startBuildingAgents)
-                  : getUpgradeToBuildText(siteUrl);
+                  : canBuildForPlan
+                    ? eventEndedWithStartBuildingMessage
+                      ? `8080.ai is still finishing the latest agent step. I will show Continue only after 8080.ai exposes it.${startBuildingAgents.length > 0 ? `\n\n${buildSuggestedAgentsText(suggestions.projectId, startBuildingAgents)}` : ""}`
+                      : `8080.ai has not emitted the final /events review/start-building message yet. I will show Continue only after 8080.ai exposes it.${startBuildingAgents.length > 0 ? `\n\n${buildSuggestedAgentsText(suggestions.projectId, startBuildingAgents)}` : ""}`
+                    : getUpgradeToBuildText(siteUrl);
                 try {
                   const share = await client.createDesignShare(suggestions.projectId);
                   // Build the public share URL, prioritizing the design-specific format with share_id
@@ -987,20 +1045,38 @@ export function create8080Command(
                     `Share this link with anyone to preview the generated design, architecture, and requirements.\n\n` +
                     buildActionText +
                     `Type \`/ai8080 list\` to see your projects anytime.`,
-                  presentation: canBuildForPlan
+                  presentation: startBuildingAgents.length > 0
                     ? buildSuggestedAgentsPresentation(suggestions.projectId, startBuildingAgents)
                     : undefined,
                 };
               } else {
-                const continueAgents = groupAgents(["continue"]);
+                const statusAfterNoOutputs = await client.getProjectStatus(suggestions.projectId).catch(() => null);
+                const pendingAfterNoOutputs = extractPendingSuggestion(statusAfterNoOutputs?.pending_suggested_agents);
+                const continueAgents = groupAgents(
+                  pendingAfterNoOutputs.agents.filter((agent) => agent === "continue" || agent === "review")
+                );
+                const hasBackendContinue = continueAgents.includes("continue");
+                log.info("command_continue backend suggestion gate no outputs", {
+                  projectId: suggestions.projectId,
+                  pendingSuggestions: pendingAfterNoOutputs.agents,
+                  filteredSuggestions: continueAgents,
+                  hasBackendContinue,
+                });
                 await writeLatestSuggestions(stateDir, sessionId, {
                   projectId: suggestions.projectId,
                   agents: continueAgents,
-                  messageId: suggestions.messageId || "",
+                  messageId: pendingAfterNoOutputs.messageId || suggestions.messageId || "",
                 });
+                if (!hasBackendContinue) {
+                  return {
+                    text:
+                      `⏳ **8080.ai is still working.**\n${logsText}\n\n` +
+                      `Continue is not available yet on 8080.ai, so I am not showing it in OpenClaw yet.`,
+                  };
+                }
                 return {
                   text:
-                    `✅ **Agent execution finished, but no new designs were generated.**\n${logsText}\n\n` +
+                    `✅ **Checkpoint reached.**\n${logsText}\n\n` +
                     buildSuggestedAgentsText(suggestions.projectId, continueAgents),
                   presentation: buildSuggestedAgentsPresentation(suggestions.projectId, continueAgents),
                 };
@@ -1035,6 +1111,9 @@ export function create8080Command(
                   pausedForReview = true;
                 }
               },
+              idleTimeoutMs: 60_000,
+              progressTimeoutMs: 45_000,
+              maxTimeoutMs: 180_000,
             });
 
             if (pausedForReview) {
@@ -1077,17 +1156,17 @@ export function create8080Command(
 
             // Fetch fresh suggestions from the project detail
             const projectStatusAfter = await client.getProjectStatus(suggestions.projectId);
-            const pendingAgentsAfter = extractSuggestedAgents(projectStatusAfter.pending_suggested_agents);
+            const pendingSuggestionAfter = extractPendingSuggestion(projectStatusAfter.pending_suggested_agents);
+            const pendingAgentsAfter = pendingSuggestionAfter.agents;
             let finalAgentsAfter = [...pendingAgentsAfter];
 
-            // Fallback: if no suggestions came back, offer Continue only once
-            // /agent-logs says the latest agent step completed.
-            if (finalAgentsAfter.length === 0 && projectStatusAfter.status === 'active') {
-              const hasCompletedLog = await client.hasLatestCompletedAgentLog(suggestions.projectId);
-              if (hasCompletedLog) {
-                finalAgentsAfter.push('continue');
-              }
-            }
+            log.info("command trigger backend suggested agents after events", {
+              projectId: suggestions.projectId,
+              pendingAgents: finalAgentsAfter,
+              reason: finalAgentsAfter.includes("continue")
+                ? "backend_exposed_continue"
+                : "backend_has_not_exposed_continue",
+            });
 
             if (finalAgentsAfter.length > 0) {
               log.info("start_building suggestions decision", {
@@ -1103,7 +1182,7 @@ export function create8080Command(
             await writeLatestSuggestions(stateDir, sessionId, {
               projectId: suggestions.projectId,
               agents: groupedAgentsAfter,
-              messageId: ""
+              messageId: pendingSuggestionAfter.messageId || suggestions.messageId || ""
             });
 
             const agentList = groupedAgentsAfter.length > 0

@@ -30,6 +30,16 @@ export function isPauseForReviewText(text: unknown): boolean {
   return mentionsReview && mentionsContinue && (mentionsReadyForReview || mentionsClickActions);
 }
 
+export function isReviewArchitectureStartBuildingChatMessage(data: unknown): boolean {
+  if (!data || typeof data !== "object") return false;
+  const event = data as Record<string, unknown>;
+  return (
+    event.type === "chat_message" &&
+    typeof event.content === "string" &&
+    /Review the design and architecture and start building/i.test(event.content)
+  );
+}
+
 function getPauseForReviewStatus(data: Record<string, unknown>): { status: string; triggered_by?: string } | null {
   if (data.status === "paused_for_review") {
     return {
@@ -66,6 +76,11 @@ function debugResponseSummary(label: string, data: unknown): string {
   return `${label}=${typeof data}`;
 }
 
+function previewLogText(value: unknown, maxLength = 240): string | undefined {
+  if (typeof value !== "string") return undefined;
+  return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
+}
+
 function summarizeAgentLogs(logs: AgentLog[], limit = 5) {
   return [...logs]
     .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
@@ -77,6 +92,11 @@ function summarizeAgentLogs(logs: AgentLog[], limit = 5) {
       created_at: entry.created_at,
       message_id: entry.message_id,
     }));
+}
+
+function normalizeAiChatModel(model: string | undefined): string | undefined {
+  if (model === "large" || model === "super_large") return undefined;
+  return model;
 }
 
 export class ApiError extends Error {
@@ -284,7 +304,15 @@ async function apiFetch(
   }
   // Debug log for project detail calls
   if (path.match(/^\/projects\/[^/]+$/) && path !== "/projects/") {
-    log.info("Project detail response", data);
+    const project = (data?.project ?? data) as Record<string, unknown> | undefined;
+    const messages = Array.isArray(data?.messages) ? data.messages : [];
+    log.info("Project detail response", {
+      projectId: project?.id,
+      status: project?.status,
+      updatedAt: project?.updated_at,
+      messagesCount: messages.length,
+      pendingSuggestedAgents: data?.pending_suggested_agents ?? null,
+    });
   }
   return data;
 }
@@ -404,75 +432,103 @@ export function createApiClient(opts: ClientOpts) {
       const projectId = createRes.project_id;
       log.info("Project created. Triggering AI stream...", { projectId });
 
-      // 2. Trigger the AI response stream using the dedicated trigger endpoint
-      const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/chat/messages/ai/stream-trigger`;
-      const res = await fetchWithAuth(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "text/event-stream",
-        },
-        body: JSON.stringify({
-          project_id: projectId,
-          model: options?.model,
-        }),
-      });
-
-      if (res.status === 401) throw new AuthError();
-      if (!res.ok) {
-        let msg = `HTTP ${res.status}`;
-        try {
-          msg += `: ${await res.text()}`;
-        } catch { }
-        throw new ApiError(res.status, msg);
-      }
-
-      if (!res.body) throw new Error("No response body in stream");
-
-      return new Promise((resolve, reject) => {
-        let isDone = false;
-        let accumulatedText = "";
-
-        const parser = createParser({
-          onEvent: (event) => {
-            if (onRaw) onRaw(event.data);
-            try {
-              const data = JSON.parse(event.data);
-
-              if (data.type === "token" && data.content) {
-                accumulatedText += data.content;
-                onToken(data.content);
-              } else if ((data.type === "suggested_agents" || data.agents || data.suggestedAgents) && onAgents) {
-                const agentsData = data.agents || data.suggested_agents || data.suggestedAgents || [];
-                const agents = Array.isArray(agentsData) ? agentsData : Object.keys(agentsData);
-                if (agents.length > 0) {
-                  onAgents(agents, projectId, data.message_id || data.messageId || "");
-                }
-              }
-            } catch (err) { }
-          }
+      const triggerStream = async (model?: string): Promise<void> => {
+        // 2. Trigger the AI response stream using the dedicated trigger endpoint
+        const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/chat/messages/ai/stream-trigger`;
+        const body = model ? { project_id: projectId, model } : { project_id: projectId };
+        log.info("streamProjectCreation trigger request", { projectId, body });
+        const res = await fetchWithAuth(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "text/event-stream",
+          },
+          body: JSON.stringify(body),
         });
 
-        const reader = res.body!.getReader();
-        const decoder = new TextDecoder("utf-8");
-
-        function pump() {
-          reader.read().then(({ done, value }) => {
-            if (done) {
-              if (!isDone) {
-                isDone = true;
-                resolve({ projectId });
-              }
-              return;
-            }
-            if (value) {
-              parser.feed(decoder.decode(value, { stream: true }));
-            }
-            if (!isDone) pump();
-          }).catch(reject);
+        if (res.status === 401) throw new AuthError();
+        if (!res.ok) {
+          let msg = `HTTP ${res.status}`;
+          try {
+            msg += `: ${await res.text()}`;
+          } catch { }
+          throw new ApiError(res.status, msg);
         }
-        pump();
-      });
+
+        if (!res.body) throw new Error("No response body in stream");
+
+        await new Promise<void>((resolve, reject) => {
+          let isDone = false;
+          let accumulatedText = "";
+
+          const parser = createParser({
+            onEvent: (event) => {
+              if (onRaw) onRaw(event.data);
+              try {
+                const data = JSON.parse(event.data);
+
+                if (data.type === "token" && data.content) {
+                  accumulatedText += data.content;
+                  onToken(data.content);
+                } else if (data.type === "error") {
+                  const errorMsg = data.message || data.content || JSON.stringify(data);
+                  log.info("streamProjectCreation SSE error", { projectId, model, error: errorMsg });
+                  if (!isDone) {
+                    isDone = true;
+                    reject(new Error(String(errorMsg)));
+                  }
+                } else if ((data.type === "suggested_agents" || data.agents || data.suggestedAgents) && onAgents) {
+                  const agentsData = data.agents || data.suggested_agents || data.suggestedAgents || [];
+                  const agents = Array.isArray(agentsData) ? agentsData : Object.keys(agentsData);
+                  if (agents.length > 0) {
+                    onAgents(agents, projectId, data.message_id || data.messageId || "");
+                  }
+                }
+              } catch (err) {
+                log.info("Failed to parse streamProjectCreation SSE event data", event.data, err);
+              }
+            }
+          });
+
+          const reader = res.body!.getReader();
+          const decoder = new TextDecoder("utf-8");
+
+          function pump() {
+            reader.read().then(({ done, value }) => {
+              if (done) {
+                if (!isDone) {
+                  isDone = true;
+                  resolve();
+                }
+                return;
+              }
+              if (value) {
+                parser.feed(decoder.decode(value, { stream: true }));
+              }
+              if (!isDone) pump();
+            }).catch(reject);
+          }
+          pump();
+        });
+      };
+
+      const modelToSend = normalizeAiChatModel(options?.model);
+      try {
+        await triggerStream(modelToSend);
+      } catch (err) {
+        if (modelToSend) {
+          log.info("streamProjectCreation retrying trigger with default model", {
+            projectId,
+            failedModel: modelToSend,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          await triggerStream(undefined);
+        } else {
+          throw err;
+        }
+      }
+
+      return { projectId };
     },
 
     // 8080.ai uses /projects/{id} (no slash) for detail
@@ -507,10 +563,14 @@ export function createApiClient(opts: ClientOpts) {
     // Resume the design pipeline after user review gate
     // POST /chat/resume-design with { project_id, phase }
     async resumeDesign(projectId: string): Promise<void> {
-      await post(`/chat/resume-design`, {
+      const path = `/chat/resume-design`;
+      const body = {
         project_id: projectId,
         // phase,
-      });
+      };
+      log.info("resume_design api request", { projectId, path, body });
+      const response = await post(path, body);
+      log.info("resume_design api response", { projectId, path, response });
     },
 
     async getDesignPages(projectId: string): Promise<unknown> {
@@ -520,7 +580,18 @@ export function createApiClient(opts: ClientOpts) {
     async getTasks(projectId: string): Promise<unknown> {
       const data = await get(`/projects/${projectId}/tasks`);
       log.info("start_building readiness tasks", { projectId, summary: debugResponseSummary("tasks", data) });
-      log.info("start_building tasks response", { projectId, tasks: data });
+      log.info("start_building tasks response", {
+        projectId,
+        count: Array.isArray(data) ? data.length : 0,
+        latestFive: Array.isArray(data)
+          ? data.slice(0, 5).map((task: Record<string, unknown>) => ({
+            title: task.title,
+            status: task.status,
+            priority: task.priority,
+            task_number: task.task_number,
+          }))
+          : [],
+      });
       return data;
     },
 
@@ -752,16 +823,32 @@ export function createApiClient(opts: ClientOpts) {
         onRaw?: (raw: string) => void;
         idleTimeoutMs?: number;
         maxTimeoutMs?: number;
+        progressTimeoutMs?: number;
       }
     ): Promise<void> {
       const controller = new AbortController();
       const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/projects/${projectId}/events`;
+      log.info("project_events api request", {
+        projectId,
+        url,
+        method: "GET",
+        accept: "text/event-stream",
+        idleTimeoutMs: callbacks.idleTimeoutMs,
+        progressTimeoutMs: callbacks.progressTimeoutMs,
+        maxTimeoutMs: callbacks.maxTimeoutMs,
+      });
       const res = await fetchWithAuth(url, {
         method: "GET",
         headers: {
           Accept: "text/event-stream",
         },
         signal: controller.signal,
+      });
+      log.info("project_events api response", {
+        projectId,
+        url,
+        status: res.status,
+        statusText: res.statusText,
       });
 
       if (res.status === 401) throw new AuthError();
@@ -782,7 +869,27 @@ export function createApiClient(opts: ClientOpts) {
           if (callbacks.onRaw) callbacks.onRaw(event.data);
           try {
             const data = JSON.parse(event.data);
+            log.info("project_events event received", {
+              projectId,
+              type: data.type,
+              action: data.action,
+              agent_type: data.agent_type,
+              status: data.status,
+              content: previewLogText(data.content),
+              summary: previewLogText(data.summary),
+              matchesStartBuildingReviewMessage: isReviewArchitectureStartBuildingChatMessage(data),
+            });
             const pauseStatus = getPauseForReviewStatus(data);
+            const isProgressEvent =
+              data.type === "agent_log" ||
+              data.type === "chat_message" ||
+              data.type === "srd_stream_chunk" ||
+              data.type === "ai_overview_text" ||
+              data.type === "planning_complete" ||
+              Boolean(pauseStatus);
+            if (isProgressEvent) {
+              lastProgressAt = Date.now();
+            }
             if (data.type === "agent_log" && callbacks.onAgentLog) {
               callbacks.onAgentLog(data);
             } else if (data.type === "chat_message" && callbacks.onChatMessage) {
@@ -812,7 +919,10 @@ export function createApiClient(opts: ClientOpts) {
       const reader = body.getReader();
       const decoder = new TextDecoder("utf-8");
       const idleTimeoutMs = callbacks.idleTimeoutMs ?? 120_000;
+      const progressTimeoutMs = callbacks.progressTimeoutMs ?? 90_000;
+      let lastProgressAt = Date.now();
       let maxTimedOut = false;
+      let progressTimedOut = false;
       const maxTimeout = callbacks.maxTimeoutMs
         ? setTimeout(() => {
           maxTimedOut = true;
@@ -849,15 +959,33 @@ export function createApiClient(opts: ClientOpts) {
             reader.cancel().catch(() => { });
             break;
           }
+          if (Date.now() - lastProgressAt > progressTimeoutMs) {
+            progressTimedOut = true;
+            log.info("streamProjectEvents progress timeout reached", {
+              projectId,
+              progressTimeoutMs,
+            });
+            reader.cancel().catch(() => { });
+            controller.abort();
+            break;
+          }
         }
       } catch (err) {
         if (maxTimedOut) {
           log.info("Stream stopped after max timeout", { projectId });
+        } else if (progressTimedOut) {
+          log.info("Stream stopped after progress timeout", { projectId });
         } else {
           log.info("Stream error", err);
         }
       } finally {
         if (maxTimeout) clearTimeout(maxTimeout);
+        log.info("project_events stream finished", {
+          projectId,
+          maxTimedOut,
+          progressTimedOut,
+          planningComplete,
+        });
       }
     },
 
