@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import { requireAuthenticatedClient, AuthError, filterStartBuildingAgents } from "./api-client.ts";
+import { requireAuthenticatedClient, AuthError, filterStartBuildingAgents, isReviewArchitectureStartBuildingChatMessage } from "./api-client.ts";
 import {
   buildSuggestedAgentsPresentation,
   buildSuggestedAgentsJsonl,
@@ -7,7 +7,9 @@ import {
 } from "./review-continue.ts";
 import { groupAgents, hasGeneratedData } from "./command.ts";
 import { readActiveModel } from "./model-state.ts";
+import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
+import { getDesignPreviewText } from "./design-preview.ts";
 import { log } from "../logger.ts";
 
 // AgentToolResult shape required by the OpenClaw SDK's onUpdate callback.
@@ -113,8 +115,23 @@ export function createSendMessageTool(deps: {
           } else {
             agents = lastSuggestions?.agents ?? ["plan_all"];
           }
-          log.info("send_message selection decision", { agents, action });
-          const messageId = lastSuggestions?.messageId ?? "";
+          let messageId = lastSuggestions?.messageId ?? "";
+          if (action === "trigger" && !messageId) {
+            try {
+              const status = await client.getProjectStatus(activeProjectId);
+              const pending = extractPendingSuggestion(status.pending_suggested_agents);
+              messageId = pending.messageId;
+              log.info("send_message selection hydrated message id", {
+                projectId: activeProjectId,
+                agents,
+                messageId,
+                pendingAgents: pending.agents,
+              });
+            } catch (err) {
+              log.info("send_message failed to hydrate message id", err);
+            }
+          }
+          log.info("send_message selection decision", { agents, action, messageId });
 
           if (action === "review") {
             const reviewUrl = `${siteUrl}/planning/${activeProjectId}/requirements`;
@@ -180,6 +197,7 @@ export function createSendMessageTool(deps: {
               activeModel: model,
             });
             await client.startBuilding(activeProjectId, model);
+            const designPreviewText = await getDesignPreviewText(client, activeProjectId, siteUrl);
             log.info("start_building selected build api completed", {
               projectId: activeProjectId,
               activeModel: model,
@@ -190,7 +208,8 @@ export function createSendMessageTool(deps: {
                 type: "text",
                 text:
                   `✅ **Building Started!** Agents are now writing your software.` +
-                  (taskSummaryText ? `\n\n${taskSummaryText}` : ""),
+                  (taskSummaryText ? `\n\n${taskSummaryText}` : "") +
+                  designPreviewText,
               }],
               details: { projectId: activeProjectId, action: "build", status: "started" },
             };
@@ -205,7 +224,7 @@ export function createSendMessageTool(deps: {
                 await writeLatestSuggestions(stateDir, sessionId, {
                   projectId: activeProjectId,
                   agents: finalAgents,
-                  messageId: "",
+                  messageId,
                 });
                 const text =
                   `${err.message}\n\n` +
@@ -239,14 +258,36 @@ export function createSendMessageTool(deps: {
           // Monitor logs live
           let hasCompletedAgent = false;
           let pausedForReview = false;
-          const eventIdleTimeoutMs = 600_000;
+          let lastProjectEvent: Record<string, unknown> | null = null;
+          const eventIdleTimeoutMs = 60_000;
+          const eventProgressTimeoutMs = 45_000;
+          const eventMaxTimeoutMs = 180_000;
           log.info("send_message streamProjectEvents start", {
             projectId: activeProjectId,
             agents,
             action,
             idleTimeoutMs: eventIdleTimeoutMs,
+            progressTimeoutMs: eventProgressTimeoutMs,
+            maxTimeoutMs: eventMaxTimeoutMs,
           });
           await client.streamProjectEvents(activeProjectId, {
+            onRaw: (raw) => {
+              try {
+                lastProjectEvent = JSON.parse(raw) as Record<string, unknown>;
+                log.info("send_message /events raw event", {
+                  projectId: activeProjectId,
+                  action,
+                  type: lastProjectEvent.type,
+                  eventAction: lastProjectEvent.action,
+                  content: typeof lastProjectEvent.content === "string"
+                    ? lastProjectEvent.content.slice(0, 240)
+                    : undefined,
+                  matchesStartBuildingReviewMessage: isReviewArchitectureStartBuildingChatMessage(lastProjectEvent),
+                });
+              } catch (err) {
+                log.info("send_message /events raw parse failed", { projectId: activeProjectId, action, raw, err });
+              }
+            },
             onAgentLog: (log) => {
               if (log.action === "completed") {
                 hasCompletedAgent = true;
@@ -268,6 +309,8 @@ export function createSendMessageTool(deps: {
               }
             },
             idleTimeoutMs: eventIdleTimeoutMs,
+            progressTimeoutMs: eventProgressTimeoutMs,
+            maxTimeoutMs: eventMaxTimeoutMs,
           });
           log.info("send_message streamProjectEvents finished", {
             projectId: activeProjectId,
@@ -275,28 +318,39 @@ export function createSendMessageTool(deps: {
             pausedForReview,
             hasCompletedAgent,
           });
+          const eventEndedWithStartBuildingMessage = isReviewArchitectureStartBuildingChatMessage(lastProjectEvent);
+          log.info("send_message /events final event decision", {
+            projectId: activeProjectId,
+            action,
+            lastEventType: lastProjectEvent?.type,
+            lastEventContent: typeof lastProjectEvent?.content === "string"
+              ? lastProjectEvent.content.slice(0, 240)
+              : undefined,
+            eventEndedWithStartBuildingMessage,
+          });
 
           // Show suggestions at the end
           let finalAgents: string[] = [];
+          let finalMessageId = messageId;
 
           if (pausedForReview) {
             finalAgents = ["continue", "review"];
           } else {
             const statusAfter = await client.getProjectStatus(activeProjectId);
 
-            if (statusAfter.pending_suggested_agents) {
-              finalAgents = Object.keys(statusAfter.pending_suggested_agents).filter(k => statusAfter.pending_suggested_agents![k] === true);
-            }
+            const pending = extractPendingSuggestion(statusAfter.pending_suggested_agents);
+            finalAgents = pending.agents;
+            if (pending.messageId) finalMessageId = pending.messageId;
 
-            // Fallback to Continue only when the agent-log timeline says the
-            // current agent run has completed. While an agent is still running,
-            // avoid presenting stale Review/Continue choices.
-            if (finalAgents.length === 0) {
-              const hasCompletedLog = await client.hasLatestCompletedAgentLog(activeProjectId);
-              if (hasCompletedLog) {
-                finalAgents = ["continue"];
-              }
-            }
+            log.info("send_message backend suggested agents after events", {
+              projectId: activeProjectId,
+              action,
+              pendingAgents: finalAgents,
+              messageId: finalMessageId,
+              reason: finalAgents.includes("continue")
+                ? "backend_exposed_continue"
+                : "backend_has_not_exposed_continue",
+            });
           }
 
           // Final Readiness Check: Architecture and Tasks
@@ -337,28 +391,50 @@ export function createSendMessageTool(deps: {
               // Add "Start Building" to the agents if not already there
               if (canBuildForPlan) {
                 const hasCompletedLog = await client.hasLatestCompletedAgentLog(activeProjectId);
+                const canShowStartBuilding = hasCompletedLog && eventEndedWithStartBuildingMessage;
+                const backendResumeSuggestions = finalAgents.filter((agent) => agent === "continue" || agent === "review");
+                const hasBackendContinue = backendResumeSuggestions.includes("continue");
                 log.info("agent_logs continue override decision", {
                   projectId: activeProjectId,
                   source: "send_message_tool",
                   action,
                   hasCompletedLog,
+                  eventEndedWithStartBuildingMessage,
+                  backendResumeSuggestions,
+                  hasBackendContinue,
                   hasArchitecture,
                   hasTasks,
                   canBuildForPlan,
-                  willOverrideToContinue: false,
-                  reason: "tasks_and_architecture_ready_agent_log_completed_is_not_ui_continue",
+                  willShowStartBuilding: canShowStartBuilding,
+                  reason: canShowStartBuilding
+                    ? "tasks_architecture_completed_agent_log_and_events_review_message_ready"
+                    : !eventEndedWithStartBuildingMessage
+                      ? "waiting_for_events_review_start_building_message"
+                      : "waiting_for_completed_agent_log_before_start_building",
                 });
-                log.info("start_building added", {
-                  projectId: activeProjectId,
-                  reason: action === "resume" ? "resume_completed_with_architecture_and_tasks" : "architecture_and_tasks",
-                });
-                finalAgents = ["start_building"];
+                if (canShowStartBuilding) {
+                  log.info("start_building added", {
+                    projectId: activeProjectId,
+                    reason: action === "resume"
+                      ? "resume_completed_with_architecture_tasks_completed_agent_log_and_events_review_message"
+                      : "architecture_tasks_completed_agent_log_and_events_review_message",
+                  });
+                  finalAgents = ["start_building"];
+                } else {
+                  readinessText += eventEndedWithStartBuildingMessage
+                    ? `\n8080.ai is still finishing the latest agent step. I will show Continue only after 8080.ai exposes it.`
+                    : `\n8080.ai has not emitted the final /events review/start-building message yet. I will show Continue only after 8080.ai exposes it.`;
+                  finalAgents = hasBackendContinue ? backendResumeSuggestions : [];
+                }
                 log.info("suggestions final decision before write", {
                   projectId: activeProjectId,
                   source: "send_message_tool",
                   action,
                   suggestions: finalAgents,
                   hasCompletedAgentLog: hasCompletedLog,
+                  eventEndedWithStartBuildingMessage,
+                  backendResumeSuggestions,
+                  hasBackendContinue,
                   hasArchitecture,
                   hasTasks,
                   canBuildForPlan,
@@ -395,7 +471,7 @@ export function createSendMessageTool(deps: {
           await writeLatestSuggestions(stateDir, sessionId, {
             projectId: activeProjectId,
             agents: finalGroupedAgents,
-            messageId: "",
+            messageId: finalMessageId,
           });
 
           return {
@@ -449,6 +525,7 @@ export function createSendMessageTool(deps: {
 
         void stream(onUpdate, "⏳ **Connecting to 8080.ai...**");
         let suggestedAgents: string[] = [];
+        let suggestionMessageId = "";
         let result = await client.streamSendMessage(
           activeProjectId,
           params.content,
@@ -460,17 +537,25 @@ export function createSendMessageTool(deps: {
           {
             model: activeModel,
             mediaUrls: mediaUrls.length > 0 ? mediaUrls : undefined,
-            onSuggestedAgents: (agents, pid) => {
+            onSuggestedAgents: (agents, pid, messageId) => {
               suggestedAgents.push(...agents);
+              if (messageId) suggestionMessageId = messageId;
             },
             onRaw: (raw) => {
-              log.info("Raw SSE event", raw);
+              try {
+                const event = JSON.parse(raw);
+                if (event.type === "token") return;
+                log.info("SSE event", event);
+              } catch {
+                log.info("Raw SSE event", raw);
+              }
             }
           }
         );
 
         // Deduplicate agents
         suggestedAgents = Array.from(new Set([...suggestedAgents, ...(result.suggestedAgents || [])]));
+        if (result.messageId) suggestionMessageId = result.messageId;
         const streamSuggestedAgents = [...suggestedAgents];
         log.info("send_message stream suggested agents", {
           projectId: activeProjectId,
@@ -503,20 +588,12 @@ export function createSendMessageTool(deps: {
         // ----------------------------------------------------------------
         // Fetch pending agents from project status if none found in stream
         // ----------------------------------------------------------------
-        if (suggestedAgents.length === 0 && !isQuestion && cleanText) {
+        if ((suggestedAgents.length === 0 || !suggestionMessageId) && !isQuestion && cleanText) {
           try {
             const status = await client.getProjectStatus(activeProjectId);
-            const pending = status.pending_suggested_agents;
-            if (pending && typeof pending === 'object') {
-              if (Array.isArray((pending as any).agents)) {
-                suggestedAgents = (pending as any).agents.filter((a: unknown): a is string => typeof a === 'string');
-              } else {
-                for (const [key, val] of Object.entries(pending)) {
-                  if (typeof val === 'string') suggestedAgents.push(val);
-                  else if (val === true) suggestedAgents.push(key);
-                }
-              }
-            }
+            const pending = extractPendingSuggestion(status.pending_suggested_agents);
+            if (suggestedAgents.length === 0) suggestedAgents = pending.agents;
+            if (pending.messageId) suggestionMessageId = pending.messageId;
           } catch { }
         }
 
@@ -555,7 +632,7 @@ export function createSendMessageTool(deps: {
           await writeLatestSuggestions(stateDir, sessionId, {
             projectId: activeProjectId,
             agents: groupedAgents,
-            messageId: "",
+            messageId: suggestionMessageId,
           });
         }
 

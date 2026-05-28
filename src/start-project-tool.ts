@@ -5,12 +5,14 @@ import { readActiveModel } from "./model-state.ts";
 import { stripA2UI, groupAgents } from "./command.ts";
 import { writeActiveProject } from "./project-state.ts";
 import { writeLatestSuggestions } from "./suggestions-state.ts";
+import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { log } from "../logger.ts";
 
 // AgentToolResult shape required by the OpenClaw SDK's onUpdate callback.
 type ToolContent = { type: "text"; text: string };
 type ToolResult<T = unknown> = { content: ToolContent[]; details: T; presentation?: any };
 type OnUpdate = (partial: { content: ToolContent[]; details: any; presentation?: any }) => void;
+type StatusMessage = { id?: string; author?: string; content?: string };
 
 // Emit a streaming update — each call replaces the previous partial content in
 // OpenClaw's UI, so pass the full accumulated text every time.
@@ -18,6 +20,14 @@ type OnUpdate = (partial: { content: ToolContent[]; details: any; presentation?:
 export async function stream(onUpdate: OnUpdate | undefined, text: string, presentation?: any): Promise<void> {
   onUpdate?.({ content: [{ type: "text", text }], details: null, presentation });
   await new Promise(r => setTimeout(r, 0));
+}
+
+function latestAssistantContent(messages: unknown): string {
+  if (!Array.isArray(messages)) return "";
+  const assistant = [...(messages as StatusMessage[])]
+    .reverse()
+    .find((message) => message.author === "assistant" && typeof message.content === "string" && message.content.trim());
+  return assistant?.content?.trim() ?? "";
 }
 
 export function createStartProjectTool(deps: {
@@ -52,7 +62,7 @@ export function createStartProjectTool(deps: {
       onUpdate: OnUpdate | undefined
     ): Promise<ToolResult> {
       const stateDir = deps.stateDir();
-      const { apiBaseUrl, sessionId } = deps;
+      const { apiBaseUrl, pollingTimeoutMs, sessionId } = deps;
      
       const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
       log.info("start_project execute entered", {
@@ -63,6 +73,7 @@ export function createStartProjectTool(deps: {
       let projectId: string;
       let accumulatedText = "";
       let suggestedAgents: string[] = [];
+      let suggestionMessageId = "";
 
       try {
         const activeModel = await readActiveModel(stateDir);
@@ -88,14 +99,22 @@ export function createStartProjectTool(deps: {
             accumulatedText += token;
             void stream(onUpdate, accumulatedText);
           },
-          undefined,
-          (agents, _pid) => {
-            log.info("Received agent suggestions from stream", agents);
+          (raw) => {
+            try {
+              const event = JSON.parse(raw);
+              if (event.type === "token") return;
+              log.info("start_project SSE event", event);
+            } catch {
+              log.info("start_project raw SSE event", raw);
+            }
+          },
+          (agents, _pid, messageId) => {
+            log.info("Received agent suggestions from stream", { agents, messageId });
             // Collect suggestions and show them after the strict Start Building
             // gate has checked the project events stream.
             suggestedAgents.push(...agents);
+            if (messageId) suggestionMessageId = messageId;
           },
-          undefined,
           {
             model: activeModel,
             mediaUrls: mediaUrls.length > 0 ? mediaUrls : undefined
@@ -107,25 +126,41 @@ export function createStartProjectTool(deps: {
         // Store project_id in session state
         await writeActiveProject(stateDir, projectId, sessionId);
 
+        if (!accumulatedText.trim()) {
+          const timeoutMs = Math.min(pollingTimeoutMs, 45_000);
+          const deadline = Date.now() + timeoutMs;
+          log.info("start_project stream empty; polling for assistant response", { projectId, timeoutMs });
+          while (!accumulatedText.trim() && Date.now() < deadline) {
+            await new Promise(r => setTimeout(r, 1500));
+            try {
+              const status = await client.getProjectStatus(projectId);
+              const assistantText = latestAssistantContent(status.messages);
+              if (assistantText) {
+                accumulatedText = assistantText;
+                log.info("start_project fetched assistant response from project detail", {
+                  projectId,
+                  textLength: assistantText.length,
+                });
+                await stream(onUpdate, accumulatedText);
+                break;
+              }
+            } catch (pollErr) {
+              log.info("start_project assistant response poll failed", pollErr);
+            }
+          }
+        }
+
         // ----------------------------------------------------------------
         // The 8080.ai backend does NOT send suggested_agents in the SSE
         // stream. Instead, they're available via the project status
         // endpoint's `pending_suggested_agents` field after stream ends.
         // ----------------------------------------------------------------
-        if (suggestedAgents.length === 0 && projectId) {
+        if ((suggestedAgents.length === 0 || !suggestionMessageId) && projectId) {
           try {
             const status = await client.getProjectStatus(projectId);
-            const pending = status.pending_suggested_agents;
-            if (pending && typeof pending === 'object') {
-              if (Array.isArray((pending as any).agents)) {
-                suggestedAgents.push(...(pending as any).agents.filter((a: unknown): a is string => typeof a === 'string'));
-              } else {
-                for (const [key, val] of Object.entries(pending)) {
-                  if (typeof val === 'string') suggestedAgents.push(val);
-                  else if (val === true) suggestedAgents.push(key);
-                }
-              }
-            }
+            const pending = extractPendingSuggestion(status.pending_suggested_agents);
+            if (suggestedAgents.length === 0) suggestedAgents.push(...pending.agents);
+            if (pending.messageId) suggestionMessageId = pending.messageId;
             log.info("Fetched pending agents from status", suggestedAgents);
           } catch (statusErr) {
             log.info("Failed to fetch project status for agents", statusErr);
@@ -142,7 +177,7 @@ export function createStartProjectTool(deps: {
           await writeLatestSuggestions(stateDir, sessionId, {
             projectId,
             agents: groupedAgents,
-            messageId: "", // streamProjectCreation doesn't always have a msgId
+            messageId: suggestionMessageId,
           });
         }
 
@@ -152,6 +187,11 @@ export function createStartProjectTool(deps: {
         let finalResponse = cleanText;
         if (!isQuestion && suggestedAgents.length > 0) {
           finalResponse += `\n\n▶️ Type **"Run Plan All"** to proceed.`;
+        }
+        if (!finalResponse.trim()) {
+          finalResponse =
+            `Project \`${projectId}\` was created, but 8080.ai did not return an assistant response from /stream-trigger yet. ` +
+            `Open or refresh the project on 8080.ai to check whether the Tech Lead response is still pending.`;
         }
         log.info("Final response ready", { isQuestion, suggestedAgents });
         void stream(onUpdate, `🤖 **AI Response:**\n\n${finalResponse}`);

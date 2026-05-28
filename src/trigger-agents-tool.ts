@@ -1,14 +1,43 @@
 import { Type } from "@sinclair/typebox";
-import { AuthError, AGENT_DISPLAY_NAMES, requireAuthenticatedClient, filterStartBuildingAgents } from "./api-client.ts";
+import { AuthError, AGENT_DISPLAY_NAMES, requireAuthenticatedClient, filterStartBuildingAgents, isPauseForReviewText, type ProjectStatus } from "./api-client.ts";
 import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
 import { groupAgents, hasGeneratedData } from "./command.ts";
 import { readActiveModel } from "./model-state.ts";
+import { extractPendingSuggestion } from "./suggested-agents.ts";
+import { writeLatestSuggestions } from "./suggestions-state.ts";
 import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
+import { getDesignPreviewText } from "./design-preview.ts";
 import { log } from "../logger.ts";
+
+function statusHasReviewCheckpoint(status: ProjectStatus): boolean {
+  const messages = Array.isArray(status.messages) ? status.messages : [];
+  return messages.some((message) => isPauseForReviewText(message.content));
+}
+
+function statusHasBackendContinue(status: ProjectStatus): boolean {
+  return extractPendingSuggestion(status.pending_suggested_agents).agents.includes("continue");
+}
+
+async function waitForReviewCheckpoint(
+  client: Awaited<ReturnType<typeof requireAuthenticatedClient>>,
+  projectId: string,
+  options: { timeoutMs: number; intervalMs: number }
+): Promise<ProjectStatus> {
+  const deadline = Date.now() + options.timeoutMs;
+  let latestStatus = await client.getProjectStatus(projectId);
+
+  while (!(statusHasReviewCheckpoint(latestStatus) && statusHasBackendContinue(latestStatus)) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, options.intervalMs));
+    latestStatus = await client.getProjectStatus(projectId);
+  }
+
+  return latestStatus;
+}
 
 export function createTriggerAgentsTool(deps: {
   stateDir: () => string;
   apiBaseUrl: string;
+  sessionId: string;
 }) {
   return {
     name: "ai8080_trigger_agents",
@@ -27,11 +56,12 @@ export function createTriggerAgentsTool(deps: {
     async execute(
       _id: string,
       params: { projectId: string; agents: string[] },
+      
       _signal: AbortSignal | undefined,
       onUpdate: (partial: { content: { type: "text"; text: string }[]; details: any; presentation?: any }) => void
     ) {
       const stateDir = deps.stateDir();
-      const { apiBaseUrl } = deps;
+      const { apiBaseUrl, sessionId } = deps;
 
       try {
         const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
@@ -102,6 +132,7 @@ export function createTriggerAgentsTool(deps: {
             activeModel,
           });
           await client.startBuilding(params.projectId, activeModel);
+          const designPreviewText = await getDesignPreviewText(client, params.projectId);
           log.info("start_building selected build api completed", {
             projectId: params.projectId,
             activeModel,
@@ -112,16 +143,31 @@ export function createTriggerAgentsTool(deps: {
               type: "text",
               text:
                 `✅ **Building Started!** Agents are now writing your software.` +
-                (taskSummaryText ? `\n\n${taskSummaryText}` : ""),
+                (taskSummaryText ? `\n\n${taskSummaryText}` : "") +
+                designPreviewText,
             }],
             details: { projectId: params.projectId, action: "build", status: "started" },
           };
         }
 
+        let messageId = "";
         if (params.agents.includes('continue')) {
           await client.resumeDesign(params.projectId);
         } else {
-          await client.triggerAgents(params.projectId, params.agents, "", activeModel);
+          try {
+            const status = await client.getProjectStatus(params.projectId);
+            const pending = extractPendingSuggestion(status.pending_suggested_agents);
+            messageId = pending.messageId;
+            log.info("trigger_agents hydrated message id", {
+              projectId: params.projectId,
+              agents: params.agents,
+              pendingAgents: pending.agents,
+              messageId,
+            });
+          } catch (err) {
+            log.info("trigger_agents failed to hydrate message id", err);
+          }
+          await client.triggerAgents(params.projectId, params.agents, messageId, activeModel);
         }
         
         let displayNames: string[] = [];
@@ -140,10 +186,10 @@ export function createTriggerAgentsTool(deps: {
         
         onUpdate?.({ content: [{ type: "text", text: accumulatedText }], details: null });
 
-        // Stream events live to the dashboard (with 60s timeout to prevent hangs)
+        // Stream events live to the dashboard until the planning checkpoint or idle timeout.
         let pausedForReview = false;
         let hasCompletedAgent = false;
-        const streamPromise = client.streamProjectEvents(params.projectId, {
+        await client.streamProjectEvents(params.projectId, {
           onAgentLog: (log) => {
             if (log.action === "completed") {
               hasCompletedAgent = true;
@@ -170,19 +216,59 @@ export function createTriggerAgentsTool(deps: {
               pausedForReview = true;
             }
           },
+          idleTimeoutMs: 60_000,
+          progressTimeoutMs: 45_000,
+          maxTimeoutMs: 180_000,
         });
 
-        const timeoutPromise = new Promise<void>((resolve) => {
-          setTimeout(() => {
-            log.info("streamProjectEvents timed out after 60s", { projectId: params.projectId });
-            resolve();
-          }, 60_000);
+        const projectStatusAfter = await waitForReviewCheckpoint(client, params.projectId, {
+          timeoutMs: params.agents.includes("plan_all") ? 15_000 : 10_000,
+          intervalMs: 5_000,
         });
+        const hasReviewCheckpoint = statusHasReviewCheckpoint(projectStatusAfter);
+        const backendHasContinue = statusHasBackendContinue(projectStatusAfter);
+        const backendReviewReady = hasReviewCheckpoint && backendHasContinue;
+        if (backendReviewReady) {
+          log.info("trigger_agents detected review checkpoint from project status", {
+            projectId: params.projectId,
+            agents: params.agents,
+            backendHasContinue,
+          });
+        } else {
+          log.info("trigger_agents review checkpoint not ready in backend suggestions", {
+            projectId: params.projectId,
+            agents: params.agents,
+            hasReviewText: hasReviewCheckpoint,
+            backendHasContinue,
+            pendingSuggestions: extractPendingSuggestion(projectStatusAfter.pending_suggested_agents).agents,
+          });
+        }
 
-        await Promise.race([streamPromise, timeoutPromise]);
+        if (pausedForReview && !backendReviewReady) {
+          accumulatedText +=
+            `\n\nPlanning reached the review checkpoint, but 8080.ai has not exposed the **Continue** action yet. ` +
+            `I will wait to show Continue until the backend publishes it.`;
+          await writeLatestSuggestions(stateDir, sessionId, {
+            projectId: params.projectId,
+            agents: [],
+            messageId,
+          });
+          return {
+            content: [{ type: "text", text: accumulatedText }],
+            details: {
+              status: "waiting_for_backend_continue",
+              suggestions: [],
+            },
+          };
+        }
 
-        if (pausedForReview) {
+        if (backendReviewReady) {
           const reviewAgents = groupAgents(["continue", "review"]);
+          await writeLatestSuggestions(stateDir, sessionId, {
+            projectId: params.projectId,
+            agents: reviewAgents,
+            messageId,
+          });
           accumulatedText += `\n\n**Planning complete — ready for your review.**\n\n`;
           accumulatedText += `**What would you like to do next?**\n`;
           accumulatedText += `1. ▶️ Continue — proceed to building\n`;
@@ -202,30 +288,21 @@ export function createTriggerAgentsTool(deps: {
         }
 
         // Fetch fresh suggestions from the project detail
-        const projectStatusAfter = await client.getProjectStatus(params.projectId);
-        const pendingAgents = projectStatusAfter.pending_suggested_agents;
-        let finalAgentsAfter: string[] = [];
-
-        // Extract agents from pending_suggested_agents (object format)
-        if (pendingAgents && typeof pendingAgents === 'object') {
-          if (Array.isArray((pendingAgents as any).agents)) {
-            finalAgentsAfter = (pendingAgents as any).agents.filter((a: unknown): a is string => typeof a === 'string');
-          } else {
-            for (const [key, val] of Object.entries(pendingAgents)) {
-              if (typeof val === 'string') finalAgentsAfter.push(val);
-              else if (val === true) finalAgentsAfter.push(key);
-            }
-          }
+        const pendingAfter = extractPendingSuggestion(projectStatusAfter.pending_suggested_agents);
+        let finalAgentsAfter: string[] = pendingAfter.agents;
+        if (pendingAfter.messageId) messageId = pendingAfter.messageId;
+        if (params.agents.includes("plan_all") && finalAgentsAfter.includes("plan_all")) {
+          finalAgentsAfter = finalAgentsAfter.filter((agent) => agent !== "plan_all");
         }
 
-        // Fallback: if no suggestions came back, offer Continue only once
-        // /agent-logs says the latest agent step completed.
-        if (finalAgentsAfter.length === 0 && projectStatusAfter.status === 'active') {
-          const hasCompletedLog = await client.hasLatestCompletedAgentLog(params.projectId);
-          if (hasCompletedLog) {
-            finalAgentsAfter.push('continue');
-          }
-        }
+        log.info("trigger_agents backend suggested agents after events", {
+          projectId: params.projectId,
+          pendingAgents: finalAgentsAfter,
+          messageId,
+          reason: finalAgentsAfter.includes("continue")
+            ? "backend_exposed_continue"
+            : "backend_has_not_exposed_continue",
+        });
 
         if (finalAgentsAfter.length > 0) {
           log.info("start_building suggestions decision", {
@@ -238,6 +315,11 @@ export function createTriggerAgentsTool(deps: {
 
         if (finalAgentsAfter.length > 0) {
           const groupedAgentsAfter = groupAgents(finalAgentsAfter);
+          await writeLatestSuggestions(stateDir, sessionId, {
+            projectId: params.projectId,
+            agents: groupedAgentsAfter,
+            messageId,
+          });
           const suggestionsText = buildSuggestedAgentsText(params.projectId, groupedAgentsAfter);
           const presentation = buildSuggestedAgentsPresentation(params.projectId, groupedAgentsAfter);
           accumulatedText += suggestionsText;

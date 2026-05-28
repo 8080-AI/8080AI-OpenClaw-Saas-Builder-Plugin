@@ -1,7 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import { requireAuthenticatedClient, AuthError } from "./api-client.ts";
 import { writeActiveProject } from "./project-state.ts";
-import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
+import { buildSuggestedAgentsPresentation } from "./review-continue.ts";
 import { writeLatestSuggestions } from "./suggestions-state.ts";
 import { log } from "../logger.ts";
 
@@ -59,14 +59,12 @@ export function createSelectProjectTool(deps: {
           sessionId,
           agents: defaultAgents,
         });
-        const nextStepsText = buildSuggestedAgentsText(selected.id, defaultAgents);
         const presentation = buildSuggestedAgentsPresentation(selected.id, defaultAgents);
         const text =
           `✅ Project \`${selected.title}\` is now active. (${selected.id})\n\n` +
           `### Suggested Next Steps:\n` +
           `1. 🛠️ Start Building\n\n` +
-          `Type \`/ai8080 select-button 1\` or \`Start Building\` to proceed.\n\n` +
-          nextStepsText;
+          `Type \`/ai8080 select-button 1\` or \`Start Building\` to proceed.`;
         onUpdate?.({
           content: [{ type: "text", text }],
           details: {
