@@ -1,13 +1,14 @@
 export type PendingSuggestion = {
   agents: string[];
   messageId: string;
+  sessionId: string;
 };
 
-const RESERVED_PENDING_KEYS = new Set(["agents", "message_id", "messageId"]);
+const RESERVED_PENDING_KEYS = new Set(["agents", "message_id", "messageId", "session_id", "sessionId"]);
 
 export function extractPendingSuggestion(pending: unknown): PendingSuggestion {
   if (!pending || typeof pending !== "object") {
-    return { agents: [], messageId: "" };
+    return { agents: [], messageId: "", sessionId: "" };
   }
 
   const record = pending as Record<string, unknown>;
@@ -17,11 +18,18 @@ export function extractPendingSuggestion(pending: unknown): PendingSuggestion {
       : typeof record.messageId === "string"
         ? record.messageId
         : "";
+  const sessionId =
+    typeof record.session_id === "string"
+      ? record.session_id
+      : typeof record.sessionId === "string"
+        ? record.sessionId
+        : "";
 
   if (Array.isArray(record.agents)) {
     return {
       agents: record.agents.filter((agent): agent is string => typeof agent === "string"),
       messageId,
+      sessionId,
     };
   }
 
@@ -32,5 +40,5 @@ export function extractPendingSuggestion(pending: unknown): PendingSuggestion {
     else if (value === true) agents.push(key);
   }
 
-  return { agents, messageId };
+  return { agents, messageId, sessionId };
 }
