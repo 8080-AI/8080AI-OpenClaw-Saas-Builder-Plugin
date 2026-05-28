@@ -5,6 +5,7 @@ const AUTH_FILE = ["plugins", "8080", "auth.json"];
 
 type StoredAuth = {
   token: string;
+  refreshToken?: string;
   storedAt: number;
   email?: string;
 };
@@ -21,10 +22,15 @@ function authPath(stateDir: string): string {
 }
 
 export async function readToken(stateDir: string): Promise<string | null> {
+  const auth = await readAuth(stateDir);
+  return auth?.token ?? null;
+}
+
+export async function readAuth(stateDir: string): Promise<StoredAuth | null> {
   try {
     const raw = await fs.readFile(authPath(stateDir), "utf-8");
     const data = JSON.parse(raw) as StoredAuth;
-    return data.token ?? null;
+    return data.token ? data : null;
   } catch {
     return null;
   }
@@ -33,7 +39,7 @@ export async function readToken(stateDir: string): Promise<string | null> {
 export async function writeToken(
   stateDir: string,
   token: string,
-  meta?: { email?: string }
+  meta?: { email?: string; refreshToken?: string }
 ): Promise<void> {
   const filePath = authPath(stateDir);
   await fs.mkdir(path.dirname(filePath), { recursive: true });

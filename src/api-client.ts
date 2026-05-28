@@ -4,7 +4,80 @@
 // Base URL: https://api.8080.ai/api/v1 (paths below are relative to this).
 // ---------------------------------------------------------------------------
 import { createParser } from "eventsource-parser";
-import { requireToken, AuthRequiredError } from "./auth.ts";
+import { readAuth, writeToken } from "./auth.ts";
+import { log } from "../logger.ts";
+
+export function isStartBuildingAgent(agent: string): boolean {
+  return agent === "start_building" || agent === "start_build";
+}
+
+export function filterStartBuildingAgents(agents: string[], allowStartBuilding: boolean): string[] {
+  const filtered = allowStartBuilding ? agents : agents.filter(agent => !isStartBuildingAgent(agent));
+  if (agents.some(isStartBuildingAgent) || filtered.length !== agents.length) {
+    log.info("start_building filter", { allowStartBuilding, before: agents, after: filtered });
+  }
+  return filtered;
+}
+
+export function isPauseForReviewText(text: unknown): boolean {
+  if (typeof text !== "string") return false;
+  const normalized = text.toLowerCase();
+  const mentionsReview = /\breview\b/.test(normalized);
+  const mentionsContinue = /\bcontinue\b/.test(normalized);
+  const mentionsReadyForReview = /ready\s+for\s+review/.test(normalized);
+  const mentionsClickActions = /click\s+review/.test(normalized) || /click\s+continue/.test(normalized);
+
+  return mentionsReview && mentionsContinue && (mentionsReadyForReview || mentionsClickActions);
+}
+
+function getPauseForReviewStatus(data: Record<string, unknown>): { status: string; triggered_by?: string } | null {
+  if (data.status === "paused_for_review") {
+    return {
+      status: "paused_for_review",
+      triggered_by: typeof data.triggered_by === "string" ? data.triggered_by : undefined,
+    };
+  }
+
+  if (
+    isPauseForReviewText(data.content) ||
+    isPauseForReviewText(data.message) ||
+    isPauseForReviewText(data.summary)
+  ) {
+    return {
+      status: "paused_for_review",
+      triggered_by: typeof data.triggered_by === "string" ? data.triggered_by : undefined,
+    };
+  }
+
+  return null;
+}
+
+function debugResponseSummary(label: string, data: unknown): string {
+  if (data === null || data === undefined) return `${label}=null`;
+  if (Array.isArray(data)) return `${label}=array length=${data.length}`;
+  if (typeof data === "object") {
+    const keys = Object.keys(data as Record<string, unknown>);
+    const arrayFields = keys
+      .filter((key) => Array.isArray((data as Record<string, unknown>)[key]))
+      .map((key) => `${key}:${((data as Record<string, unknown>)[key] as unknown[]).length}`)
+      .join(",");
+    return `${label}=object keys=${keys.length}${arrayFields ? ` arrays=[${arrayFields}]` : ""}`;
+  }
+  return `${label}=${typeof data}`;
+}
+
+function summarizeAgentLogs(logs: AgentLog[], limit = 5) {
+  return [...logs]
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+    .slice(0, limit)
+    .map((entry) => ({
+      action: entry.action,
+      agent_type: entry.agent_type,
+      summary: entry.summary,
+      created_at: entry.created_at,
+      message_id: entry.message_id,
+    }));
+}
 
 export class ApiError extends Error {
   constructor(
@@ -17,8 +90,8 @@ export class ApiError extends Error {
 }
 
 export class AuthError extends ApiError {
-  constructor() {
-    super(401, "Session expired. Run `/ai8080 login` to re-authenticate.");
+  constructor(message = "Your 8080.ai session token expired. Run `/ai8080 login`, then continue the same project again.") {
+    super(401, message);
     this.name = "AuthError";
   }
 }
@@ -42,6 +115,20 @@ export type Subscription = {
     features: string[];
   };
 };
+
+export type SubscriptionPlan = Record<string, unknown>;
+
+export type UserProfile = {
+  id: string;
+  email: string;
+  subscription_tier?: string;
+  credits_balance?: number;
+  [key: string]: unknown;
+};
+
+export function isFreePlanProfile(profile: UserProfile | null | undefined): boolean {
+  return (profile?.subscription_tier ?? "free").toLowerCase() === "free";
+}
 
 export const AGENT_DISPLAY_NAMES: Record<string, string> = {
   'System Requirements Agent': '📋 Requirements',
@@ -84,6 +171,16 @@ export type ChatMessage = {
   created_at: string;
 };
 
+export type AgentLog = {
+  id: string;
+  project_id: string;
+  message_id: string | null;
+  agent_type: string;
+  summary: string | null;
+  action: string;
+  created_at: string;
+};
+
 export type ProjectStatus = {
   id: string;
   phase: ProjectPhase;
@@ -107,13 +204,53 @@ export type ProjectStatus = {
 type ClientOpts = {
   token: string;
   apiBaseUrl: string;
+  refreshToken?: string;
+  onTokenRefresh?: (token: string) => Promise<void>;
 };
+
+export async function refreshAccessToken(opts: { apiBaseUrl: string; refreshToken: string }): Promise<string> {
+  const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/auth/refresh-token`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ refresh_token: opts.refreshToken }),
+  });
+
+  if (res.status === 401) throw new AuthError("Your 8080.ai refresh token expired. Run `/ai8080 login`, then save fresh tokens again.");
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try {
+      const text = await res.text();
+      if (text) msg += `: ${text}`;
+    } catch { }
+    throw new ApiError(res.status, `Token refresh failed: ${msg}`);
+  }
+
+  const data = await res.json() as { access_token?: string };
+  if (!data.access_token) {
+    throw new ApiError(500, "Token refresh failed: missing access_token in response.");
+  }
+  return data.access_token;
+}
+
+async function refreshAndPersist(opts: ClientOpts): Promise<boolean> {
+  if (!opts.refreshToken) return false;
+  const token = await refreshAccessToken({
+    apiBaseUrl: opts.apiBaseUrl,
+    refreshToken: opts.refreshToken,
+  });
+  opts.token = token;
+  await opts.onTokenRefresh?.(token);
+  log.info("Access token refreshed successfully.");
+  return true;
+}
 
 async function apiFetch(
   opts: ClientOpts,
   method: string,
   path: string,
-  body?: unknown
+  body?: unknown,
+  alreadyRetried = false
 ): Promise<unknown> {
   const url = `${opts.apiBaseUrl.replace(/\/$/, "")}${path}`;
   const res = await fetch(url, {
@@ -125,7 +262,11 @@ async function apiFetch(
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
 
-  if (res.status === 401) throw new AuthError();
+  if (res.status === 401) {
+    const refreshed = alreadyRetried ? false : await refreshAndPersist(opts);
+    if (refreshed) return apiFetch(opts, method, path, body, true);
+    throw new AuthError();
+  }
 
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
@@ -139,11 +280,11 @@ async function apiFetch(
   const text = await res.text();
   const data = text ? JSON.parse(text) : null;
   if (path === "/projects/") {
-    process.stderr.write(`[8080.ai API] /projects/ response sample: ${JSON.stringify(data?.[0] ?? "null")}\n`);
+    log.info("/projects/ response sample", data?.[0] ?? "null");
   }
   // Debug log for project detail calls
   if (path.match(/^\/projects\/[^/]+$/) && path !== "/projects/") {
-    process.stderr.write(`[8080.ai API] Project detail response: ${JSON.stringify(data, null, 2)}\n`);
+    log.info("Project detail response", data);
   }
   return data;
 }
@@ -155,49 +296,78 @@ async function apiFetch(
  */
 export async function validateToken(opts: ClientOpts): Promise<boolean> {
   const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/subscription/current`;
-  process.stderr.write(`[8080.ai API] Validating token at: ${url}` + "\n");
+  log.info("Validating token", { url });
   try {
     const res = await fetch(url, {
       method: "GET",
       headers: { Authorization: `Bearer ${opts.token}` },
     });
-    process.stderr.write(`[8080.ai API] Validation response status: ${res.status}` + "\n");
+    log.info("Validation response", { status: res.status });
     if (res.status === 401) return false;
     if (!res.ok) {
-      process.stderr.write(`[8080.ai API] Validation failed with HTTP ${res.status}` + "\n");
+      log.info("Validation failed", { status: res.status });
       return false;
     }
     return true;
   } catch (err) {
-    process.stderr.write(`[8080.ai API] Validation request error: ${err instanceof Error ? err.message : String(err)}` + "\n");
+    log.info("Validation request error", err);
     throw err;
   }
 }
 
 /**
- * Ensures the user is logged in AND the token is valid.
- * Throws AuthRequiredError if no token, or AuthError if token is invalid.
+ * Ensures the user has saved auth data. Requests refresh automatically on 401
+ * when a refresh token is available.
  */
 export async function requireAuthenticatedClient(stateDir: string, apiBaseUrl: string) {
-  try {
-    const token = await requireToken(stateDir);
-    return createApiClient({ token, apiBaseUrl });
-  } catch (err) {
-    if (err instanceof AuthRequiredError) {
-      throw new AuthError("Your 8080.ai session expired. Run /ai8080 login to re-authenticate.");
-    }
-    throw err;
+  const auth = await readAuth(stateDir);
+  if (!auth?.token) {
+    throw new AuthError("Your 8080.ai session expired. Run /ai8080 login to re-authenticate.");
   }
+
+  return createApiClient({
+    token: auth.token,
+    apiBaseUrl,
+    refreshToken: auth.refreshToken,
+    onTokenRefresh: async (token) => {
+      await writeToken(stateDir, token, {
+        refreshToken: auth.refreshToken,
+        email: auth.email,
+      });
+    },
+  });
 }
 
 export function createApiClient(opts: ClientOpts) {
   const get = (path: string) => apiFetch(opts, "GET", path);
   const post = (path: string, body?: unknown) =>
     apiFetch(opts, "POST", path, body);
+  const fetchWithAuth = async (url: string, init: RequestInit): Promise<Response> => {
+    const headers = new Headers(init.headers);
+    headers.set("Authorization", `Bearer ${opts.token}`);
+    const res = await fetch(url, { ...init, headers });
+    if (res.status !== 401) return res;
+
+    const refreshed = await refreshAndPersist(opts);
+    if (!refreshed) return res;
+
+    const retryHeaders = new Headers(init.headers);
+    retryHeaders.set("Authorization", `Bearer ${opts.token}`);
+    return fetch(url, { ...init, headers: retryHeaders });
+  };
 
   return {
     async getSubscription(): Promise<Subscription> {
       return get("/subscription/current") as Promise<Subscription>;
+    },
+
+    async getSubscriptionPlans(): Promise<SubscriptionPlan[]> {
+      const data = await get("/subscription/plans");
+      return Array.isArray(data) ? data as SubscriptionPlan[] : [];
+    },
+
+    async getProfile(): Promise<UserProfile> {
+      return get("/profile/") as Promise<UserProfile>;
     },
 
     // 8080.ai uses /projects/ (with slash) for listing
@@ -232,14 +402,13 @@ export function createApiClient(opts: ClientOpts) {
       }) as { project_id: string };
 
       const projectId = createRes.project_id;
-      process.stderr.write(`[8080.ai] Project created: ${projectId}. Triggering AI stream...` + "\n");
+      log.info("Project created. Triggering AI stream...", { projectId });
 
       // 2. Trigger the AI response stream using the dedicated trigger endpoint
       const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/chat/messages/ai/stream-trigger`;
-      const res = await fetch(url, {
+      const res = await fetchWithAuth(url, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${opts.token}`,
           "Content-Type": "application/json",
           Accept: "text/event-stream",
         },
@@ -337,10 +506,10 @@ export function createApiClient(opts: ClientOpts) {
 
     // Resume the design pipeline after user review gate
     // POST /chat/resume-design with { project_id, phase }
-    async resumeDesign(projectId: string, phase: string = "all_pages"): Promise<void> {
+    async resumeDesign(projectId: string): Promise<void> {
       await post(`/chat/resume-design`, {
         project_id: projectId,
-        phase,
+        // phase,
       });
     },
 
@@ -349,30 +518,72 @@ export function createApiClient(opts: ClientOpts) {
     },
 
     async getTasks(projectId: string): Promise<unknown> {
-      return get(`/projects/${projectId}/tasks`);
+      const data = await get(`/projects/${projectId}/tasks`);
+      log.info("start_building readiness tasks", { projectId, summary: debugResponseSummary("tasks", data) });
+      log.info("start_building tasks response", { projectId, tasks: data });
+      return data;
     },
 
     async getArchitecture(projectId: string): Promise<unknown> {
-      return get(`/projects/${projectId}/architecture`);
+      const data = await get(`/projects/${projectId}/architecture`);
+      log.info("start_building readiness architecture", { projectId, summary: debugResponseSummary("architecture", data) });
+      return data;
+    },
+
+    async getAgentLogs(projectId: string): Promise<AgentLog[]> {
+      const path = `/projects/${projectId}/agent-logs`;
+      log.info("agent_logs api request", { projectId, path });
+      const logs = await get(path) as AgentLog[];
+      log.info("agent_logs api response", {
+        projectId,
+        path,
+        count: Array.isArray(logs) ? logs.length : 0,
+        latestFive: Array.isArray(logs) ? summarizeAgentLogs(logs) : [],
+      });
+      return logs;
+    },
+
+    async hasLatestCompletedAgentLog(projectId: string): Promise<boolean> {
+      const logs = await this.getAgentLogs(projectId).catch(() => []);
+      const latest = [...logs].sort((a, b) => {
+        return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+      })[0];
+
+      log.info("agent_logs latest action check", {
+        projectId,
+        logsCount: logs.length,
+        latestAction: latest?.action,
+        latestAgentType: latest?.agent_type,
+        latestSummary: latest?.summary,
+        latestCreatedAt: latest?.created_at,
+        isCompleted: latest?.action === "completed",
+        latestFive: summarizeAgentLogs(logs),
+      });
+
+      return latest?.action === "completed";
     },
 
     // 8080.ai uses /projects/{id}/build (no slash) to start/continue building
     async startBuilding(projectId: string, activeModel: string): Promise<void> {
-      await post(`/projects/${projectId}/build`, {
+      const path = `/projects/${projectId}/build`;
+      const body = {
         default_model: "super_large",
-      });
+      };
+      log.info("start_building build api request", { projectId, path, activeModel, body });
+      const response = await post(path, body);
+      log.info("start_building build api response", { projectId, path, response });
     },
 
     // Create or get a public design share link for a project
     async createDesignShare(projectId: string): Promise<{ share_id: string; is_public: boolean; share_url?: string;[key: string]: unknown }> {
       const res = await post(`/projects/${projectId}/design-share`) as Record<string, unknown>;
-      process.stderr.write(`[8080.ai API] design-share response: ${JSON.stringify(res, null, 2)}\n`);
+      log.info("design-share response ", res);
       return res as { share_id: string; is_public: boolean; share_url?: string;[key: string]: unknown };
     },
 
     // Send follow-up message to AI and stream the response
     async streamSendMessage(
-      projectId: string,
+      projectId:  string,
       content: string,
       onToken: (text: string) => void,
       options?: {
@@ -383,39 +594,38 @@ export function createApiClient(opts: ClientOpts) {
       }
     ): Promise<{ suggestedAgents?: string[]; messageId?: string }> {
       const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/chat/messages/ai/stream`;
-      process.stderr.write(`[8080.ai API] POST ${url}` + "\n");
-      let modelToSend = options?.model;
-      if (modelToSend === "large" || modelToSend === "super_large") {
-        modelToSend = undefined;
-      }
+      log.info("POST streamSendMessage", { url });
+      // let modelToSend = options?.model;
+      // if (modelToSend === "large" || modelToSend === "super_large") {
+      //   modelToSend = undefined;
+      // }
 
       const body = {
         project_id: projectId,
         content: content,
-        model: modelToSend,
+        model: "gpt-4o",
         media_urls: options?.mediaUrls ?? [],
-        plan_auto: true,
+        plan_auto: false,
       };
-      console.log(`[8080.ai API] streamSendMessage request body: ${JSON.stringify(body)}`);
+      log.info("streamSendMessage request body", body);
 
-      const res = await fetch(url, {
+      const res = await fetchWithAuth(url, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${opts.token}`,
           "Content-Type": "application/json",
           Accept: "text/event-stream",
         },
         body: JSON.stringify(body),
       });
 
-      console.log(`[8080.ai API] Response: ${res.status} ${res.statusText}`);
+      log.info("streamSendMessage response", { status: res.status, statusText: res.statusText });
 
       if (res.status === 401) throw new AuthError();
       if (!res.ok) {
         let msg = `HTTP ${res.status}`;
         try {
           const errBody = await res.text();
-          console.log(`[8080.ai API] Error body: ${errBody}`);
+          log.info("streamSendMessage error body", errBody);
           msg += `: ${errBody}`;
         } catch { }
         throw new ApiError(res.status, msg);
@@ -434,7 +644,7 @@ export function createApiClient(opts: ClientOpts) {
           onEvent: (event) => {
             if (options?.onRaw) options?.onRaw(event.data);
             if (event.data === "[DONE]") {
-              process.stderr.write("[8080.ai API] SSE stream received [DONE]" + "\n");
+              log.info("SSE stream received [DONE]");
               if (!isDone) {
                 isDone = true;
                 resolve({ suggestedAgents: suggestedAgents.length > 0 ? suggestedAgents : undefined, messageId: lastMessageId });
@@ -450,14 +660,14 @@ export function createApiClient(opts: ClientOpts) {
                 onToken(token);
               } else if (data.type === "error") {
                 const errorMsg = data.message || data.content || JSON.stringify(data);
-                console.log(`[8080.ai API] SSE error event: ${errorMsg}`);
+                log.info("SSE error event", errorMsg);
                 if (!isDone) {
                   isDone = true;
                   reject(new Error(errorMsg));
                 }
                 return;
               } else if (data.type === "already_has_assistant") {
-                console.log("[8080.ai API] already_has_assistant - AI is already processing.");
+                log.info("already_has_assistant - AI is already processing.");
               }
 
               const agents = data.agents || data.suggested_agents || data.suggestedAgents || data.pending_suggested_agents;
@@ -465,7 +675,10 @@ export function createApiClient(opts: ClientOpts) {
                 let agentList: string[] = [];
                 if (Array.isArray(agents)) agentList = agents;
                 else if (typeof agents === "object" && agents !== null) {
-                  agentList = Object.values(agents).filter((v): v is string => typeof v === "string");
+                  for (const [key, value] of Object.entries(agents)) {
+                    if (typeof value === "string") agentList.push(value);
+                    else if (value === true) agentList.push(key);
+                  }
                 }
 
                 if (agentList.length > 0) {
@@ -478,10 +691,10 @@ export function createApiClient(opts: ClientOpts) {
 
               if (data.type === "message_done" || data.type === "stop" || data.type === "done") {
                 if (data.ai_message_id) lastMessageId = data.ai_message_id;
-                process.stderr.write(`[8080.ai API] SSE stream reached ${data.type}` + "\n");
+                log.info("SSE stream reached", data.type);
               }
             } catch (err) {
-              process.stderr.write(`[8080.ai API] Failed to parse SSE event data: ${event.data} ${err instanceof Error ? err.stack : String(err)}\n`);
+              log.info("Failed to parse SSE event data", event.data, err);
             }
           }
         });
@@ -493,7 +706,7 @@ export function createApiClient(opts: ClientOpts) {
           try {
             const { done, value } = await reader.read();
             if (done) {
-              process.stderr.write("[8080.ai API] SSE stream reader done" + "\n");
+              log.info("SSE stream reader done");
               if (!isDone) {
                 isDone = true;
                 resolve({ suggestedAgents: suggestedAgents.length > 0 ? suggestedAgents : undefined, messageId: lastMessageId });
@@ -506,7 +719,7 @@ export function createApiClient(opts: ClientOpts) {
             }
             if (!isDone) pump();
           } catch (err) {
-            process.stderr.write(`[8080.ai API] SSE pump error: ${err instanceof Error ? err.stack : String(err)}\n`);
+            log.info("SSE pump error", err);
             reject(err);
           }
         }
@@ -516,12 +729,15 @@ export function createApiClient(opts: ClientOpts) {
 
     // Trigger specific agents for a project (used when user clicks agent suggestion button)
     async triggerAgents(projectId: string, agents: string[], messageId: string, model?: string): Promise<void> {
-      await post("/chat/trigger-agents", {
+      const body = {
         project_id: projectId,
         agents,
         message_id: messageId,
-        model: model ?? "super_large",
-      });
+        // model: model ?? "super_large",
+      };
+      log.info("trigger_agents api request", { path: "/chat/trigger-agents", body });
+      const response = await post("/chat/trigger-agents", body);
+      log.info("trigger_agents api response", { projectId, agents, response });
     },
 
     // Stream events for a specific project
@@ -534,15 +750,18 @@ export function createApiClient(opts: ClientOpts) {
         onAiOverview?: (msg: any) => void;
         onPlanningComplete?: (data: { status: string; triggered_by?: string }) => void;
         onRaw?: (raw: string) => void;
+        idleTimeoutMs?: number;
+        maxTimeoutMs?: number;
       }
     ): Promise<void> {
+      const controller = new AbortController();
       const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/projects/${projectId}/events`;
-      const res = await fetch(url, {
+      const res = await fetchWithAuth(url, {
         method: "GET",
         headers: {
-          Authorization: `Bearer ${opts.token}`,
           Accept: "text/event-stream",
         },
+        signal: controller.signal,
       });
 
       if (res.status === 401) throw new AuthError();
@@ -563,6 +782,7 @@ export function createApiClient(opts: ClientOpts) {
           if (callbacks.onRaw) callbacks.onRaw(event.data);
           try {
             const data = JSON.parse(event.data);
+            const pauseStatus = getPauseForReviewStatus(data);
             if (data.type === "agent_log" && callbacks.onAgentLog) {
               callbacks.onAgentLog(data);
             } else if (data.type === "chat_message" && callbacks.onChatMessage) {
@@ -573,7 +793,15 @@ export function createApiClient(opts: ClientOpts) {
               callbacks.onAiOverview(data);
             } else if (data.type === "planning_complete") {
               planningComplete = true;
-              callbacks.onPlanningComplete?.({ status: data.status, triggered_by: data.triggered_by });
+              callbacks.onPlanningComplete?.(pauseStatus ?? {
+                status: String(data.status ?? "complete"),
+                triggered_by: typeof data.triggered_by === "string" ? data.triggered_by : undefined,
+              });
+            }
+
+            if (pauseStatus && data.type !== "planning_complete") {
+              planningComplete = true;
+              callbacks.onPlanningComplete?.(pauseStatus);
             }
           } catch (e) {
             // ignore
@@ -583,10 +811,38 @@ export function createApiClient(opts: ClientOpts) {
 
       const reader = body.getReader();
       const decoder = new TextDecoder("utf-8");
+      const idleTimeoutMs = callbacks.idleTimeoutMs ?? 120_000;
+      let maxTimedOut = false;
+      const maxTimeout = callbacks.maxTimeoutMs
+        ? setTimeout(() => {
+          maxTimedOut = true;
+          log.info("streamProjectEvents max timeout reached", {
+            projectId,
+            maxTimeoutMs: callbacks.maxTimeoutMs,
+          });
+          reader.cancel().catch(() => { });
+          controller.abort();
+        }, callbacks.maxTimeoutMs)
+        : undefined;
+
+      const readWithIdleTimeout = () => {
+        let timeout: NodeJS.Timeout | undefined;
+        const timeoutPromise = new Promise<ReadableStreamReadResult<Uint8Array>>((resolve) => {
+          timeout = setTimeout(() => {
+            reader.cancel().catch(() => { });
+            controller.abort();
+            resolve({ done: true, value: undefined });
+          }, idleTimeoutMs);
+        });
+
+        return Promise.race([reader.read(), timeoutPromise]).finally(() => {
+          if (timeout) clearTimeout(timeout);
+        });
+      };
 
       try {
         while (true) {
-          const { done, value } = await reader.read();
+          const { done, value } = await readWithIdleTimeout();
           if (done) break;
           parser.feed(decoder.decode(value, { stream: true }));
           if (planningComplete) {
@@ -595,7 +851,13 @@ export function createApiClient(opts: ClientOpts) {
           }
         }
       } catch (err) {
-        process.stderr.write(`[8080.ai API] Stream error: ${err instanceof Error ? err.stack : String(err)}\n`);
+        if (maxTimedOut) {
+          log.info("Stream stopped after max timeout", { projectId });
+        } else {
+          log.info("Stream error", err);
+        }
+      } finally {
+        if (maxTimeout) clearTimeout(maxTimeout);
       }
     },
 
@@ -622,17 +884,15 @@ export function createApiClient(opts: ClientOpts) {
           const blob = new Blob([buffer], { type });
           formData.append("files", blob, name);
         } catch (err) {
-          process.stderr.write(`[8080.ai] Failed to read file ${filePath}: ${err instanceof Error ? err.message : String(err)}\n`);
+          log.info("Failed to read file", filePath, err);
         }
       }
       formData.append("project_id", projectId);
 
       const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/chat/media/upload`;
-      const res = await fetch(url, {
+      const res = await fetchWithAuth(url, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${opts.token}`,
-        },
+        headers: {},
         body: formData,
       });
 

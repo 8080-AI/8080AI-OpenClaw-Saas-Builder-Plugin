@@ -1,9 +1,10 @@
 import { Type } from "@sinclair/typebox";
-import { AuthRequiredError, requireToken } from "./auth.ts";
-import { AuthError, createApiClient, AGENT_DISPLAY_NAMES, requireAuthenticatedClient } from "./api-client.ts";
+import { AuthError, AGENT_DISPLAY_NAMES, requireAuthenticatedClient, filterStartBuildingAgents } from "./api-client.ts";
 import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
-import { groupAgents } from "./command.ts";
+import { groupAgents, hasGeneratedData } from "./command.ts";
 import { readActiveModel } from "./model-state.ts";
+import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
+import { log } from "../logger.ts";
 
 export function createTriggerAgentsTool(deps: {
   stateDir: () => string;
@@ -27,7 +28,7 @@ export function createTriggerAgentsTool(deps: {
       _id: string,
       params: { projectId: string; agents: string[] },
       _signal: AbortSignal | undefined,
-      onUpdate: (partial: { content: { type: "text"; text: string }[]; details: any }) => void
+      onUpdate: (partial: { content: { type: "text"; text: string }[]; details: any; presentation?: any }) => void
     ) {
       const stateDir = deps.stateDir();
       const { apiBaseUrl } = deps;
@@ -35,6 +36,88 @@ export function createTriggerAgentsTool(deps: {
       try {
         const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
         const activeModel = await readActiveModel(stateDir);
+        if (params.agents.includes("start_building")) {
+          log.info("trigger_agents received start_building", {
+            projectId: params.projectId,
+            agents: params.agents,
+            activeModel,
+          });
+          const [tasksForBuild, archForBuild] = await Promise.all([
+            client.getTasks(params.projectId).catch(() => null),
+            client.getArchitecture(params.projectId).catch(() => null),
+          ]);
+          const canStartBuilding = hasGeneratedData(tasksForBuild) && hasGeneratedData(archForBuild);
+          log.info("start_building selected readiness decision", {
+            projectId: params.projectId,
+            hasTasks: hasGeneratedData(tasksForBuild),
+            hasArchitecture: hasGeneratedData(archForBuild),
+            canStartBuilding,
+          });
+          if (!canStartBuilding) {
+            return {
+              content: [{ type: "text", text: "Start Building is not available yet. Architecture and tasks must be generated first." }],
+              details: { projectId: params.projectId, action: "build", blocked: true },
+            };
+          }
+          const [subscription, plans, profile] = await Promise.all([
+            client.getSubscription().catch(() => null),
+            client.getSubscriptionPlans().catch(() => []),
+            client.getProfile().catch(() => null),
+          ]);
+          const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
+          const canBuildForPlan = canUseStartBuilding(subscriptionTier);
+          log.info("start_building selected plan decision", {
+            projectId: params.projectId,
+            subscriptionTier,
+            canBuildForPlan,
+            plansCount: plans.length,
+          });
+          if (!canBuildForPlan) {
+            return {
+              content: [{ type: "text", text: getUpgradeToBuildText("https://8080.ai") }],
+              details: { projectId: params.projectId, action: "build", blocked: true, subscriptionTier },
+            };
+          }
+          const taskSummaryText = canShowStartBuildingTasks(subscriptionTier)
+            ? formatStartBuildingTasks(tasksForBuild, params.projectId)
+            : "";
+          log.info("start_building task list in trigger_agents", {
+            projectId: params.projectId,
+            tier: subscriptionTier,
+            tasks: tasksForBuild,
+            taskSummaryText,
+            shown: Boolean(taskSummaryText),
+          });
+          onUpdate?.({
+            content: [{
+              type: "text",
+              text:
+                `🚀 Triggering **Building Phase** for project \`${params.projectId}\`...\n\n` +
+                (taskSummaryText ? `${taskSummaryText}\n\n` : ""),
+            }],
+            details: { projectId: params.projectId, action: "build" },
+          });
+          log.info("start_building selected build api about to call", {
+            projectId: params.projectId,
+            activeModel,
+          });
+          await client.startBuilding(params.projectId, activeModel);
+          log.info("start_building selected build api completed", {
+            projectId: params.projectId,
+            activeModel,
+            taskSummaryShown: Boolean(taskSummaryText),
+          });
+          return {
+            content: [{
+              type: "text",
+              text:
+                `✅ **Building Started!** Agents are now writing your software.` +
+                (taskSummaryText ? `\n\n${taskSummaryText}` : ""),
+            }],
+            details: { projectId: params.projectId, action: "build", status: "started" },
+          };
+        }
+
         if (params.agents.includes('continue')) {
           await client.resumeDesign(params.projectId);
         } else {
@@ -91,7 +174,7 @@ export function createTriggerAgentsTool(deps: {
 
         const timeoutPromise = new Promise<void>((resolve) => {
           setTimeout(() => {
-            console.log("[8080.ai tool] streamProjectEvents timed out after 60s");
+            log.info("streamProjectEvents timed out after 60s", { projectId: params.projectId });
             resolve();
           }, 60_000);
         });
@@ -99,19 +182,22 @@ export function createTriggerAgentsTool(deps: {
         await Promise.race([streamPromise, timeoutPromise]);
 
         if (pausedForReview) {
+          const reviewAgents = groupAgents(["continue", "review"]);
           accumulatedText += `\n\n**Planning complete — ready for your review.**\n\n`;
           accumulatedText += `**What would you like to do next?**\n`;
           accumulatedText += `1. ▶️ Continue — proceed to building\n`;
           accumulatedText += `2. 🔍 Review — inspect the generated requirements & design\n`;
 
-          onUpdate?.({ content: [{ type: "text", text: accumulatedText }], details: null });
+          const presentation = buildSuggestedAgentsPresentation(params.projectId, reviewAgents);
+          onUpdate?.({ content: [{ type: "text", text: accumulatedText }], details: null, presentation });
 
           return {
             content: [{ type: "text", text: accumulatedText }],
             details: {
               status: "paused_for_review",
-              suggestions: ["continue", "review"],
+              suggestions: reviewAgents,
             },
+            presentation,
           };
         }
 
@@ -132,13 +218,28 @@ export function createTriggerAgentsTool(deps: {
           }
         }
 
-        // Fallback: if no suggestions but project is active, offer review/continue
+        // Fallback: if no suggestions came back, offer Continue only once
+        // /agent-logs says the latest agent step completed.
         if (finalAgentsAfter.length === 0 && projectStatusAfter.status === 'active') {
-            finalAgentsAfter.push('review', 'continue');
+          const hasCompletedLog = await client.hasLatestCompletedAgentLog(params.projectId);
+          if (hasCompletedLog) {
+            finalAgentsAfter.push('continue');
+          }
         }
 
         if (finalAgentsAfter.length > 0) {
-          const suggestionsText = buildSuggestedAgentsText(params.projectId, groupAgents(finalAgentsAfter));
+          log.info("start_building suggestions decision", {
+            projectId: params.projectId,
+            pending: finalAgentsAfter,
+            allowStartBuilding: false,
+          });
+          finalAgentsAfter = filterStartBuildingAgents(finalAgentsAfter, false);
+        }
+
+        if (finalAgentsAfter.length > 0) {
+          const groupedAgentsAfter = groupAgents(finalAgentsAfter);
+          const suggestionsText = buildSuggestedAgentsText(params.projectId, groupedAgentsAfter);
+          const presentation = buildSuggestedAgentsPresentation(params.projectId, groupedAgentsAfter);
           accumulatedText += suggestionsText;
 
           return {
@@ -150,8 +251,9 @@ export function createTriggerAgentsTool(deps: {
             ],
             details: {
               status: "complete",
-              suggestions: finalAgentsAfter
-            }
+              suggestions: groupedAgentsAfter
+            },
+            presentation,
           };
         }
 

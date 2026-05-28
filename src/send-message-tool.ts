@@ -1,12 +1,14 @@
 import { Type } from "@sinclair/typebox";
-import { requireAuthenticatedClient, AuthError } from "./api-client.ts";
+import { requireAuthenticatedClient, AuthError, filterStartBuildingAgents } from "./api-client.ts";
 import {
   buildSuggestedAgentsPresentation,
   buildSuggestedAgentsJsonl,
   buildSuggestedAgentsText,
 } from "./review-continue.ts";
-import { groupAgents } from "./command.ts";
+import { groupAgents, hasGeneratedData } from "./command.ts";
 import { readActiveModel } from "./model-state.ts";
+import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
+import { log } from "../logger.ts";
 
 // AgentToolResult shape required by the OpenClaw SDK's onUpdate callback.
 type ToolContent = { type: "text"; text: string };
@@ -23,6 +25,7 @@ async function stream(onUpdate: OnUpdate | undefined, text: string, presentation
 
 export function createSendMessageTool(deps: {
   stateDir: () => string;
+  siteUrl: string;
   apiBaseUrl: string;
   sessionId: string;
 }) {
@@ -51,17 +54,22 @@ export function createSendMessageTool(deps: {
       onUpdate: OnUpdate | undefined
     ): Promise<ToolResult> {
       const stateDir = deps.stateDir();
-      const { apiBaseUrl, sessionId } = deps;
-
-      // Detect "run plan all" or numeric selections — trigger agents directly
+      const { siteUrl, apiBaseUrl, sessionId } = deps;
+      log.info("send_message received", {
+        projectId: params.projectId,
+        content: params.content,
+        mediaCount: params.MediaPaths?.length ?? 0,
+      });
+      // Detect button-style selections that should trigger actions directly.
       const trimmedContent = params.content.trim().toLowerCase();
       const isRunPlanAll = /run\s+plan\s+all/i.test(trimmedContent);
       const numericSelection = trimmedContent.match(/^(?:select\s+)?(\d+)$/);
+      const isStartBuildingSelection = /^(?:start[\s_-]*building|start[\s_-]*build)$/i.test(trimmedContent);
 
-      if (isRunPlanAll || numericSelection) {
+      if (isRunPlanAll || numericSelection || isStartBuildingSelection) {
         try {
           const { readActiveProject } = await import("./project-state.ts");
-          const { readLatestSuggestions, writeLatestSuggestions } = await import("./suggestions-state.ts");
+          const { readLatestSuggestionsForProject, writeLatestSuggestions } = await import("./suggestions-state.ts");
 
           const activeProjectId = params.projectId || await readActiveProject(stateDir, sessionId);
           if (!activeProjectId) {
@@ -70,13 +78,13 @@ export function createSendMessageTool(deps: {
               details: null,
             };
           }
-
+          log.info("send_message using active project", { activeProjectId });
           const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
 
-          const lastSuggestions = await readLatestSuggestions(stateDir, sessionId);
-          
+          const lastSuggestions = await readLatestSuggestionsForProject(stateDir, sessionId, activeProjectId);
+
           let agents: string[] = ["plan_all"];
-          let action: "trigger" | "resume" | "review" = "trigger";
+          let action: "trigger" | "resume" | "review" | "build" = "trigger";
 
           if (numericSelection) {
             const index = parseInt(numericSelection[1], 10) - 1;
@@ -86,39 +94,158 @@ export function createSendMessageTool(deps: {
                 action = "resume";
               } else if (selected === "review") {
                 action = "review";
+              } else if (selected === "start_building") {
+                action = "build";
               } else {
                 agents = selected.startsWith("GROUP:") ? selected.slice(6).split('|') : [selected];
               }
             } else if (!isRunPlanAll) {
-               throw new Error("No suggested agents found for this selection.");
+              throw new Error("No suggested agents found for this selection.");
             }
+          } else if (isStartBuildingSelection) {
+            action = "build";
+            agents = ["start_building"];
+            log.info("start_building text selection matched", {
+              projectId: activeProjectId,
+              content: params.content,
+              suggestions: lastSuggestions?.agents ?? [],
+            });
           } else {
             agents = lastSuggestions?.agents ?? ["plan_all"];
           }
-          
+          log.info("send_message selection decision", { agents, action });
           const messageId = lastSuggestions?.messageId ?? "";
 
           if (action === "review") {
-            const reviewUrl = `${apiBaseUrl.replace("/api/v1", "")}/planning/${activeProjectId}/requirements`;
+            const reviewUrl = `${siteUrl}/planning/${activeProjectId}/requirements`;
             return {
               content: [{ type: "text", text: `🔍 **Review Mode**\n\nOpen your project to review the generated requirements and design:\n\n🔗 [${reviewUrl}](${reviewUrl})` }],
               details: { projectId: activeProjectId, action: "review" },
             };
           }
-
+          
           let accumulatedText = "";
-          if (action === "resume") {
+          if (action === "build") {
+            const [tasksForBuild, archForBuild] = await Promise.all([
+              client.getTasks(activeProjectId).catch(() => null),
+              client.getArchitecture(activeProjectId).catch(() => null),
+            ]);
+            const canStartBuilding = hasGeneratedData(tasksForBuild) && hasGeneratedData(archForBuild);
+            log.info("start_building selected readiness decision", {
+              projectId: activeProjectId,
+              hasTasks: hasGeneratedData(tasksForBuild),
+              hasArchitecture: hasGeneratedData(archForBuild),
+              canStartBuilding,
+            });
+            if (!canStartBuilding) {
+              return {
+                content: [{ type: "text", text: "Start Building is not available yet. Architecture and tasks must be generated first." }],
+                details: { projectId: activeProjectId, action: "build", blocked: true },
+              };
+            }
+            const [subscription, plans, profile] = await Promise.all([
+              client.getSubscription().catch(() => null),
+              client.getSubscriptionPlans().catch(() => []),
+              client.getProfile().catch(() => null),
+            ]);
+            const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
+            const canBuildForPlan = canUseStartBuilding(subscriptionTier);
+            log.info("start_building selected plan decision", {
+              projectId: activeProjectId,
+              subscriptionTier,
+              canBuildForPlan,
+              plansCount: plans.length,
+            });
+            if (!canBuildForPlan) {
+              return {
+                content: [{ type: "text", text: getUpgradeToBuildText(siteUrl) }],
+                details: { projectId: activeProjectId, action: "build", blocked: true, subscriptionTier },
+              };
+            }
+            let taskSummaryText = "";
+            if (canShowStartBuildingTasks(subscriptionTier)) {
+              taskSummaryText = formatStartBuildingTasks(tasksForBuild, activeProjectId, siteUrl);
+              log.info("start_building task list", { projectId: activeProjectId, tier: subscriptionTier, tasks: tasksForBuild, taskSummaryText, shown: Boolean(taskSummaryText) });
+            } else {
+              log.info("start_building task list", { projectId: activeProjectId, tier: subscriptionTier, shown: false, reason: "plan_not_allowed" });
+            }
+
+            accumulatedText =
+              `🚀 Triggering **Building Phase** for project \`${activeProjectId}\`...\n\n` +
+              (taskSummaryText ? `${taskSummaryText}\n\n` : "");
+            await stream(onUpdate, accumulatedText);
+            const model = await readActiveModel(stateDir);
+            log.info("start_building selected build api about to call", {
+              projectId: activeProjectId,
+              activeModel: model,
+            });
+            await client.startBuilding(activeProjectId, model);
+            log.info("start_building selected build api completed", {
+              projectId: activeProjectId,
+              activeModel: model,
+              taskSummaryShown: Boolean(taskSummaryText),
+            });
+            return {
+              content: [{
+                type: "text",
+                text:
+                  `✅ **Building Started!** Agents are now writing your software.` +
+                  (taskSummaryText ? `\n\n${taskSummaryText}` : ""),
+              }],
+              details: { projectId: activeProjectId, action: "build", status: "started" },
+            };
+          } else if (action === "resume") {
             accumulatedText = `🚀 Triggering **Design Agent** to continue building project \`${activeProjectId}\`...\n\n`;
             await stream(onUpdate, accumulatedText);
-            await client.resumeDesign(activeProjectId);
+            try {
+              await client.resumeDesign(activeProjectId);
+            } catch (err) {
+              if (err instanceof AuthError) {
+                const finalAgents = ["continue", "review"];
+                await writeLatestSuggestions(stateDir, sessionId, {
+                  projectId: activeProjectId,
+                  agents: finalAgents,
+                  messageId: "",
+                });
+                const text =
+                  `${err.message}\n\n` +
+                  `Your project checkpoint is still saved. After logging in, choose Continue again to resume.`;
+                return {
+                  content: [{ type: "text", text }],
+                  details: { projectId: activeProjectId, status: "auth_expired", agents: finalAgents },
+                  presentation: buildSuggestedAgentsPresentation(activeProjectId, finalAgents),
+                };
+              }
+              throw err;
+            }
           } else {
             accumulatedText = `🚀 Triggering **${isRunPlanAll ? "Run Plan All" : agents.join(", ")}** on project \`${activeProjectId}\`...\n\n`;
             await stream(onUpdate, accumulatedText);
+            log.info("send_message trigger_agents about to call", {
+              projectId: activeProjectId,
+              agents,
+              messageId,
+              isRunPlanAll,
+            });
             await client.triggerAgents(activeProjectId, agents, messageId);
+            log.info("send_message trigger_agents completed", {
+              projectId: activeProjectId,
+              agents,
+              messageId,
+              isRunPlanAll,
+            });
           }
 
           // Monitor logs live
           let hasCompletedAgent = false;
+          let pausedForReview = false;
+          const eventIdleTimeoutMs = 600_000;
+          log.info("send_message streamProjectEvents start", {
+            projectId: activeProjectId,
+            agents,
+            action,
+            idleTimeoutMs: eventIdleTimeoutMs,
+          });
           await client.streamProjectEvents(activeProjectId, {
             onAgentLog: (log) => {
               if (log.action === "completed") {
@@ -135,34 +262,146 @@ export function createSendMessageTool(deps: {
               accumulatedText += `\n**System:** ${msg.content}\n`;
               void stream(onUpdate, accumulatedText);
             },
+            onPlanningComplete: (data) => {
+              if (data.status === "paused_for_review") {
+                pausedForReview = true;
+              }
+            },
+            idleTimeoutMs: eventIdleTimeoutMs,
+          });
+          log.info("send_message streamProjectEvents finished", {
+            projectId: activeProjectId,
+            agents,
+            pausedForReview,
+            hasCompletedAgent,
           });
 
           // Show suggestions at the end
-          const statusAfter = await client.getProjectStatus(activeProjectId);
           let finalAgents: string[] = [];
-          
-          if (statusAfter.pending_suggested_agents) {
-            finalAgents = Object.keys(statusAfter.pending_suggested_agents).filter(k => statusAfter.pending_suggested_agents![k] === true);
+
+          if (pausedForReview) {
+            finalAgents = ["continue", "review"];
+          } else {
+            const statusAfter = await client.getProjectStatus(activeProjectId);
+
+            if (statusAfter.pending_suggested_agents) {
+              finalAgents = Object.keys(statusAfter.pending_suggested_agents).filter(k => statusAfter.pending_suggested_agents![k] === true);
+            }
+
+            // Fallback to Continue only when the agent-log timeline says the
+            // current agent run has completed. While an agent is still running,
+            // avoid presenting stale Review/Continue choices.
+            if (finalAgents.length === 0) {
+              const hasCompletedLog = await client.hasLatestCompletedAgentLog(activeProjectId);
+              if (hasCompletedLog) {
+                finalAgents = ["continue"];
+              }
+            }
           }
-          
-          // Fallback to continue/review if no specific agents are suggested at this stage
-          if (finalAgents.length === 0) {
+
+          // Final Readiness Check: Architecture and Tasks
+          let readinessText = "";
+          let hasArchitectureAndTasks = false;
+          let canBuildForPlan = false;
+          try {
+            const [arch, tasks] = await Promise.all([
+              client.getArchitecture(activeProjectId).catch(() => null),
+              client.getTasks(activeProjectId).catch(() => null),
+            ]);
+
+            const hasArchitecture = hasGeneratedData(arch);
+            const hasTasks = hasGeneratedData(tasks);
+            hasArchitectureAndTasks = hasArchitecture && hasTasks;
+            log.info("start_building readiness decision", { projectId: activeProjectId, hasArchitecture, hasTasks, willShow: hasArchitectureAndTasks });
+
+            if (hasArchitectureAndTasks) {
+              const share = await client.createDesignShare(activeProjectId).catch(() => null);
+              readinessText = `\n\n🎉 **Project Ready for Building!**\n`;
+              if (share?.share_url) {
+                readinessText += `🎨 **Design Preview:** [${share.share_url}](${share.share_url})\n`;
+              }
+              const [subscription, plans, profile] = await Promise.all([
+                client.getSubscription().catch(() => null),
+                client.getSubscriptionPlans().catch(() => []),
+                client.getProfile().catch(() => null),
+              ]);
+              const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
+              canBuildForPlan = canUseStartBuilding(subscriptionTier);
+              log.info("start_building show plan decision", {
+                projectId: activeProjectId,
+                subscriptionTier,
+                canBuildForPlan,
+                plansCount: plans.length,
+              });
+
+              // Add "Start Building" to the agents if not already there
+              if (canBuildForPlan) {
+                const hasCompletedLog = await client.hasLatestCompletedAgentLog(activeProjectId);
+                log.info("agent_logs continue override decision", {
+                  projectId: activeProjectId,
+                  source: "send_message_tool",
+                  action,
+                  hasCompletedLog,
+                  hasArchitecture,
+                  hasTasks,
+                  canBuildForPlan,
+                  willOverrideToContinue: false,
+                  reason: "tasks_and_architecture_ready_agent_log_completed_is_not_ui_continue",
+                });
+                log.info("start_building added", {
+                  projectId: activeProjectId,
+                  reason: action === "resume" ? "resume_completed_with_architecture_and_tasks" : "architecture_and_tasks",
+                });
+                finalAgents = ["start_building"];
+                log.info("suggestions final decision before write", {
+                  projectId: activeProjectId,
+                  source: "send_message_tool",
+                  action,
+                  suggestions: finalAgents,
+                  hasCompletedAgentLog: hasCompletedLog,
+                  hasArchitecture,
+                  hasTasks,
+                  canBuildForPlan,
+                });
+              }
+              if (!canBuildForPlan) {
+                readinessText += `\n${getUpgradeToBuildText(siteUrl)}`;
+              }
+            }
+          } catch (err) {
+            log.info("Readiness check error", err);
+          }
+
+          finalAgents = filterStartBuildingAgents(finalAgents, hasArchitectureAndTasks && canBuildForPlan);
+          if (action === "resume" && finalAgents.length === 0 && !hasArchitectureAndTasks) {
+            log.info("resume ended before generated checkpoint; preserving review actions", {
+              projectId: activeProjectId,
+              pausedForReview,
+              hasCompletedAgent,
+              hasArchitectureAndTasks,
+            });
             finalAgents = ["continue", "review"];
           }
-          
-          const groupedAgentsAfter = groupAgents(finalAgents);
-          accumulatedText += `\n\n${buildSuggestedAgentsText(activeProjectId, groupedAgentsAfter)}`;
+          const finalGroupedAgents = groupAgents(finalAgents);
+          accumulatedText += readinessText;
+          if (finalGroupedAgents.length > 0) {
+            accumulatedText += `\n\n${buildSuggestedAgentsText(activeProjectId, finalGroupedAgents)}`;
+          }
+          const presentation = finalGroupedAgents.length > 0
+            ? buildSuggestedAgentsPresentation(activeProjectId, finalGroupedAgents)
+            : undefined;
 
           // Update saved suggestions for the next selection
           await writeLatestSuggestions(stateDir, sessionId, {
             projectId: activeProjectId,
-            agents: groupedAgentsAfter,
+            agents: finalGroupedAgents,
             messageId: "",
           });
 
           return {
             content: [{ type: "text", text: accumulatedText }],
-            details: { projectId: activeProjectId, agents: groupedAgentsAfter },
+            details: { projectId: activeProjectId, agents: finalGroupedAgents },
+            presentation,
           };
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -189,7 +428,7 @@ export function createSendMessageTool(deps: {
           try {
             mediaUrls = await client.uploadMedia(params.MediaPaths, activeProjectId);
           } catch (uploadErr) {
-            console.error("[8080.ai] Media upload failed:", uploadErr);
+            log.info("Media upload failed", uploadErr);
             // We'll continue without media if upload fails, or should we error?
             // For now, let's just log it and continue.
           }
@@ -205,7 +444,7 @@ export function createSendMessageTool(deps: {
           const msgs = (statusBefore.messages || []) as { id?: string; author?: string }[];
           const lastAssistant = [...msgs].reverse().find(m => m.author === "assistant");
           lastKnownMsgId = lastAssistant?.id;
-          console.log(`[8080.ai tool] lastKnownMsgId: ${lastKnownMsgId}`);
+          log.info("lastKnownMsgId", lastKnownMsgId);
         } catch { /* ignore */ }
 
         void stream(onUpdate, "⏳ **Connecting to 8080.ai...**");
@@ -225,17 +464,23 @@ export function createSendMessageTool(deps: {
               suggestedAgents.push(...agents);
             },
             onRaw: (raw) => {
-              console.log(`[8080.ai tool] Raw SSE event: ${raw}`);
+              log.info("Raw SSE event", raw);
             }
           }
         );
 
         // Deduplicate agents
         suggestedAgents = Array.from(new Set([...suggestedAgents, ...(result.suggestedAgents || [])]));
+        const streamSuggestedAgents = [...suggestedAgents];
+        log.info("send_message stream suggested agents", {
+          projectId: activeProjectId,
+          suggestedAgents: streamSuggestedAgents,
+          hasPlanAll: streamSuggestedAgents.includes("plan_all"),
+        });
 
         // Fallback: if response is empty, check for a NEW message in history.
         if (!responseText.trim()) {
-          console.log("[8080.ai tool] Response empty, waiting 2s then checking history for NEW message...");
+          log.info("Response empty, waiting 2s then checking history for NEW message...");
           await new Promise(r => setTimeout(r, 2000));
           try {
             const status = await client.getProjectStatus(activeProjectId);
@@ -245,10 +490,10 @@ export function createSendMessageTool(deps: {
 
             if (newMsg?.content) {
               responseText = newMsg.content;
-              console.log(`[8080.ai tool] Found NEW fallback message: ${newMsg.id}`);
+              log.info("Found NEW fallback message", { messageId: newMsg.id });
             }
           } catch (fallbackErr) {
-            console.error("[8080.ai tool] Fallback failed:", fallbackErr);
+            log.info("Fallback failed", fallbackErr);
           }
         }
 
@@ -275,13 +520,28 @@ export function createSendMessageTool(deps: {
           } catch { }
         }
 
-        // Forced Fallback: If no agents suggested but it's a declarative response, force "plan_all"
-        if (suggestedAgents.length === 0 && !isQuestion && cleanText) {
-          suggestedAgents.push("plan_all");
+        if (!streamSuggestedAgents.includes("plan_all")) {
+          suggestedAgents = suggestedAgents.filter((agent) => agent !== "plan_all");
+        }
+        if (isQuestion) {
+          suggestedAgents = [];
+        }
+        log.info("send_message suggestion display decision", {
+          projectId: activeProjectId,
+          isQuestion,
+          streamSuggestedAgents,
+          finalSuggestedAgents: suggestedAgents,
+          showRunPlanAll: !isQuestion && streamSuggestedAgents.includes("plan_all") && suggestedAgents.includes("plan_all"),
+        });
+
+        if (suggestedAgents.length > 0) {
+          suggestedAgents = filterStartBuildingAgents(suggestedAgents, false);
         }
 
         const groupedAgents = groupAgents(suggestedAgents);
-        const presentation = buildSuggestedAgentsPresentation(activeProjectId, groupedAgents, cleanText);
+        const presentation = groupedAgents.length > 0
+          ? buildSuggestedAgentsPresentation(activeProjectId, groupedAgents, cleanText)
+          : undefined;
         const agentText = groupedAgents.length > 0 ? buildSuggestedAgentsText(activeProjectId, groupedAgents, cleanText) : "";
 
         let finalResponse = cleanText;

@@ -11,12 +11,17 @@ import { createLoginTool } from "./src/login-tool.ts";
 import { createListProjectsTool } from "./src/list-projects-tool.ts";
 import { createModelTool } from "./src/model-tool.ts";
 import { createSelectProjectTool } from "./src/select-project-tool.ts";
+import { createTaskListTool } from "./src/task-list-tool.ts";
 import { generateSessionId } from "./src/command.ts";
+import { configureLogger, log } from "./logger.ts";
 type PluginConfig = {
   siteUrl?: string;
   apiBaseUrl?: string;
   pollingTimeoutMs?: number;
 };
+
+const DEFAULT_SITE_URL = "https://8080.ai/";
+const DEFAULT_API_BASE_URL = "https://api.8080.ai/api/v1";
 
 export default definePluginEntry({
   id: "ai8080",
@@ -24,10 +29,11 @@ export default definePluginEntry({
   description: "Integrates the 8080.ai AI software development platform into OpenClaw.",
 
   register(api) {
-    console.log(`[ai8080] Registering plugin with ID: ${api.pluginId}`);
+    configureLogger(api.logger);
+    log.info("Registering plugin", { pluginId: api.pluginId });
     const config = (api.pluginConfig ?? {}) as PluginConfig;
-    const siteUrl = (config.siteUrl?.trim() || "https://8080.ai").replace(/\/$/, "");
-    const apiBaseUrl = (config.apiBaseUrl?.trim() || "https://api.8080.ai/api/v1").replace(/\/$/, "");
+    const siteUrl = (config.siteUrl?.trim() || DEFAULT_SITE_URL).replace(/\/$/, "");
+    const apiBaseUrl = (config.apiBaseUrl?.trim() || DEFAULT_API_BASE_URL).replace(/\/$/, "");
     const pollingTimeoutMs = config.pollingTimeoutMs ?? 600_000;
 
     const stateDir = () => api.runtime.state.resolveStateDir();
@@ -40,7 +46,7 @@ export default definePluginEntry({
     // -----------------------------------------------------------------------
     const command = create8080Command(
       api as Parameters<typeof create8080Command>[0],
-      { siteUrl, apiBaseUrl }
+      { siteUrl, apiBaseUrl, sessionId }
     );
     api.registerCommand(command);
 
@@ -57,10 +63,11 @@ export default definePluginEntry({
     api.registerTool(createCreditsTool({ stateDir, apiBaseUrl }));
     api.registerTool(createReviewProjectTool({ stateDir, apiBaseUrl, sessionId }));
     api.registerTool(createContinueProjectTool({ stateDir, apiBaseUrl, sessionId }));
-    api.registerTool(createSendMessageTool({ stateDir, apiBaseUrl, sessionId }));
+    api.registerTool(createSendMessageTool({ stateDir, siteUrl, apiBaseUrl, sessionId }));
     api.registerTool(createTriggerAgentsTool({ stateDir, apiBaseUrl, sessionId }));
     api.registerTool(createListProjectsTool({ stateDir, apiBaseUrl }));
     api.registerTool(createSelectProjectTool({ stateDir, apiBaseUrl, sessionId }));
+    api.registerTool(createTaskListTool({ stateDir, apiBaseUrl, sessionId }));
     api.registerTool(createModelTool({ stateDir, apiBaseUrl }));
   },
 });
