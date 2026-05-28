@@ -94,6 +94,13 @@ function summarizeAgentLogs(logs: AgentLog[], limit = 5) {
     }));
 }
 
+function isCompletedAgentLog(entry: AgentLog | undefined): boolean {
+  if (!entry) return false;
+  if (entry.action === "completed") return true;
+  if (typeof entry.summary !== "string") return false;
+  return /^completed\b/i.test(entry.summary.trim());
+}
+
 function normalizeAiChatModel(model: string | undefined): string | undefined {
   if (model === "large" || model === "super_large") return undefined;
   return model;
@@ -620,6 +627,8 @@ export function createApiClient(opts: ClientOpts) {
         return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
       })[0];
 
+      const isCompleted = isCompletedAgentLog(latest);
+
       log.info("agent_logs latest action check", {
         projectId,
         logsCount: logs.length,
@@ -627,11 +636,11 @@ export function createApiClient(opts: ClientOpts) {
         latestAgentType: latest?.agent_type,
         latestSummary: latest?.summary,
         latestCreatedAt: latest?.created_at,
-        isCompleted: latest?.action === "completed",
+        isCompleted,
         latestFive: summarizeAgentLogs(logs),
       });
 
-      return latest?.action === "completed";
+      return isCompleted;
     },
 
     // 8080.ai uses /projects/{id}/build (no slash) to start/continue building
@@ -869,16 +878,6 @@ export function createApiClient(opts: ClientOpts) {
           if (callbacks.onRaw) callbacks.onRaw(event.data);
           try {
             const data = JSON.parse(event.data);
-            log.info("project_events event received", {
-              projectId,
-              type: data.type,
-              action: data.action,
-              agent_type: data.agent_type,
-              status: data.status,
-              content: previewLogText(data.content),
-              summary: previewLogText(data.summary),
-              matchesStartBuildingReviewMessage: isReviewArchitectureStartBuildingChatMessage(data),
-            });
             const pauseStatus = getPauseForReviewStatus(data);
             const isProgressEvent =
               data.type === "agent_log" ||

@@ -7,6 +7,13 @@
 import { AGENT_DISPLAY_NAMES, type Project } from "./api-client.ts";
 import { type MessagePresentation } from "openclaw/plugin-sdk";
 
+export function buildRequirementsUrl(siteUrl: string, projectId: string, sessionId?: string): string {
+  const base = siteUrl.replace(/\/$/, "");
+  return sessionId
+    ? `${base}/planning/${projectId}/${sessionId}/requirements`
+    : `${base}/planning/${projectId}/requirements`;
+}
+
 export function buildReviewContinueJsonl(
   projectId: string,
   requirementDocUrl: string
@@ -76,7 +83,7 @@ export function buildSuggestedAgentsJsonl(projectId: string, agents: string[]): 
       });
       label = `🚀 Run ${subLabels.join(", ")}`;
     } else {
-      label = AGENT_DISPLAY_NAMES[agent] ?? agent;
+      label = agent === "continue" ? "Continue" : agent === "review" ? "Review" : AGENT_DISPLAY_NAMES[agent] ?? agent;
     }
 
     let value = "";
@@ -123,7 +130,7 @@ export function buildSuggestedAgentsPresentation(
       });
       label = `🚀 Run ${subLabels.join(", ")}`;
     } else {
-      label = AGENT_DISPLAY_NAMES[agent] ?? agent;
+      label = agent === "continue" ? "Continue" : agent === "review" ? "Review" : AGENT_DISPLAY_NAMES[agent] ?? agent;
     }
 
     let value = "";
@@ -145,8 +152,10 @@ export function buildSuggestedAgentsPresentation(
 
   return {
     type: "buttons",
-    title: "8080.ai Agents",
-    message: "Choose an agent to trigger:",
+    title: "8080.ai",
+    message: agents.length === 2 && agents[0] === "continue" && agents[1] === "review"
+      ? "Choose what to do next:"
+      : "Choose an agent to trigger:",
     buttons
   };
 }
@@ -208,7 +217,7 @@ export function buildSuggestedAgentsText(
       });
       label = `🚀 Run ${subLabels.join(", ")}`;
     } else {
-      label = AGENT_DISPLAY_NAMES[agent] ?? agent;
+      label = agent === "continue" ? "Continue" : agent === "review" ? "Review" : AGENT_DISPLAY_NAMES[agent] ?? agent;
     }
     return `${i + 1}. ${label}`;
   });

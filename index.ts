@@ -61,7 +61,7 @@ export default definePluginEntry({
     api.registerTool(createLoginTool({ stateDir, siteUrl, apiBaseUrl }));
     api.registerTool(createProjectStatusTool({ stateDir, apiBaseUrl, sessionId }));
     api.registerTool(createCreditsTool({ stateDir, apiBaseUrl }));
-    api.registerTool(createReviewProjectTool({ stateDir, apiBaseUrl, sessionId }));
+    api.registerTool(createReviewProjectTool({ stateDir, siteUrl, apiBaseUrl, sessionId }));
     api.registerTool(createContinueProjectTool({ stateDir, apiBaseUrl, sessionId }));
     api.registerTool(createSendMessageTool({ stateDir, siteUrl, apiBaseUrl, sessionId }));
     api.registerTool(createTriggerAgentsTool({ stateDir, apiBaseUrl, sessionId }));

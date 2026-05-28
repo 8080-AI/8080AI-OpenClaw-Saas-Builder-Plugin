@@ -1,10 +1,13 @@
 import { Type } from "@sinclair/typebox";
-import open from "open";
 import { AuthRequiredError } from "./auth.ts";
 import { AuthError, requireAuthenticatedClient } from "./api-client.ts";
+import { buildRequirementsUrl } from "./review-continue.ts";
+import { extractPendingSuggestion } from "./suggested-agents.ts";
+import { log } from "../logger.ts";
 
 export function createReviewProjectTool(deps: {
   stateDir: () => string;
+  siteUrl: string;
   apiBaseUrl: string;
   sessionId: string;
 }) {
@@ -27,7 +30,7 @@ export function createReviewProjectTool(deps: {
       _onUpdate: unknown
     ) {
       const stateDir = deps.stateDir();
-      const { apiBaseUrl, sessionId } = deps;
+      const { siteUrl, apiBaseUrl, sessionId } = deps;
 
       try {
         const { readActiveProject } = await import("./project-state.ts");
@@ -41,22 +44,18 @@ export function createReviewProjectTool(deps: {
 
         const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
         const status = await client.getProjectStatus(activeProjectId);
-        if (!status.requirementDocUrl) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `No requirement document available yet for project ${activeProjectId}. Current phase: ${status.phase}`,
-              },
-            ],
-          };
-        }
-        await open(status.requirementDocUrl);
+        const pending = extractPendingSuggestion(status.pending_suggested_agents);
+        const requirementUrl = status.requirementDocUrl || buildRequirementsUrl(siteUrl, activeProjectId, pending.sessionId);
+        log.info("review_project url", {
+          projectId: activeProjectId,
+          requirementUrl,
+          sessionId: pending.sessionId,
+        });
         return {
           content: [
             {
               type: "text",
-              text: `Opened requirement document in browser:\n${status.requirementDocUrl}`,
+              text: requirementUrl,
             },
           ],
         };
