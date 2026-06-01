@@ -1,5 +1,4 @@
 import { Type } from "@sinclair/typebox";
-import open from "open";
 import { writeToken, clearToken } from "./auth.ts";
 import { refreshAccessToken, validateToken } from "./api-client.ts";
 
@@ -151,12 +150,6 @@ export function createLoginTool(deps: {
       }
 
       // action === "login"
-      try {
-        await open(siteUrl);
-      } catch {
-        // Browser failed to open — that's OK, user can open manually
-      }
-
       return {
         presentation: {
           type: "buttons",

@@ -1,4 +1,3 @@
-import open from "open";
 import { writeToken, clearToken } from "./auth.ts";
 import { AuthError, AGENT_DISPLAY_NAMES, type BuildStep, requireAuthenticatedClient, validateToken, filterStartBuildingAgents, refreshAccessToken, isReviewArchitectureStartBuildingChatMessage } from "./api-client.ts";
 import { readActiveProject, writeActiveProject } from "./project-state.ts";
@@ -335,15 +334,9 @@ export function create8080Command(
 
         // ------------------------------------------------------------------
         case "login": {
-          try {
-            await open(siteUrl);
-          } catch {
-            // Browser failed to open — that's OK, user can open it manually
-          }
-
           return {
             text:
-              `🔗 Opening 8080.ai for login…\n\n` +
+              `🔗 Log in to 8080.ai:\n${siteUrl}\n\n` +
               `Steps to connect manually:\n` +
               `  1. Log in at ${siteUrl}\n` +
               `  2. Open browser console (F12 → Console)\n` +
