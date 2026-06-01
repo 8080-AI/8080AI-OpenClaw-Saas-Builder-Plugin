@@ -31,13 +31,32 @@ export function isPauseForReviewText(text: unknown): boolean {
 }
 
 export function isReviewArchitectureStartBuildingChatMessage(data: unknown): boolean {
+  if (typeof data === "string") {
+    return /Review the design and architecture and start building/i.test(data);
+  }
   if (!data || typeof data !== "object") return false;
   const event = data as Record<string, unknown>;
+  return [event.content, event.message, event.summary].some(isReviewArchitectureStartBuildingChatMessage);
+}
+
+export function isReviewBuildSystemMessage(projectId: string, data: unknown): boolean {
+  if (!data || typeof data !== "object") return false;
+  const message = data as Record<string, unknown>;
   return (
-    event.type === "chat_message" &&
-    typeof event.content === "string" &&
-    /Review the design and architecture and start building/i.test(event.content)
+    message.project_id === projectId &&
+    message.author === "system" &&
+    isReviewArchitectureStartBuildingChatMessage(message.content)
   );
+}
+
+function extractChatMessages(data: unknown): ChatMessage[] {
+  if (Array.isArray(data)) return data as ChatMessage[];
+  if (!data || typeof data !== "object") return [];
+  const obj = data as Record<string, unknown>;
+  for (const key of ["messages", "data", "items", "results"]) {
+    if (Array.isArray(obj[key])) return obj[key] as ChatMessage[];
+  }
+  return [];
 }
 
 function getPauseForReviewStatus(data: Record<string, unknown>): { status: string; triggered_by?: string } | null {
@@ -193,6 +212,7 @@ export type BuildStep = {
 
 export type ChatMessage = {
   id: string;
+  project_id?: string;
   content: string;
   author: "user" | "assistant" | "system";
   created_at: string;
@@ -606,6 +626,30 @@ export function createApiClient(opts: ClientOpts) {
       const data = await get(`/projects/${projectId}/architecture`);
       log.info("start_building readiness architecture", { projectId, summary: debugResponseSummary("architecture", data) });
       return data;
+    },
+
+    async getChatMessages(projectId: string): Promise<ChatMessage[]> {
+      const path = "/chat/messages";
+      const data = await get(path);
+      const messages = extractChatMessages(data);
+      const projectMessages = messages.filter((message) => message.project_id === projectId);
+      const hasReviewBuildSystemMessage = projectMessages.some((message) =>
+        isReviewBuildSystemMessage(projectId, message)
+      );
+      log.info("chat_messages api response", {
+        projectId,
+        path,
+        summary: debugResponseSummary("chatMessages", data),
+        messagesCount: messages.length,
+        projectMessagesCount: projectMessages.length,
+        hasReviewBuildSystemMessage,
+      });
+      return messages;
+    },
+
+    async hasReviewBuildSystemMessage(projectId: string): Promise<boolean> {
+      const messages = await this.getChatMessages(projectId);
+      return messages.some((message) => isReviewBuildSystemMessage(projectId, message));
     },
 
     async getAgentLogs(projectId: string): Promise<AgentLog[]> {

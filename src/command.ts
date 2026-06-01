@@ -878,27 +878,30 @@ export function create8080Command(
                 progressTimeoutMs: 45_000,
                 maxTimeoutMs: 180_000,
               });
-              const eventEndedWithStartBuildingMessage = isReviewArchitectureStartBuildingChatMessage(lastProjectEvent);
-              log.info("command_continue /events final event decision", {
-                projectId: suggestions.projectId,
-                lastEventType: lastProjectEvent?.type,
-                lastEventContent: typeof lastProjectEvent?.content === "string"
-                  ? lastProjectEvent.content.slice(0, 240)
-                  : undefined,
-                eventEndedWithStartBuildingMessage,
-              });
-
               // Check if any of the three endpoints generated data
               log.info("start_building condition-check 1 in command", {
                 projectId: suggestions.projectId,
                 source: "command_continue",
                 step: "fetch_outputs_start",
               });
-              const [designPages, tasks, arch] = await Promise.all([
+              const [designPages, tasks, arch, hasReviewBuildSystemMessage] = await Promise.all([
                 client.getDesignPages(suggestions.projectId).catch(() => null),
                 client.getTasks(suggestions.projectId).catch(() => null),
                 client.getArchitecture(suggestions.projectId).catch(() => null),
+                client.hasReviewBuildSystemMessage(suggestions.projectId).catch(() => false),
               ]);
+              const eventEndedWithStartBuildingMessage =
+                isReviewArchitectureStartBuildingChatMessage(lastProjectEvent) ||
+                hasReviewBuildSystemMessage;
+              log.info("command_continue review_build phase decision", {
+                projectId: suggestions.projectId,
+                lastEventType: lastProjectEvent?.type,
+                lastEventContent: typeof lastProjectEvent?.content === "string"
+                  ? lastProjectEvent.content.slice(0, 240)
+                  : undefined,
+                hasReviewBuildSystemMessage,
+                eventEndedWithStartBuildingMessage,
+              });
 
               const isGenerated = hasGeneratedData(designPages) || hasGeneratedData(tasks) || hasGeneratedData(arch);
               const hasTasks = hasGeneratedData(tasks);
@@ -984,10 +987,7 @@ export function create8080Command(
                   canBuildForPlan,
                   plansCount: plans.length,
                 });
-                const hasCompletedAgentLog = canBuildForPlan
-                  ? await client.hasLatestCompletedAgentLog(suggestions.projectId)
-                  : false;
-                const canShowStartBuilding = canBuildForPlan && hasCompletedAgentLog && eventEndedWithStartBuildingMessage;
+                const canShowStartBuilding = canBuildForPlan && eventEndedWithStartBuildingMessage;
                 const statusAfterReadiness = await client.getProjectStatus(suggestions.projectId).catch(() => null);
                 const pendingAfterReadiness = extractPendingSuggestion(statusAfterReadiness?.pending_suggested_agents);
                 const backendResumeSuggestions = pendingAfterReadiness.agents.filter((agent) =>
@@ -997,7 +997,6 @@ export function create8080Command(
                 log.info("agent_logs continue override decision", {
                   projectId: suggestions.projectId,
                   source: "command_continue",
-                  hasCompletedAgentLog,
                   eventEndedWithStartBuildingMessage,
                   backendResumeSuggestions,
                   hasBackendContinue,
@@ -1006,10 +1005,10 @@ export function create8080Command(
                   canBuildForPlan,
                   willShowStartBuilding: canShowStartBuilding,
                   reason: canShowStartBuilding
-                    ? "tasks_architecture_completed_agent_log_and_events_review_message_ready"
+                    ? "paid_plan_tasks_architecture_and_review_build_signal_ready"
                     : !eventEndedWithStartBuildingMessage
                       ? "waiting_for_events_review_start_building_message"
-                      : "waiting_for_completed_agent_log_before_start_building",
+                      : "plan_not_allowed",
                 });
                 const nextAgents = canShowStartBuilding
                   ? ["start_building"]
@@ -1022,7 +1021,6 @@ export function create8080Command(
                   source: "command_continue",
                   suggestions: startBuildingAgents,
                   writeSuggestions: startBuildingAgents.length > 0,
-                  hasCompletedAgentLog,
                   eventEndedWithStartBuildingMessage,
                   backendResumeSuggestions,
                   hasBackendContinue,
@@ -1036,9 +1034,9 @@ export function create8080Command(
                     projectId: suggestions.projectId,
                     source: "command_continue",
                     reason: canShowStartBuilding
-                      ? "resume_completed_with_architecture_tasks_completed_agent_log_and_events_review_message"
+                      ? "paid_plan_resume_completed_with_architecture_tasks_and_review_build_signal"
                       : eventEndedWithStartBuildingMessage
-                        ? "waiting_for_completed_agent_log_continue_retry"
+                        ? "waiting_for_plan_permission"
                         : "waiting_for_events_review_start_building_message",
                   });
                   await writeLatestSuggestions(stateDir, sessionId, {

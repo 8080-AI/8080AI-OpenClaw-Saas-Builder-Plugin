@@ -19,6 +19,7 @@ You have access to these 8080.ai tools. Use them when the user talks about 8080.
 | "list my projects", "show all my 8080 projects", "how many projects do I have" | `ai8080_list_projects` |
 | "/ai8080 task-list", "task-list", "show project tasks", "list tasks for active project", "fetch /projects/{project_id}/tasks" | `ai8080_task_list` |
 | "select project", "switch to project X", "activate project Y" | `ai8080_select_project` with `projectId` |
+| "select 1", "select-1", "choose option 1", "option 2", "pick 1" after 8080.ai shows Suggested Next Steps | `ai8080_select_button` with `choice` set to the selected number or option name |
 | "what's the status of my project", "check project X" | `ai8080_get_project_status` with `projectId` |
 | "send a message to my project", "tell 8080 to add dark mode", "for specific hair type" | `ai8080_send_message` (projectId is optional if project is already active) |
 | "review my project", "show the requirements doc" | `ai8080_open_project_requirements` (projectId is optional) |
@@ -53,5 +54,5 @@ The 8080.ai plugin uses the OpenClaw Dashboard v2 features:
 - For task-list requests, always use `ai8080_task_list`; never use `ai8080_list_projects`.
 - For `ai8080_start_project`, **pass the EXACT requirements from the user without expanding them**. If the user provides a short sentence, pass only that short sentence. Do not invent or add features they didn't ask for.
 - After `start_project` or `send_message`, the tool will return the exact response from the 8080.ai Tech Lead. **You MUST output the Tech Lead's response EXACTLY word-for-word to the user.** Do not summarize it. Do not change it.
-- After `start_project` or `send_message`, the response may include numbered next steps — tell the user they can say "choose option N" to trigger them.
+- After `start_project`, `send_message`, `trigger_agents`, or `continue_project`, the response may include numbered next steps — use `ai8080_select_button` when the user says "select 1", "choose option N", or similar.
 - After the user selects `Run Plan All` or `Continue`, do not add any assistant-written progress, success, or confirmation text. If `ai8080_trigger_agents`, `ai8080_continue_project`, or a selection handled by `ai8080_send_message` returns empty visible content with `silent` or `suppressUserResponse`, stay silent. Only show the exact Continue/Review or Start Building actions when the tool returns visible content/presentation.
