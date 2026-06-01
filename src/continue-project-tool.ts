@@ -401,31 +401,34 @@ export function createContinueProjectTool(deps: {
         if (logCount === 0) {
           await new Promise(r => setTimeout(r, 2000)); // Brief pause to ensure backend processed resume
         }
-        const eventEndedWithStartBuildingMessage =
-          sawStartBuildingReviewMessage || isReviewArchitectureStartBuildingChatMessage(lastProjectEvent);
-        const eventEndedAtReviewCheckpoint =
-          eventEndedWithStartBuildingMessage ||
-          (lastProjectEvent?.type === "chat_message" && isPauseForReviewText(lastProjectEvent.content));
-        log.info("continue_project /events final event decision", {
-          projectId: activeProjectId,
-          lastEventType: lastProjectEvent?.type,
-          lastEventContent: previewLogText(lastProjectEvent?.content),
-          rawEventCount,
-          sawStartBuildingReviewMessage,
-          eventEndedWithStartBuildingMessage,
-          eventEndedAtReviewCheckpoint,
-        });
-
         log.info("start_building condition-check 1 in continue_project_tool", {
           projectId: activeProjectId,
           source: "continue_project_tool",
           step: "fetch_outputs_start",
         });
-        const [designPages, tasks, arch] = await Promise.all([
+        const [designPages, tasks, arch, hasReviewBuildSystemMessage] = await Promise.all([
           client.getDesignPages(activeProjectId).catch(() => null),
           client.getTasks(activeProjectId).catch(() => null),
           client.getArchitecture(activeProjectId).catch(() => null),
+          client.hasReviewBuildSystemMessage(activeProjectId).catch(() => false),
         ]);
+        const eventEndedWithStartBuildingMessage =
+          sawStartBuildingReviewMessage ||
+          isReviewArchitectureStartBuildingChatMessage(lastProjectEvent) ||
+          hasReviewBuildSystemMessage;
+        const eventEndedAtReviewCheckpoint =
+          eventEndedWithStartBuildingMessage ||
+          (lastProjectEvent?.type === "chat_message" && isPauseForReviewText(lastProjectEvent.content));
+        log.info("continue_project review_build phase decision", {
+          projectId: activeProjectId,
+          lastEventType: lastProjectEvent?.type,
+          lastEventContent: previewLogText(lastProjectEvent?.content),
+          rawEventCount,
+          sawStartBuildingReviewMessage,
+          hasReviewBuildSystemMessage,
+          eventEndedWithStartBuildingMessage,
+          eventEndedAtReviewCheckpoint,
+        });
 
         function hasGeneratedData(data: unknown): boolean {
           if (!data) return false;
@@ -438,6 +441,7 @@ export function createContinueProjectTool(deps: {
           return false;
         }
 
+        const designPagesReady = hasCompletedDesignPages(designPages);
         const isGenerated = hasGeneratedData(designPages) || hasGeneratedData(tasks) || hasGeneratedData(arch);
         const hasTasks = hasGeneratedData(tasks);
         const hasArchitecture = hasGeneratedData(arch);
@@ -449,6 +453,8 @@ export function createContinueProjectTool(deps: {
           hasDesignPages,
           hasTasks,
           hasArchitecture,
+          designPagesReady,
+          designPagesSummary: summarizeDesignPages(designPages),
           isGenerated,
         });
         const logsText = "";
@@ -458,7 +464,7 @@ export function createContinueProjectTool(deps: {
           const pendingAfterPause = extractPendingSuggestion(statusAfterPause?.pending_suggested_agents);
           const backendSuggestions = pendingAfterPause.agents.filter((agent) => agent === "continue" || agent === "review");
           const hasBackendContinue = backendSuggestions.includes("continue");
-          const suggestions = hasBackendContinue ? backendSuggestions : [];
+          const suggestions = hasBackendContinue ? backendSuggestions : ["continue", "review"];
           const hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(activeProjectId);
           log.info("continue_project paused_for_review backend suggestion gate", {
             projectId: activeProjectId,
@@ -469,7 +475,7 @@ export function createContinueProjectTool(deps: {
             hasLatestCompletedAgentLog,
             eventEndedAtReviewCheckpoint,
           });
-          if (!hasBackendContinue || (!hasLatestCompletedAgentLog && !eventEndedAtReviewCheckpoint)) {
+          if (!eventEndedAtReviewCheckpoint && !hasLatestCompletedAgentLog) {
             pausedForReview = false;
           } else {
             await writeLatestSuggestions(stateDir, sessionId, {
@@ -477,7 +483,7 @@ export function createContinueProjectTool(deps: {
               agents: suggestions,
               messageId: pendingAfterPause.messageId || latestSuggestions?.messageId || "",
             });
-          const finalResult = buildSuggestedAgentsText(activeProjectId, suggestions);
+            const finalResult = buildSuggestedAgentsText(activeProjectId, suggestions);
             const presentation = buildSuggestedAgentsPresentation(activeProjectId, suggestions);
             onUpdate?.({ content: [{ type: "text", text: finalResult }] });
             return {
@@ -557,10 +563,7 @@ export function createContinueProjectTool(deps: {
             canBuildForPlan,
             plansCount: plans.length,
           });
-          const hasCompletedAgentLog = canBuildForPlan
-            ? await client.hasLatestCompletedAgentLog(activeProjectId)
-            : false;
-          const canShowStartBuilding = canBuildForPlan && hasCompletedAgentLog && eventEndedWithStartBuildingMessage;
+          const canShowStartBuilding = canBuildForPlan && eventEndedWithStartBuildingMessage;
           const statusAfterReadiness = await client.getProjectStatus(activeProjectId).catch(() => null);
           const pendingAfterReadiness = extractPendingSuggestion(statusAfterReadiness?.pending_suggested_agents);
           const backendResumeSuggestions = pendingAfterReadiness.agents.filter((agent) =>
@@ -570,7 +573,6 @@ export function createContinueProjectTool(deps: {
           log.info("agent_logs continue override decision", {
             projectId: activeProjectId,
             source: "continue_project_tool",
-            hasCompletedAgentLog,
             eventEndedWithStartBuildingMessage,
             backendResumeSuggestions,
             hasBackendContinue,
@@ -579,14 +581,14 @@ export function createContinueProjectTool(deps: {
             canBuildForPlan,
             willShowStartBuilding: canShowStartBuilding,
             reason: canShowStartBuilding
-              ? "tasks_architecture_completed_agent_log_and_events_review_message_ready"
+              ? "paid_plan_tasks_architecture_and_review_build_signal_ready"
               : !eventEndedWithStartBuildingMessage
                 ? "waiting_for_events_review_start_building_message"
-                : "waiting_for_completed_agent_log_before_start_building",
+                : "plan_not_allowed",
           });
           const canShowReviewActions =
             hasBackendContinue &&
-            (hasCompletedAgentLog || eventEndedAtReviewCheckpoint);
+            eventEndedAtReviewCheckpoint;
           const suggestions = canShowStartBuilding
             ? ["start_building"]
             : canBuildForPlan && canShowReviewActions
@@ -597,7 +599,6 @@ export function createContinueProjectTool(deps: {
             source: "continue_project_tool",
             suggestions,
             writeSuggestions: suggestions.length > 0,
-            hasCompletedAgentLog,
             eventEndedWithStartBuildingMessage,
             backendResumeSuggestions,
             hasBackendContinue,
@@ -612,11 +613,9 @@ export function createContinueProjectTool(deps: {
             source: "continue_project_tool",
             shown: canShowStartBuilding,
             reason: canShowStartBuilding
-              ? "resume_completed_with_architecture_tasks_completed_agent_log_and_events_review_message"
+              ? "paid_plan_resume_completed_with_architecture_tasks_and_review_build_signal"
               : canBuildForPlan
-                ? eventEndedWithStartBuildingMessage
-                  ? "waiting_for_completed_agent_log"
-                  : "waiting_for_events_review_start_building_message"
+                ? "waiting_for_events_review_start_building_message"
                 : "plan_not_allowed",
           });
           if (suggestions.length > 0) {
@@ -631,9 +630,7 @@ export function createContinueProjectTool(deps: {
             (canShowStartBuilding
               ? `Review the design and architecture and start building.\n\n${buildSuggestedAgentsText(activeProjectId, suggestions)}`
               : canBuildForPlan
-                ? eventEndedWithStartBuildingMessage && !hasCompletedAgentLog
-                  ? `The design, tasks, and architecture are available, but 8080.ai still has an active agent log. I will show Continue after the latest /agent-logs action is completed.${suggestions.length > 0 ? `\n\n${buildSuggestedAgentsText(activeProjectId, suggestions)}` : ""}`
-                  : `The design, tasks, and architecture are available.${suggestions.length > 0 ? `\n\n${buildSuggestedAgentsText(activeProjectId, suggestions)}` : ""}`
+                ? `The design, tasks, and architecture are available.${suggestions.length > 0 ? `\n\n${buildSuggestedAgentsText(activeProjectId, suggestions)}` : ""}`
                 : getUpgradeToBuildText());
           onUpdate?.({ content: [{ type: "text", text: finalResult }] });
           return {
@@ -654,7 +651,8 @@ export function createContinueProjectTool(deps: {
           const hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(activeProjectId);
           const canShowReviewActions =
             (hasBackendContinue && (hasLatestCompletedAgentLog || pausedForReview || eventEndedAtReviewCheckpoint)) ||
-            (hasDesignPages && hasLatestCompletedAgentLog);
+            (hasDesignPages && hasLatestCompletedAgentLog) ||
+            designPagesReady;
           const suggestions = canShowReviewActions
             ? (backendSuggestions.length > 0 ? backendSuggestions : ["continue", "review"])
             : [];
@@ -672,12 +670,16 @@ export function createContinueProjectTool(deps: {
             hasTasks,
             hasArchitecture,
             hasDesignPages,
+            designPagesReady,
+            designPagesSummary: summarizeDesignPages(designPages),
             lastEventType: lastProjectEvent?.type,
             eventEndedWithStartBuildingMessage,
             reason: hasBackendContinue
               ? "backend_pending_suggested_agents_contains_continue"
               : hasDesignPages && hasLatestCompletedAgentLog
                 ? "design_pages_generated_and_latest_agent_log_completed"
+              : designPagesReady
+                ? "design_pages_generation_completed"
               : canShowReviewActions
                 ? "completed_agent_log_or_events_review_checkpoint"
                 : "waiting_for_completed_agent_log_or_events_review_checkpoint",
@@ -741,4 +743,62 @@ export function createContinueProjectTool(deps: {
 function previewLogText(value: unknown, maxLength = 240): string | undefined {
   if (typeof value !== "string") return undefined;
   return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
+}
+
+function getDesignPageRecords(data: unknown): Record<string, unknown>[] {
+  if (Array.isArray(data)) {
+    return data.filter((page): page is Record<string, unknown> => Boolean(page) && typeof page === "object");
+  }
+  if (!data || typeof data !== "object") return [];
+
+  for (const value of Object.values(data as Record<string, unknown>)) {
+    if (!Array.isArray(value)) continue;
+    const pages = value.filter((page): page is Record<string, unknown> => Boolean(page) && typeof page === "object");
+    if (pages.length > 0) return pages;
+  }
+
+  return [];
+}
+
+function hasCompletedDesignPages(data: unknown): boolean {
+  const pages = getDesignPageRecords(data);
+  if (pages.length === 0) return false;
+
+  return pages.every((page) => {
+    if (page.generation_failed === true || page.credit_blocked === true) return false;
+
+    const sectionsDone = typeof page.sections_done === "number" ? page.sections_done : undefined;
+    const sectionsTotal = typeof page.sections_total === "number" ? page.sections_total : undefined;
+    const phase = typeof page.generation_phase === "string" ? page.generation_phase.toLowerCase() : "";
+    const isReviewPhase = ["review", "reviewing"].some((token) => phase.includes(token));
+    const hasRenderableOutput = Boolean(
+      page.compiled_html || page.jsx_content || page.screenshot_url || page.screenshot_thumb_url
+    );
+
+    if (sectionsTotal !== undefined && sectionsTotal > 0) {
+      const sectionsComplete = sectionsDone !== undefined && sectionsDone >= sectionsTotal;
+      if (sectionsComplete && isReviewPhase && hasRenderableOutput) return true;
+      if (page.generation_in_progress === true) return false;
+      return sectionsComplete;
+    }
+
+    if (page.generation_in_progress === true && !(isReviewPhase && hasRenderableOutput)) return false;
+    if (phase && !["complete", "completed", "done", "screenshot", "review"].some((token) => phase.includes(token))) {
+      return false;
+    }
+
+    return hasRenderableOutput;
+  });
+}
+
+function summarizeDesignPages(data: unknown) {
+  return getDesignPageRecords(data).slice(0, 5).map((page) => ({
+    page_name: page.page_name,
+    generation_in_progress: page.generation_in_progress,
+    generation_failed: page.generation_failed,
+    sections_done: page.sections_done,
+    sections_total: page.sections_total,
+    generation_phase: page.generation_phase,
+    has_screenshot: Boolean(page.screenshot_url || page.screenshot_thumb_url),
+  }));
 }

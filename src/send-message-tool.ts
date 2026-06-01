@@ -379,15 +379,24 @@ export function createSendMessageTool(deps: {
           let hasArchitectureAndTasks = false;
           let canBuildForPlan = false;
           try {
-            const [arch, tasks] = await Promise.all([
+            const [arch, tasks, hasReviewBuildSystemMessage] = await Promise.all([
               client.getArchitecture(activeProjectId).catch(() => null),
               client.getTasks(activeProjectId).catch(() => null),
+              client.hasReviewBuildSystemMessage(activeProjectId).catch(() => false),
             ]);
 
             const hasArchitecture = hasGeneratedData(arch);
             const hasTasks = hasGeneratedData(tasks);
+            const hasReviewBuildPhase = eventEndedWithStartBuildingMessage || hasReviewBuildSystemMessage;
             hasArchitectureAndTasks = hasArchitecture && hasTasks;
-            log.info("start_building readiness decision", { projectId: activeProjectId, hasArchitecture, hasTasks, willShow: hasArchitectureAndTasks });
+            log.info("start_building readiness decision", {
+              projectId: activeProjectId,
+              hasArchitecture,
+              hasTasks,
+              hasReviewBuildSystemMessage,
+              hasReviewBuildPhase,
+              willShow: hasArchitectureAndTasks && hasReviewBuildPhase,
+            });
 
             if (hasArchitectureAndTasks) {
               const share = await client.createDesignShare(activeProjectId).catch(() => null);
@@ -411,16 +420,16 @@ export function createSendMessageTool(deps: {
 
               // Add "Start Building" to the agents if not already there
               if (canBuildForPlan) {
-                const hasCompletedLog = await client.hasLatestCompletedAgentLog(activeProjectId);
-                const canShowStartBuilding = hasCompletedLog && eventEndedWithStartBuildingMessage;
+                const canShowStartBuilding = hasReviewBuildPhase;
                 const backendResumeSuggestions = finalAgents.filter((agent) => agent === "continue" || agent === "review");
                 const hasBackendContinue = backendResumeSuggestions.includes("continue");
                 log.info("agent_logs continue override decision", {
                   projectId: activeProjectId,
                   source: "send_message_tool",
                   action,
-                  hasCompletedLog,
                   eventEndedWithStartBuildingMessage,
+                  hasReviewBuildSystemMessage,
+                  hasReviewBuildPhase,
                   backendResumeSuggestions,
                   hasBackendContinue,
                   hasArchitecture,
@@ -428,23 +437,23 @@ export function createSendMessageTool(deps: {
                   canBuildForPlan,
                   willShowStartBuilding: canShowStartBuilding,
                   reason: canShowStartBuilding
-                    ? "tasks_architecture_completed_agent_log_and_events_review_message_ready"
-                    : !eventEndedWithStartBuildingMessage
-                      ? "waiting_for_events_review_start_building_message"
-                      : "waiting_for_completed_agent_log_before_start_building",
+                    ? "paid_plan_tasks_architecture_and_review_build_signal_ready"
+                    : !hasReviewBuildPhase
+                      ? "waiting_for_review_build_phase_signal"
+                      : "plan_not_allowed",
                 });
                 if (canShowStartBuilding) {
                   log.info("start_building added", {
                     projectId: activeProjectId,
                     reason: action === "resume"
-                      ? "resume_completed_with_architecture_tasks_completed_agent_log_and_events_review_message"
-                      : "architecture_tasks_completed_agent_log_and_events_review_message",
+                      ? "resume_completed_with_architecture_tasks_and_review_build_signal"
+                      : "architecture_tasks_and_review_build_signal",
                   });
                   finalAgents = ["start_building"];
                 } else {
-                  readinessText += eventEndedWithStartBuildingMessage
+                  readinessText += hasReviewBuildPhase
                     ? `\n8080.ai is still finishing the latest agent step. I will show Continue only after 8080.ai exposes it.`
-                    : `\n8080.ai has not emitted the final /events review/start-building message yet. I will show Continue only after 8080.ai exposes it.`;
+                    : `\n8080.ai has not emitted the final review/start-building signal yet. I will show Continue only after 8080.ai exposes it.`;
                   finalAgents = hasBackendContinue ? backendResumeSuggestions : [];
                 }
                 log.info("suggestions final decision before write", {
@@ -452,8 +461,9 @@ export function createSendMessageTool(deps: {
                   source: "send_message_tool",
                   action,
                   suggestions: finalAgents,
-                  hasCompletedAgentLog: hasCompletedLog,
                   eventEndedWithStartBuildingMessage,
+                  hasReviewBuildSystemMessage,
+                  hasReviewBuildPhase,
                   backendResumeSuggestions,
                   hasBackendContinue,
                   hasArchitecture,

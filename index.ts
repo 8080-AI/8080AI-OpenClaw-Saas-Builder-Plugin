@@ -12,6 +12,7 @@ import { createListProjectsTool } from "./src/list-projects-tool.ts";
 import { createModelTool } from "./src/model-tool.ts";
 import { createSelectProjectTool } from "./src/select-project-tool.ts";
 import { createTaskListTool } from "./src/task-list-tool.ts";
+import { createSelectButtonTool } from "./src/select-button-tool.ts";
 import { generateSessionId } from "./src/command.ts";
 import { configureLogger, log } from "./logger.ts";
 type PluginConfig = {
@@ -67,6 +68,7 @@ export default definePluginEntry({
     api.registerTool(createTriggerAgentsTool({ stateDir, apiBaseUrl, sessionId }));
     api.registerTool(createListProjectsTool({ stateDir, apiBaseUrl }));
     api.registerTool(createSelectProjectTool({ stateDir, apiBaseUrl, sessionId }));
+    api.registerTool(createSelectButtonTool({ stateDir, siteUrl, apiBaseUrl, sessionId }));
     api.registerTool(createTaskListTool({ stateDir, apiBaseUrl, sessionId }));
     api.registerTool(createModelTool({ stateDir, apiBaseUrl }));
   },
