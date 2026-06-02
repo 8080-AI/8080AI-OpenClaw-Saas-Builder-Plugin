@@ -9,7 +9,6 @@ import { createSendMessageTool } from "./src/send-message-tool.ts";
 import { createTriggerAgentsTool } from "./src/trigger-agents-tool.ts";
 import { createLoginTool } from "./src/login-tool.ts";
 import { createListProjectsTool } from "./src/list-projects-tool.ts";
-import { createModelTool } from "./src/model-tool.ts";
 import { createSelectProjectTool } from "./src/select-project-tool.ts";
 import { createTaskListTool } from "./src/task-list-tool.ts";
 import { createSelectButtonTool } from "./src/select-button-tool.ts";
@@ -21,22 +20,12 @@ type PluginConfig = {
   pollingTimeoutMs?: number;
 };
 
-const SITE_URL_ENV = "AI8080_SITE_URL";
-const API_BASE_URL_ENV = "AI8080_API_BASE_URL";
 const DEFAULT_SITE_URL = "https://8080.ai/";
 const DEFAULT_API_BASE_URL = "https://api.8080.ai/api/v1";
 
-function resolveStringConfig(value: string | undefined, envName: string, fallback: string): string {
+function resolveStringConfig(value: string | undefined, fallback: string): string {
   const trimmed = value?.trim();
-  const envValue = process.env[envName]?.trim();
-  if (!trimmed) return envValue || fallback;
-
-  const envReference = trimmed.match(/^\$\{([A-Z0-9_]+)\}$/);
-  if (envReference) {
-    return process.env[envReference[1]]?.trim() || envValue || fallback;
-  }
-
-  return trimmed;
+  return trimmed || fallback;
 }
 
 export default definePluginEntry({
@@ -48,8 +37,8 @@ export default definePluginEntry({
     configureLogger(api.logger);
     log.info("Registering plugin", { pluginId: api.pluginId });
     const config = (api.pluginConfig ?? {}) as PluginConfig;
-    const siteUrl = resolveStringConfig(config.siteUrl, SITE_URL_ENV, DEFAULT_SITE_URL).replace(/\/$/, "");
-    const apiBaseUrl = resolveStringConfig(config.apiBaseUrl, API_BASE_URL_ENV, DEFAULT_API_BASE_URL).replace(/\/$/, "");
+    const siteUrl = resolveStringConfig(config.siteUrl, DEFAULT_SITE_URL).replace(/\/$/, "");
+    const apiBaseUrl = resolveStringConfig(config.apiBaseUrl, DEFAULT_API_BASE_URL).replace(/\/$/, "");
     const pollingTimeoutMs = config.pollingTimeoutMs ?? 600_000;
 
     const stateDir = () => api.runtime.state.resolveStateDir();
@@ -85,6 +74,5 @@ export default definePluginEntry({
     api.registerTool(createSelectProjectTool({ stateDir, apiBaseUrl, sessionId }));
     api.registerTool(createSelectButtonTool({ stateDir, siteUrl, apiBaseUrl, sessionId }));
     api.registerTool(createTaskListTool({ stateDir, apiBaseUrl, sessionId }));
-    api.registerTool(createModelTool({ stateDir, apiBaseUrl }));
   },
 });

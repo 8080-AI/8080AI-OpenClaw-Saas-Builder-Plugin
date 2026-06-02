@@ -3,12 +3,12 @@
   "version": "0.1.0",
   "description": "OpenClaw plugin for creating, managing, and building 8080.ai projects.",
   "type": "module",
-  "license": "MIT",
+  "license": "GPL-2.0-only",
   "keywords": [
     "openclaw",
     "openclaw-plugin",
     "8080.ai",
-    "ai",
+    "ai", 
     "software-development"
   ],
   "engines": {
@@ -20,6 +20,7 @@
     "openclaw.plugin.json",
     "package.json",
     "README.md",
+    "LOCAL_DEVELOPMENT.md",
     "LICENSE",
     ".env.example"
   ],
@@ -43,8 +44,7 @@
         "ai8080_list_projects",
         "ai8080_select_project",
         "ai8080_select_button",
-        "ai8080_task_list",
-        "ai8080_manage_models"
+        "ai8080_task_list"
       ]
     }
   },

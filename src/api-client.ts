@@ -1,7 +1,6 @@
 // ---------------------------------------------------------------------------
 // 8080.ai API Client
-//
-// Base URL: https://api.8080.ai/api/v1 (paths below are relative to this).
+
 // ---------------------------------------------------------------------------
 import { createParser } from "eventsource-parser";
 import { readAuth, writeToken } from "./auth.ts";

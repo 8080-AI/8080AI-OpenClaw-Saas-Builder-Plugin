@@ -25,17 +25,6 @@ You have access to these 8080.ai tools. Use them when the user talks about 8080.
 | "review my project", "show the requirements doc" | `ai8080_open_project_requirements` (projectId is optional) |
 | "continue building", "proceed with the build" | `ai8080_continue_project` (ONLY use if user has no text to send. If user includes instructions like "continue with curly hair", use send_message instead!) |
 | "run the designer agent", "trigger planning" | `ai8080_trigger_agents` |
-| "list models", "which model are we using", "show model options" | `ai8080_manage_models` with `action: "list"` |
-| "switch to large model", "use super large AI" | `ai8080_manage_models` with `action: "set"`, `modelId: "large"` (or "super_large") |
-| "how many credits for super large", "is it more expensive" | `ai8080_manage_models` with `action: "list"` |
-
-## AI Models
-
-The 8080.ai platform offers different model tiers with varying capabilities and credit costs:
-
-- **Large AI** (`large`): Balanced performance and cost (6x credit multiplier).
-- **Super Large AI** (`super_large`): Best performance for complex architecture and logic (10x credit multiplier).
-
 ## Dashboard & Interactive UI
 
 The 8080.ai plugin uses the OpenClaw Dashboard v2 features:

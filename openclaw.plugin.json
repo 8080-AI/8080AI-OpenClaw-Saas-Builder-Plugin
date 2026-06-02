@@ -24,8 +24,7 @@
       "ai8080_list_projects",
       "ai8080_select_project",
       "ai8080_select_button",
-      "ai8080_task_list",
-      "ai8080_manage_models"
+      "ai8080_task_list"
     ]
   },
   "configSchema": {
@@ -35,12 +34,12 @@
       "siteUrl": {
         "type": "string",
         "default": "https://8080.ai/",
-        "description": "Override the 8080.ai website URL, or set AI8080_SITE_URL / use ${AI8080_SITE_URL}. Default: https://8080.ai/"
+        "description": "8080.ai website URL."
       },
       "apiBaseUrl": {
         "type": "string",
         "default": "https://api.8080.ai/api/v1",
-        "description": "Override the 8080.ai API base URL, or set AI8080_API_BASE_URL / use ${AI8080_API_BASE_URL}. Default: https://api.8080.ai/api/v1"
+        "description": "8080.ai API base URL."
       },
       "pollingTimeoutMs": {
         "type": "number",
