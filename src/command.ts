@@ -1,4 +1,3 @@
-import open from "open";
 import { writeToken, clearToken } from "./auth.ts";
 import { AuthError, AGENT_DISPLAY_NAMES, type BuildStep, requireAuthenticatedClient, validateToken, filterStartBuildingAgents, refreshAccessToken, isReviewArchitectureStartBuildingChatMessage } from "./api-client.ts";
 import { readActiveProject, writeActiveProject } from "./project-state.ts";
@@ -12,7 +11,7 @@ import {
   parseButtonValue,
 } from "./review-continue.ts";
 import { writeLatestSuggestions, readLatestSuggestions } from "./suggestions-state.ts";
-import { readActiveModel, writeActiveModel, MODEL_OPTIONS } from "./model-state.ts";
+import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
@@ -29,8 +28,6 @@ const HELP_TEXT = `8080.ai plugin commands:
   /ai8080 list                   List your projects
   /ai8080 select <number>        Select a project by its number from the list
   /ai8080 task-list              Show active project tasks grouped by status
-  /ai8080 model                  Show current AI model & available options
-  /ai8080 model <number>         Switch the AI model for builds
   /ai8080 message <text>         Send follow-up message to the AI (uses active project)
   /ai8080 select-button <number> Trigger suggested agents by their number
 
@@ -335,15 +332,9 @@ export function create8080Command(
 
         // ------------------------------------------------------------------
         case "login": {
-          try {
-            await open(siteUrl);
-          } catch {
-            // Browser failed to open — that's OK, user can open it manually
-          }
-
           return {
             text:
-              `🔗 Opening 8080.ai for login…\n\n` +
+              `🔗 Log in to 8080.ai:\n${siteUrl}\n\n` +
               `Steps to connect manually:\n` +
               `  1. Log in at ${siteUrl}\n` +
               `  2. Open browser console (F12 → Console)\n` +
@@ -579,46 +570,6 @@ export function create8080Command(
             return { text: `8080.ai error: ${msg}` };
           }
         }
-
-        // ------------------------------------------------------------------
-        case "model": {
-          const choice = rest[0]?.trim();
-          const currentModel = await readActiveModel(stateDir);
-
-          // Build the model list display
-          const buildModelList = (errorMsg?: string) => {
-            const lines = MODEL_OPTIONS.map((m, i) => {
-              const isActive = m.id === currentModel;
-              const marker = isActive ? "👉" : "  ";
-              return `${marker} ${i + 1}. ${m.label} (${m.multiplier})`;
-            });
-            const header = `### 8080.ai AI Models:\n\n${lines.join("\n")}`;
-            const footer = `\nType \`/ai8080 model <number>\` to switch the AI model.`;
-            const err = errorMsg ? `\n⚠️  ${errorMsg}\n` : "";
-            return { text: `${header}${err}${footer}` };
-          };
-
-          // No number given — just show the list
-          if (!choice) {
-            return buildModelList();
-          }
-
-          // Validate the number
-          const num = parseInt(choice, 10);
-          if (isNaN(num) || num < 1 || num > MODEL_OPTIONS.length) {
-            return buildModelList(
-              `"${choice}" is not valid. Pick a number between 1 and ${MODEL_OPTIONS.length}.`
-            );
-          }
-
-          // Valid number — switch the model
-          const selected = MODEL_OPTIONS[num - 1];
-          await writeActiveModel(stateDir, selected.id);
-          return {
-            text: `✅ AI model switched to **${selected.label} (${selected.multiplier})**`,
-          };
-        }
-
 
         // ------------------------------------------------------------------
         case "message": {

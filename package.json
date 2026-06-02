@@ -1,7 +1,28 @@
 {
-  "name": "8080",
+  "name": "ai8080",
   "version": "0.1.0",
+  "description": "OpenClaw plugin for creating, managing, and building 8080.ai projects.",
   "type": "module",
+  "license": "GPL-2.0-only",
+  "keywords": [
+    "openclaw",
+    "openclaw-plugin",
+    "8080.ai",
+    "ai", 
+    "software-development"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "openclaw.plugin.json",
+    "package.json",
+    "README.md",
+    "LICENSE",
+    ".env.example"
+  ],
   "openclaw": {
     "extensions": [
       "./dist/index.js"
@@ -22,15 +43,13 @@
         "ai8080_list_projects",
         "ai8080_select_project",
         "ai8080_select_button",
-        "ai8080_task_list",
-        "ai8080_manage_models"
+        "ai8080_task_list"
       ]
     }
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0",
     "eventsource-parser": "^3.0.8",
-    "open": "^10.1.0",
     "openclaw": ">=2026.3.0"
   },
   "devDependencies": {
@@ -41,7 +60,7 @@
   },
   "scripts": {
     "build": "esbuild index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:openclaw",
-    "postinstall": "npm run build",
+    "prepack": "npm run build",
     "dev": "tsx watch index.ts",
     "start": "tsx index.ts"
   }

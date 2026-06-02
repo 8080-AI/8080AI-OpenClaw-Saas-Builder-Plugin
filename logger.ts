@@ -3,6 +3,7 @@ type OpenClawLogger = {
 };
 
 let openClawLogger: OpenClawLogger | undefined;
+const DEBUG_LOGGING_ENABLED = false;
 
 function formatArg(value: unknown): string {
   if (value instanceof Error) return value.stack || value.message;
@@ -15,6 +16,8 @@ function formatArg(value: unknown): string {
 }
 
 function write(args: unknown[]): void {
+  if (!DEBUG_LOGGING_ENABLED) return;
+
   const message = args.map(formatArg).join(" ");
   const formatted = `[8080.ai] ${message}`;
 
