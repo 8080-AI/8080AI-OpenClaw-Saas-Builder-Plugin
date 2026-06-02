@@ -54,9 +54,6 @@ Install or relink the plugin locally:
 ./plugin-install.sh
 ```
 
-After installation, restart OpenClaw if your environment does not restart the gateway automatically.
-
-For a full local developer setup guide, see `LOCAL_DEVELOPMENT.md`.
 
 ## Configuration
 
@@ -150,9 +147,6 @@ These requests are handled through the registered OpenClaw tools:
 
 - OpenClaw loads the native manifest from `openclaw.plugin.json`.
 - The bundled skill at `skills/ai8080/SKILL.md` provides routing guidance for natural-language requests.
-- The plugin does not require users to create a `.env` file.
-- Authenticated 8080.ai API requests send the saved token as an HTTP Bearer token.
-- Plugin logs are temporarily enabled for testing in this branch.
 
 ## License
 

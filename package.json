@@ -20,7 +20,6 @@
     "openclaw.plugin.json",
     "package.json",
     "README.md",
-    "LOCAL_DEVELOPMENT.md",
     "LICENSE",
     ".env.example"
   ],
