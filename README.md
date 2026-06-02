@@ -83,10 +83,13 @@ Use the login command:
 /ai8080 login
 ```
 
-Or ask naturally:
+Or ask naturally using any similar wording (applies to all commands):
 
 ```text
 login to 8080.ai
+sign in to 8080.ai
+log in using 8080.ai
+connect me to 8080.ai
 ```
 
 Then save your 8080.ai auth token:
