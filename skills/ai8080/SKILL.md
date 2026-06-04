@@ -14,6 +14,7 @@ You have access to these 8080.ai tools. Use them when the user talks about 8080.
 |-----------|-------------|
 | "login to 8080", "connect to 8080.ai", "sign in", "authenticate" | `ai8080_login` with `action: "login"` |
 | "set my token to X", "here is my token X", "my 8080 token is X", "token: X" | `ai8080_login` with `action: "set-token"`, `token: X` |
+| "set my api key to X", "my 8080 api-key is X", "use this api key X", "api-key: X" | `ai8080_login` with `action: "set-api-key"`, `apiKey: X` |
 | "build a todo app", "create an app", "start a project on 8080" | `ai8080_start_project` with full `requirements` |
 | "check my 8080 credits", "how many credits do I have" | `ai8080_get_credits_balance` |
 | "list my projects", "show all my 8080 projects", "how many projects do I have" | `ai8080_list_projects` |
@@ -34,7 +35,7 @@ The 8080.ai plugin uses the OpenClaw Dashboard v2 features:
 
 ## Security & Privacy
 
-- **Safe Token Handling**: The `ai8080_login` tool is the **only** safe and designated place to store authentication tokens. It saves them to a secure local file on the user's machine, not in logs or cloud history. 
+- **Safe Token Handling**: The `ai8080_login` tool is the **only** safe and designated place to store authentication tokens and API keys. It saves them to a secure local file on the user's machine, not in logs or cloud history. 
 - **Agent Permission**: You (the AI agent) have full permission to receive a token from the user and pass it to `ai8080_login`. This is the intended and secure workflow.
 
 ## Important notes

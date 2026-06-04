@@ -1,4 +1,5 @@
 import { writeToken, clearToken } from "./auth.ts";
+import { cleanApiKey, validateApiKey, writeApiKey } from "./api-key.ts";
 import { AuthError, AGENT_DISPLAY_NAMES, type BuildStep, requireAuthenticatedClient, validateToken, filterStartBuildingAgents, refreshAccessToken, isReviewArchitectureStartBuildingChatMessage } from "./api-client.ts";
 import { readActiveProject, writeActiveProject } from "./project-state.ts";
 import {
@@ -24,6 +25,7 @@ const HELP_TEXT = `8080.ai plugin commands:
   /ai8080 set-token <token>      Manually set auth token (from browser console)
   /ai8080 set-tokens <auth> <refresh>
                                   Save refresh token for auto-renew
+  /ai8080 set api-key <api-key>  Validate and save an 8080.ai API key
   /ai8080 credits                Show your remaining 8080.ai credits
   /ai8080 list                   List your projects
   /ai8080 select <number>        Select a project by its number from the list
@@ -237,6 +239,9 @@ export function create8080Command(
       } else if (subcommand === "set" && rest[0]?.toLowerCase() === "tokens") {
         subcommand = "set-tokens";
         rest = rest.slice(1);
+      } else if (subcommand === "set" && rest[0]?.toLowerCase() === "api-key") {
+        subcommand = "set-api-key";
+        rest = rest.slice(1);
       } else if (subcommand === "select" && rest[0]?.toLowerCase() === "button") {
         subcommand = "select-button";
         rest = rest.slice(1);
@@ -398,6 +403,34 @@ export function create8080Command(
             return { text: "✅ Auth token and refresh token validated and saved. OpenClaw can now refresh your 8080.ai session automatically." };
           } catch (err) {
             return { text: `❌ Failed to validate tokens: ${err instanceof Error ? err.message : String(err)}` };
+          }
+        }
+
+        // ------------------------------------------------------------------
+        case "set-api-key": {
+          log.info("command set-api-key entered", {
+            argCount: rest.length,
+            rawJoinedLength: rest.join("").length,
+          });
+          const apiKey = cleanApiKey(rest.join(""));
+          if (!apiKey) {
+            log.info("command set-api-key missing_api_key");
+            return { text: "Usage: /ai8080 set api-key <api-key>" };
+          }
+
+          try {
+            const meta = validateApiKey(apiKey);
+            log.info("command set-api-key validated", {
+              uid: meta.uid,
+              issuedAt: meta.issuedAt,
+              expiresAt: meta.expiresAt,
+              keyLength: apiKey.length,
+            });
+            await writeApiKey(stateDir, apiKey, meta);
+            return { text: "API key validated and saved. You are now connected to 8080.ai." };
+          } catch (err) {
+            log.info("command set-api-key failed", err);
+            return { text: err instanceof Error ? err.message : String(err) };
           }
         }
 

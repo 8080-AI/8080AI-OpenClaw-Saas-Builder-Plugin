@@ -1,6 +1,8 @@
 import { Type } from "@sinclair/typebox";
 import { writeToken, clearToken } from "./auth.ts";
 import { refreshAccessToken, validateToken } from "./api-client.ts";
+import { cleanApiKey, validateApiKey, writeApiKey } from "./api-key.ts";
+import { log } from "../logger.ts";
 
 export function createLoginTool(deps: {
   stateDir: () => string;
@@ -19,12 +21,14 @@ export function createLoginTool(deps: {
           Type.Literal("login"),
           Type.Literal("set-token"),
           Type.Literal("set-tokens"),
+          Type.Literal("set-api-key"),
         ],
         {
           description:
             "'login' opens the browser and shows token setup steps. " +
             "'set-token' saves an auth token. " +
-            "'set-tokens' saves auth and refresh tokens for automatic renewal.",
+            "'set-tokens' saves auth and refresh tokens for automatic renewal. " +
+            "'set-api-key' saves a validated 8080.ai API key.",
         }
       ),
       token: Type.Optional(
@@ -41,16 +45,59 @@ export function createLoginTool(deps: {
             "The refresh token from localStorage.getItem('refresh_token') in the browser console.",
         })
       ),
+      apiKey: Type.Optional(
+        Type.String({
+          description:
+            "Required only when action is 'set-api-key'. The Base64 URL-safe 8080.ai API key.",
+        })
+      ),
     }),
 
     async execute(
       _id: string,
-      params: { action: "login" | "set-token" | "set-tokens"; token?: string; refreshToken?: string },
+      params: { action: "login" | "set-token" | "set-tokens" | "set-api-key"; token?: string; refreshToken?: string; apiKey?: string },
       _signal: AbortSignal | undefined,
       onUpdate: (partial: { content: { type: "text"; text: string }[] }) => void
     ) {
       const stateDir = deps.stateDir();
       const { siteUrl } = deps;
+
+      if (params.action === "set-api-key") {
+        log.info("login_tool set-api-key entered", {
+          hasApiKeyParam: Boolean(params.apiKey),
+          hasTokenFallback: Boolean(params.token),
+          apiKeyParamLength: params.apiKey?.length ?? 0,
+          tokenFallbackLength: params.token?.length ?? 0,
+        });
+        const apiKey = cleanApiKey(params.apiKey ?? params.token);
+        if (!apiKey) {
+          log.info("login_tool set-api-key missing_api_key");
+          return {
+            content: [{ type: "text", text: "Please provide your API key." }],
+          };
+        }
+
+        try {
+          const meta = validateApiKey(apiKey);
+          log.info("login_tool set-api-key validated", {
+            uid: meta.uid,
+            issuedAt: meta.issuedAt,
+            expiresAt: meta.expiresAt,
+            keyLength: apiKey.length,
+          });
+          await writeApiKey(stateDir, apiKey, meta);
+          const successMsg = "API key validated and saved. You are now connected to 8080.ai.";
+          onUpdate?.({ content: [{ type: "text", text: successMsg }] });
+          return {
+            content: [{ type: "text", text: successMsg }],
+          };
+        } catch (err) {
+          log.info("login_tool set-api-key failed", err);
+          return {
+            content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
+          };
+        }
+      }
 
       if (params.action === "set-token") {
         // Fuzzy parsing: remove whitespace, quotes, and common prefixes

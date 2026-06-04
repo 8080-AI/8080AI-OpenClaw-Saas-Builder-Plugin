@@ -33,12 +33,12 @@
     "properties": {
       "siteUrl": {
         "type": "string",
-        "default": "https://8080.ai/",
+        "default": "http://localhost:3000",
         "description": "8080.ai website URL."
       },
       "apiBaseUrl": {
         "type": "string",
-        "default": "https://api.8080.ai/api/v1",
+        "default": "http://localhost:8000/api/v1",
         "description": "8080.ai API base URL."
       },
       "pollingTimeoutMs": {
