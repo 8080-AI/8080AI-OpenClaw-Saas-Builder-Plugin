@@ -3,7 +3,6 @@
 
 // ---------------------------------------------------------------------------
 import { createParser } from "eventsource-parser";
-import { readAuth, writeToken } from "./auth.ts";
 import { ApiKeyExpiredError, readApiKey } from "./api-key.ts";
 import { log } from "../logger.ts";
 
@@ -136,7 +135,7 @@ export class ApiError extends Error {
 }
 
 export class AuthError extends ApiError {
-  constructor(message = "Your 8080.ai credentials expired or were rejected. Run `/ai8080 login` or `/ai8080 set api-key <api-key>`, then try again.") {
+  constructor(message = "Your 8080.ai API key expired or was rejected. Run `/ai8080 set api-key <api-key>`, then try again.") {
     super(401, message);
     this.name = "AuthError";
   }
@@ -249,60 +248,17 @@ export type ProjectStatus = {
 };
 
 type ClientOpts = {
-  token?: string;
   apiBaseUrl: string;
-  apiKey?: string;
-  refreshToken?: string;
-  onTokenRefresh?: (token: string) => Promise<void>;
+  apiKey: string;
 };
-
-export async function refreshAccessToken(opts: { apiBaseUrl: string; refreshToken: string }): Promise<string> {
-  const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/auth/refresh-token`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ refresh_token: opts.refreshToken }),
-  });
-
-  if (res.status === 401) throw new AuthError("Your 8080.ai refresh token expired. Run `/ai8080 login`, then save fresh tokens again.");
-  if (!res.ok) {
-    let msg = `HTTP ${res.status}`;
-    try {
-      const text = await res.text();
-      if (text) msg += `: ${text}`;
-    } catch { }
-    throw new ApiError(res.status, `Token refresh failed: ${msg}`);
-  }
-
-  const data = await res.json() as { access_token?: string };
-  if (!data.access_token) {
-    throw new ApiError(500, "Token refresh failed: missing access_token in response.");
-  }
-  return data.access_token;
-}
-
-async function refreshAndPersist(opts: ClientOpts): Promise<boolean> {
-  if (!opts.token || !opts.refreshToken) return false;
-  const token = await refreshAccessToken({
-    apiBaseUrl: opts.apiBaseUrl,
-    refreshToken: opts.refreshToken,
-  });
-  opts.token = token;
-  await opts.onTokenRefresh?.(token);
-  log.info("Access token refreshed successfully.");
-  return true;
-}
 
 function authHeaders(opts: ClientOpts): Record<string, string> {
   log.info("api_client auth_headers", {
-    hasToken: Boolean(opts.token),
-    hasApiKey: Boolean(opts.apiKey),
-    openClawApiKeyHeader: Boolean(opts.apiKey) ? "X-OpenClaw-API-Key" : null,
-    apiKeyLength: opts.apiKey?.length ?? 0,
+    openClawApiKeyHeader: "X-OpenClaw-API-Key",
+    apiKeyLength: opts.apiKey.length,
   });
   return {
-    ...(opts.token ? { Authorization: `Bearer ${opts.token}` } : {}),
-    ...(opts.apiKey ? { "X-OpenClaw-API-Key": opts.apiKey } : {}),
+    "X-OpenClaw-API-Key": opts.apiKey,
   };
 }
 
@@ -310,17 +266,14 @@ async function apiFetch(
   opts: ClientOpts,
   method: string,
   path: string,
-  body?: unknown,
-  alreadyRetried = false
+  body?: unknown
 ): Promise<unknown> {
   const url = `${opts.apiBaseUrl.replace(/\/$/, "")}${path}`;
   log.info("api_client request", {
     method,
     path,
     hasBody: body !== undefined,
-    hasToken: Boolean(opts.token),
-    hasApiKey: Boolean(opts.apiKey),
-    sendsOpenClawApiKeyHeader: Boolean(opts.apiKey),
+    sendsOpenClawApiKeyHeader: true,
   });
   const res = await fetch(url, {
     method,
@@ -335,26 +288,16 @@ async function apiFetch(
     path,
     status: res.status,
     ok: res.ok,
-    middlewareLikelyCheckedApiKey: Boolean(opts.apiKey),
+    middlewareLikelyCheckedApiKey: true,
   });
 
   if (res.status === 401) {
     log.info("api_client response unauthorized", {
       method,
       path,
-      alreadyRetried,
-      canRefresh: Boolean(opts.token && opts.refreshToken),
-      hasApiKey: Boolean(opts.apiKey),
-      note: opts.apiKey
-        ? "Backend rejected credentials or OpenClaw API-key middleware returned 401."
-        : "Backend rejected bearer credentials and no OpenClaw API key was sent.",
+      note: "Backend rejected credentials or OpenClaw API-key middleware returned 401.",
     });
-    if (opts.apiKey) {
-      throw new AuthError("8080.ai rejected the OpenClaw API key. Confirm the backend route uses `require_user_or_openclaw_api_key` and the saved key exists in the same backend database.");
-    }
-    const refreshed = alreadyRetried ? false : await refreshAndPersist(opts);
-    if (refreshed) return apiFetch(opts, method, path, body, true);
-    throw new AuthError();
+    throw new AuthError("8080.ai rejected the OpenClaw API key. Confirm the backend route uses `require_user_or_openclaw_api_key` and the saved key exists in the same backend database.");
   }
 
   if (!res.ok) {
@@ -368,7 +311,7 @@ async function apiFetch(
       path,
       status: res.status,
       messagePreview: msg.slice(0, 500),
-      hadOpenClawApiKeyHeader: Boolean(opts.apiKey),
+      hadOpenClawApiKeyHeader: true,
     });
     throw new ApiError(res.status, msg);
   }
@@ -394,41 +337,9 @@ async function apiFetch(
 }
 
 /**
- * Validate a token by hitting a lightweight authenticated endpoint.
- * Returns `true` if the token is accepted (HTTP 200), `false` on 401.
- * Throws on network / unexpected errors.
- */
-export async function validateToken(opts: { token: string; apiBaseUrl: string }): Promise<boolean> {
-  const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/subscription/current`;
-  log.info("Validating token", { url });
-  try {
-    const res = await fetch(url, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${opts.token}` },
-    });
-    log.info("Validation response", { status: res.status });
-    if (res.status === 401) return false;
-    if (!res.ok) {
-      log.info("Validation failed", { status: res.status });
-      return false;
-    }
-    return true;
-  } catch (err) {
-    log.info("Validation request error", err);
-    throw err;
-  }
-}
-
-/**
- * Ensures the user has saved auth data. Requests refresh automatically on 401
- * when a refresh token is available.
+ * Ensures the user has saved an OpenClaw API key.
  */
 export async function requireAuthenticatedClient(stateDir: string, apiBaseUrl: string) {
-  const auth = await readAuth(stateDir);
-  log.info("require_authenticated_client auth_state", {
-    hasToken: Boolean(auth?.token),
-    hasRefreshToken: Boolean(auth?.refreshToken),
-  });
   let apiKey: string | undefined;
   try {
     apiKey = (await readApiKey(stateDir))?.apiKey;
@@ -444,46 +355,32 @@ export async function requireAuthenticatedClient(stateDir: string, apiBaseUrl: s
     willSendOpenClawApiKeyHeader: Boolean(apiKey),
   });
 
-  if (!auth?.token && !apiKey) {
+  if (!apiKey) {
     log.info("require_authenticated_client missing_credentials");
-    throw new AuthError("Not authenticated. Run `/ai8080 login` or `/ai8080 set api-key <api-key>`.");
+    throw new AuthError("Not authenticated. Run `/ai8080 set api-key <api-key>`.");
   }
 
   return createApiClient({
-    token: auth?.token,
     apiKey,
     apiBaseUrl,
-    refreshToken: auth?.refreshToken,
-    onTokenRefresh: async (token) => {
-      await writeToken(stateDir, token, {
-        refreshToken: auth?.refreshToken,
-        email: auth?.email,
-      });
-    },
   });
 }
 
 export function createApiClient(opts: ClientOpts) {
   log.info("api_client created", {
-    hasToken: Boolean(opts.token),
-    hasRefreshToken: Boolean(opts.refreshToken),
-    hasApiKey: Boolean(opts.apiKey),
-    openClawApiKeyHeader: Boolean(opts.apiKey) ? "X-OpenClaw-API-Key" : null,
+    openClawApiKeyHeader: "X-OpenClaw-API-Key",
   });
   const get = (path: string) => apiFetch(opts, "GET", path);
   const post = (path: string, body?: unknown) =>
     apiFetch(opts, "POST", path, body);
   const fetchWithAuth = async (url: string, init: RequestInit): Promise<Response> => {
     const headers = new Headers(init.headers);
-    if (opts.token) headers.set("Authorization", `Bearer ${opts.token}`);
-    if (opts.apiKey) headers.set("X-OpenClaw-API-Key", opts.apiKey);
+    headers.set("X-OpenClaw-API-Key", opts.apiKey);
     log.info("api_client fetch_with_auth request", {
       method: init.method ?? "GET",
       url,
-      hasToken: Boolean(opts.token),
-      hasApiKey: Boolean(opts.apiKey),
-      sendsOpenClawApiKeyHeader: Boolean(opts.apiKey),
-      apiKeyLength: opts.apiKey?.length ?? 0,
+      sendsOpenClawApiKeyHeader: true,
+      apiKeyLength: opts.apiKey.length,
     });
     const res = await fetch(url, { ...init, headers });
     log.info("api_client fetch_with_auth response", {
@@ -491,36 +388,16 @@ export function createApiClient(opts: ClientOpts) {
       url,
       status: res.status,
       ok: res.ok,
-      middlewareLikelyCheckedApiKey: Boolean(opts.apiKey),
+      middlewareLikelyCheckedApiKey: true,
     });
     if (res.status !== 401) return res;
 
     log.info("api_client fetch_with_auth unauthorized", {
       method: init.method ?? "GET",
       url,
-      canRefresh: Boolean(opts.token && opts.refreshToken),
-      hasApiKey: Boolean(opts.apiKey),
-      note: opts.apiKey
-        ? "Backend rejected credentials or OpenClaw API-key middleware returned 401."
-        : "Backend rejected bearer credentials and no OpenClaw API key was sent.",
+      note: "Backend rejected credentials or OpenClaw API-key middleware returned 401.",
     });
-    if (opts.apiKey) return res;
-
-    const refreshed = await refreshAndPersist(opts);
-    if (!refreshed) return res;
-
-    const retryHeaders = new Headers(init.headers);
-    if (opts.token) retryHeaders.set("Authorization", `Bearer ${opts.token}`);
-    if (opts.apiKey) retryHeaders.set("X-OpenClaw-API-Key", opts.apiKey);
-    const retryRes = await fetch(url, { ...init, headers: retryHeaders });
-    log.info("api_client fetch_with_auth retry_response", {
-      method: init.method ?? "GET",
-      url,
-      status: retryRes.status,
-      ok: retryRes.ok,
-      middlewareLikelyCheckedApiKey: Boolean(opts.apiKey),
-    });
-    return retryRes;
+    return res;
   };
 
   return {

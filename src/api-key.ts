@@ -4,14 +4,15 @@ import { log } from "../logger.ts";
 
 const API_KEY_FILE = ["plugins", "8080", "api-key.json"];
 const OPENCLAW_API_KEY_PREFIX = "sk-8080ai-";
+const OPENCLAW_API_KEY_PATTERN = /^sk-8080ai-[A-Za-z0-9_-]+$/;
 
-const EXPIRATION_DAYS = {
-  "15d": 15,
-  "30d": 30,
-  "90d": 90,
+const EXPIRATION_UNIT_MS = {
+  m: 60 * 1000,
+  h: 60 * 60 * 1000,
+  d: 24 * 60 * 60 * 1000,
 } as const;
 
-type ApiKeyExpiration = keyof typeof EXPIRATION_DAYS;
+type ApiKeyExpiration = string;
 
 type ApiKeyPayload = {
   uid: string;
@@ -59,61 +60,39 @@ export function cleanApiKey(value: string | undefined): string {
   return cleaned;
 }
 
+function parseExpirationMs(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+
+  const match = /^([1-9]\d*)([mhd])$/.exec(value.trim());
+  if (!match) return null;
+
+  const amount = Number(match[1]);
+  const unit = match[2] as keyof typeof EXPIRATION_UNIT_MS;
+  const durationMs = amount * EXPIRATION_UNIT_MS[unit];
+  return Number.isSafeInteger(durationMs) ? durationMs : null;
+}
+
 function isApiKeyExpiration(value: unknown): value is ApiKeyExpiration {
-  return typeof value === "string" && Object.hasOwn(EXPIRATION_DAYS, value);
+  return parseExpirationMs(value) !== null;
 }
 
-function apiKeyPayloadCandidates(apiKey: string): string[] {
-  const candidates = new Set<string>();
-  candidates.add(apiKey);
-
-  for (const prefix of [
-    OPENCLAW_API_KEY_PREFIX,
-    "sk-8080ai.",
-    "sk-8080ai_",
-    "sk-8080.",
-    "sk-8080_",
-    "sk-8080-",
-    "sk_8080.",
-    "sk_8080_",
-    "sk_8080-",
-  ]) {
-    if (apiKey.startsWith(prefix)) {
-      candidates.add(apiKey.slice(prefix.length));
-    }
-  }
-
-  const finalDashIndex = apiKey.lastIndexOf("-");
-  if (finalDashIndex >= 0 && finalDashIndex < apiKey.length - 1) {
-    candidates.add(apiKey.slice(finalDashIndex + 1));
-  }
-
-  for (const part of apiKey.split(/[._-]/g)) {
-    if (part && !part.startsWith("sk-") && !part.startsWith("sk_")) {
-      candidates.add(part);
-    }
-  }
-
-  return [...candidates].filter(Boolean);
-}
-
-function parseBase64Payload(candidate: string): Record<string, unknown> | null {
+function parseBase64Payload(candidate: string): Record<string, unknown> {
   let decoded: string;
   try {
     decoded = Buffer.from(candidate, "base64url").toString("utf-8");
   } catch {
-    return null;
+    throw new ApiKeyInvalidError("Invalid API key payload encoding.");
   }
 
   try {
     return JSON.parse(decoded) as Record<string, unknown>;
   } catch {
-    log.info("api_key decode candidate_json_parse_failed", {
+    log.info("api_key decode json_parse_failed", {
       candidateLength: candidate.length,
       decodedLength: decoded.length,
       decodedStartsWithJson: decoded.trimStart().startsWith("{"),
     });
-    return null;
+    throw new ApiKeyInvalidError("Invalid API key payload. Please check the key and try again.");
   }
 }
 
@@ -127,20 +106,21 @@ export function decodeApiKey(apiKey: string): ApiKeyPayload {
     throw new ApiKeyInvalidError("Invalid OpenClaw API key prefix.");
   }
 
-  const candidates = apiKeyPayloadCandidates(apiKey);
-  log.info("api_key decode candidates", {
-    count: candidates.length,
-    lengths: candidates.map((candidate) => candidate.length),
-  });
-
-  const payload = candidates
-    .map((candidate) => parseBase64Payload(candidate))
-    .find((candidatePayload): candidatePayload is Record<string, unknown> => Boolean(candidatePayload));
-
-  if (!payload) {
-    log.info("api_key decode all_candidates_failed");
-    throw new ApiKeyInvalidError("Invalid API key payload. Please check the key and try again.");
+  if (!OPENCLAW_API_KEY_PATTERN.test(apiKey)) {
+    log.info("api_key invalid_format", { keyLength: apiKey.length });
+    throw new ApiKeyInvalidError("Invalid API key format. Expected sk-8080ai- followed by one Base64URL payload.");
   }
+
+  const encodedPayload = apiKey.slice(OPENCLAW_API_KEY_PREFIX.length);
+  if (!encodedPayload || encodedPayload.includes(OPENCLAW_API_KEY_PREFIX)) {
+    log.info("api_key invalid_payload_segment", {
+      payloadLength: encodedPayload.length,
+      hasNestedPrefix: encodedPayload.includes(OPENCLAW_API_KEY_PREFIX),
+    });
+    throw new ApiKeyInvalidError("Invalid API key format. Provide exactly one sk-8080ai- key.");
+  }
+
+  const payload = parseBase64Payload(encodedPayload);
 
   log.info("api_key decoded payload", {
     hasUid: typeof payload.uid === "string" && Boolean(payload.uid.trim()),
@@ -193,7 +173,12 @@ export function validateApiKeyPayload(payload: ApiKeyPayload): {
     return { uid: payload.uid, issuedAt, expiresAt: null };
   }
 
-  const expiresAt = issuedAt + EXPIRATION_DAYS[payload.exp] * 24 * 60 * 60 * 1000;
+  const expirationMs = parseExpirationMs(payload.exp);
+  if (expirationMs === null) {
+    throw new ApiKeyInvalidError("Invalid API key expiration.");
+  }
+
+  const expiresAt = issuedAt + expirationMs;
   log.info("api_key validate expiry", {
     uid: payload.uid,
     exp: payload.exp,

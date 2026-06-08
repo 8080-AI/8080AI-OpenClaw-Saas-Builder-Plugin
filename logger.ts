@@ -3,7 +3,7 @@ type OpenClawLogger = {
 };
 
 let openClawLogger: OpenClawLogger | undefined;
-const DEBUG_LOGGING_ENABLED = true;
+const DEBUG_LOGGING_ENABLED = false; // Set to true to enable debug logging to stderr when OpenClaw logger is not available
 
 function formatArg(value: unknown): string {
   if (value instanceof Error) return value.stack || value.message;

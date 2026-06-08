@@ -1,5 +1,4 @@
 import { Type } from "@sinclair/typebox";
-import { AuthRequiredError } from "./auth.ts";
 import { AuthError, requireAuthenticatedClient } from "./api-client.ts";
 
 export function createCreditsTool(deps: {

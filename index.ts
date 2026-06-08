@@ -22,9 +22,9 @@ type PluginConfig = {
 
 // const DEFAULT_SITE_URL = "https://8080.ai/";
 // const DEFAULT_API_BASE_URL = "https://api.8080.ai/api/v1";
+
 const DEFAULT_SITE_URL = "http://localhost:3000";
 const DEFAULT_API_BASE_URL = "http://localhost:8000/api/v1";
-
 function resolveStringConfig(value: string | undefined, fallback: string): string {
   const trimmed = value?.trim();
   return trimmed || fallback;
@@ -47,7 +47,7 @@ export default definePluginEntry({
     const sessionId = generateSessionId();
 
     // -----------------------------------------------------------------------
-    // 1. Slash command — /ai8080 login | logout | set-token | credits | status | review | continue
+    // 1. Slash command — /ai8080 login | set api-key | credits | status | review | continue
     //    Kept as a manual fallback for when the LLM should not be involved
     //    (auth flows in particular).
     // -----------------------------------------------------------------------

@@ -1,6 +1,5 @@
-import { writeToken, clearToken } from "./auth.ts";
 import { cleanApiKey, validateApiKey, writeApiKey } from "./api-key.ts";
-import { AuthError, AGENT_DISPLAY_NAMES, type BuildStep, requireAuthenticatedClient, validateToken, filterStartBuildingAgents, refreshAccessToken, isReviewArchitectureStartBuildingChatMessage } from "./api-client.ts";
+import { AuthError, AGENT_DISPLAY_NAMES, type BuildStep, requireAuthenticatedClient, filterStartBuildingAgents, isReviewArchitectureStartBuildingChatMessage } from "./api-client.ts";
 import { readActiveProject, writeActiveProject } from "./project-state.ts";
 import {
   buildProjectSelectionJsonl,
@@ -21,10 +20,7 @@ import { log } from "../logger.ts";
 const HELP_TEXT = `8080.ai plugin commands:
 
   /ai8080 start <requirements>   Start a new project on 8080.ai
-  /ai8080 login                  Log in to 8080.ai via browser
-  /ai8080 set-token <token>      Manually set auth token (from browser console)
-  /ai8080 set-tokens <auth> <refresh>
-                                  Save refresh token for auto-renew
+  /ai8080 login                  Open 8080.ai and show API-key setup steps
   /ai8080 set api-key <api-key>  Validate and save an 8080.ai API key
   /ai8080 credits                Show your remaining 8080.ai credits
   /ai8080 list                   List your projects
@@ -233,13 +229,7 @@ export function create8080Command(
       let rest = tokens.slice(1);
 
       // Handle multi-word subcommands to be lenient with syntax
-      if (subcommand === "set" && rest[0]?.toLowerCase() === "token") {
-        subcommand = "set-token";
-        rest = rest.slice(1);
-      } else if (subcommand === "set" && rest[0]?.toLowerCase() === "tokens") {
-        subcommand = "set-tokens";
-        rest = rest.slice(1);
-      } else if (subcommand === "set" && rest[0]?.toLowerCase() === "api-key") {
+      if (subcommand === "set" && rest[0]?.toLowerCase() === "api-key") {
         subcommand = "set-api-key";
         rest = rest.slice(1);
       } else if (subcommand === "select" && rest[0]?.toLowerCase() === "button") {
@@ -340,70 +330,13 @@ export function create8080Command(
           return {
             text:
               `🔗 Log in to 8080.ai:\n${siteUrl}\n\n` +
-              `Steps to connect manually:\n` +
+              `Steps to connect with OpenClaw:\n` +
               `  1. Log in at ${siteUrl}\n` +
-              `  2. Open browser console (F12 → Console)\n` +
-              `  3. Run: localStorage.getItem('auth_token')\n` +
-              `  4. Optional auto-renew: localStorage.getItem('refresh_token')\n` +
-              `  5. Run this command in OpenClaw:\n\n` +
-              `     /ai8080 set-token <your_token>\n\n` +
-              `     Or, for auto-renew:\n\n` +
-              `     /ai8080 set-tokens <your_auth_token> <your_refresh_token>\n\n` +
-              `This will save your credentials securely for future project creation.`,
+              `  2. Generate an OpenClaw API key\n` +
+              `  3. Run this command in OpenClaw:\n\n` +
+              `     /ai8080 set api-key <your_api_key>\n\n` +
+              `The plugin will use only the OpenClaw API key for future requests.`,
           };
-        }
-
-        // ------------------------------------------------------------------
-        case "set-token": {
-          const token = rest.join("").replace(/\s+/g, "");
-          if (!token) {
-            return {
-              text: "Usage: /ai8080 set-token <token>\n\nGet your token from the browser console: localStorage.getItem('auth_token')",
-            };
-          }
-          // Validate token before saving
-          try {
-            const isValid = await validateToken({ token, apiBaseUrl });
-            if (!isValid) {
-              return { text: "❌ Invalid token. Please check the token and try again." };
-            }
-          } catch (err) {
-            return { text: `❌ Failed to validate token: ${err instanceof Error ? err.message : String(err)}` };
-          }
-
-          await writeToken(stateDir, token);
-          return { text: "✅ Token validated and saved. You are now logged in to 8080.ai." };
-        }
-
-        // ------------------------------------------------------------------
-        case "set-tokens": {
-          const [rawAuthToken, rawRefreshToken] = rest;
-          const token = rawAuthToken?.trim().replace(/^["']|["']$/g, "").replace(/\s+/g, "");
-          const refreshToken = rawRefreshToken?.trim().replace(/^["']|["']$/g, "").replace(/\s+/g, "");
-
-          if (!token || !refreshToken) {
-            return {
-              text:
-                "Usage: /ai8080 set-tokens <auth_token> <refresh_token>\n\n" +
-                "Get them from the browser console:\n" +
-                "  localStorage.getItem('auth_token')\n" +
-                "  localStorage.getItem('refresh_token')",
-            };
-          }
-
-          try {
-            await validateToken({ token, apiBaseUrl });
-            const validToken = await refreshAccessToken({ apiBaseUrl, refreshToken });
-            const isValid = await validateToken({ token: validToken, apiBaseUrl });
-            if (!isValid) {
-              return { text: "❌ Invalid auth token and refresh token. Please check both tokens and try again." };
-            }
-
-            await writeToken(stateDir, validToken, { refreshToken });
-            return { text: "✅ Auth token and refresh token validated and saved. OpenClaw can now refresh your 8080.ai session automatically." };
-          } catch (err) {
-            return { text: `❌ Failed to validate tokens: ${err instanceof Error ? err.message : String(err)}` };
-          }
         }
 
         // ------------------------------------------------------------------
