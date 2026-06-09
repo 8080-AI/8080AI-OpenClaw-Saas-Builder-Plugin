@@ -1,9 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import { requireAuthenticatedClient, AuthError } from "./api-client.ts";
 import { writeActiveProject } from "./project-state.ts";
-import { buildSuggestedAgentsPresentation } from "./review-continue.ts";
-import { writeLatestSuggestions } from "./suggestions-state.ts";
-import { log } from "../logger.ts";
 
 export function createSelectProjectTool(deps: {
   stateDir: () => string;
@@ -15,8 +12,7 @@ export function createSelectProjectTool(deps: {
     description:
       "Select and activate an existing 8080.ai project for the current session. " +
       "Use this when the user wants to switch to a different project or after listing projects to set the active one. " +
-      "Once selected, subsequent messages will be sent to this project. " +
-      "IMPORTANT: The result must show the numbered Start Building option exactly; do not summarize it as 'say Continue'.",
+      "Once selected, subsequent messages will be sent to this project.",
     parameters: Type.Object({
       projectId: Type.String({
         description: "The ID of the 8080.ai project to select and activate.",
@@ -47,31 +43,12 @@ export function createSelectProjectTool(deps: {
         }
 
         await writeActiveProject(stateDir, selected.id, sessionId);
-        const defaultAgents = ["start_building"];
-        await writeLatestSuggestions(stateDir, sessionId, {
-          projectId: selected.id,
-          agents: defaultAgents,
-          messageId: "",
-        });
-        log.info("select project default start_building suggestion written", {
-          projectId: selected.id,
-          source: "select_project_tool",
-          sessionId,
-          agents: defaultAgents,
-        });
-        const presentation = buildSuggestedAgentsPresentation(selected.id, defaultAgents);
-        const text =
-          `✅ Project \`${selected.title}\` is now active. (${selected.id})\n\n` +
-          `### Suggested Next Steps:\n` +
-          `1. 🛠️ Start Building\n\n` +
-          `Type \`/ai8080 select-button 1\` or \`Start Building\` to proceed.`;
+        const text = `✅ Project \`${selected.title}\` is now active. (${selected.id})`;
         onUpdate?.({
           content: [{ type: "text", text }],
           details: {
             projectId: selected.id,
-            agents: defaultAgents,
           },
-          presentation,
         });
         return {
           content: [
@@ -82,9 +59,7 @@ export function createSelectProjectTool(deps: {
           ],
           details: {
             projectId: selected.id,
-            agents: defaultAgents,
           },
-          presentation,
         };
       } catch (err) {
         if (err instanceof AuthError) {

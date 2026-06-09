@@ -96,8 +96,12 @@ export function createLoginTool(deps: {
               `🔗 **Please log in to 8080.ai to continue.**\n\n` +
               `1. Click the **Open 8080.ai Login** button above (or go to ${siteUrl})\n` +
               `2. Sign in to your account.\n` +
-              `3. Generate an OpenClaw API key.\n` +
-              `4. Save it here with: \`/ai8080 set api-key <api-key>\`\n\n` +
+              `3. Open your profile section.\n` +
+              `4. Find **OpenClaw Secret Key Generation**.\n` +
+              `5. Generate a new key.\n` +
+              `6. Copy the key immediately. The key is shown only once.\n` +
+              `7. Click **Done** after copying it.\n` +
+              `8. Save it here with: \`set api-key <api-key>\`\n\n` +
               `I'll validate it locally and save it securely for future requests.`,
           },
         ],

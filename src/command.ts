@@ -332,9 +332,13 @@ export function create8080Command(
               `🔗 Log in to 8080.ai:\n${siteUrl}\n\n` +
               `Steps to connect with OpenClaw:\n` +
               `  1. Log in at ${siteUrl}\n` +
-              `  2. Generate an OpenClaw API key\n` +
-              `  3. Run this command in OpenClaw:\n\n` +
-              `     /ai8080 set api-key <your_api_key>\n\n` +
+              `  2. Open your profile section\n` +
+              `  3. Find OpenClaw Secret Key Generation\n` +
+              `  4. Generate a new key\n` +
+              `  5. Copy the key immediately. The key is shown only once\n` +
+              `  6. Click Done after copying it\n` +
+              `  7. Run this command in OpenClaw:\n\n` +
+              `     set api-key <your_api_key>\n\n` +
               `The plugin will use only the OpenClaw API key for future requests.`,
           };
         }

@@ -29,7 +29,7 @@ function resolveStringConfig(value: string | undefined, fallback: string): strin
 }
 
 export default definePluginEntry({
-  id: "ai8080",
+  id: "8080ai",
   name: "8080.ai",
   description: "Integrates the 8080.ai AI software development platform into OpenClaw.",
 
