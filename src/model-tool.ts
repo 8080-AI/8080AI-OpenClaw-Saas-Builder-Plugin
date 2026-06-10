@@ -1,7 +1,6 @@
 import { Type } from "@sinclair/typebox";
 import { readActiveModel, writeActiveModel, MODEL_OPTIONS, type ModelTier } from "./model-state.ts";
-import { requireAuthenticatedClient } from "./api-client.ts";
-import { AuthRequiredError } from "./auth.ts";
+import { AuthError, requireAuthenticatedClient } from "./api-client.ts";
 
 export function createModelTool(deps: { stateDir: () => string; apiBaseUrl: string }) {
   return {
@@ -32,9 +31,9 @@ export function createModelTool(deps: { stateDir: () => string; apiBaseUrl: stri
       try {
         await requireAuthenticatedClient(stateDir, apiBaseUrl);
       } catch (err) {
-        const msg = err instanceof AuthRequiredError 
-          ? "🔒 Authentication required. Please log in first." 
-          : "❌ Authentication failed. Please log in again.";
+        const msg = err instanceof AuthError
+          ? err.message
+          : "Authentication failed. Run `/ai8080 set api-key <api-key>` and try again.";
         return { content: [{ type: "text", text: msg }] };
       }
 

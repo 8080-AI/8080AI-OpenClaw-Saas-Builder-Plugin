@@ -1,6 +1,5 @@
 import { Type } from "@sinclair/typebox";
 import { requireAuthenticatedClient, AuthError } from "./api-client.ts";
-import { AuthRequiredError } from "./auth.ts";
 
 export function createProjectStatusTool(deps: {
   stateDir: () => string;

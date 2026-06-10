@@ -45,7 +45,7 @@ export default definePluginEntry({
     const sessionId = generateSessionId();
 
     // -----------------------------------------------------------------------
-    // 1. Slash command — /ai8080 login | logout | set-token | credits | status | review | continue
+    // 1. Slash command — /ai8080 login | set api-key | credits | status | review | continue
     //    Kept as a manual fallback for when the LLM should not be involved
     //    (auth flows in particular).
     // -----------------------------------------------------------------------

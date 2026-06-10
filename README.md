@@ -92,25 +92,22 @@ log in using 8080.ai
 connect me to 8080.ai
 ```
 
-Then save your 8080.ai auth token:
+Then save your 8080.ai OpenClaw API key:
 
 ```text
-/ai8080 set-token <auth_token>
+/ai8080 set api-key <api-key>
 ```
 
-For automatic session renewal, save both access and refresh tokens:
+The API key is decoded locally from Base64 URL-safe JSON and validated before saving. If the key contains `exp`, the plugin checks `ts + exp` and rejects expired keys. Expiration values use compact durations such as `5m`, `1h`, `15d`, `30d`, or `90d`. If `exp` is omitted, the key does not expire locally.
 
-```text
-/ai8080 set-tokens <auth_token> <refresh_token>
-```
-
-Tokens are stored locally in OpenClaw state under `plugins/8080/auth.json` with file permissions managed by the host environment.
+API keys are stored locally in OpenClaw state under `plugins/8080/api-key.json`, with file permissions managed by the host environment.
 
 ## Commands
 
 | Slash command | Natural-language option |
 | --- | --- |
 | `/ai8080 login` | `login to 8080.ai` |
+| `/ai8080 set api-key <api-key>` | `set my 8080 api key to <api-key>` |
 | `/ai8080 credits` | `check my 8080.ai credits` |
 | `/ai8080 list` | `list my 8080.ai projects` |
 | `/ai8080 select <number>` | `select project <number>` |
