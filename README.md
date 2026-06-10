@@ -156,11 +156,9 @@ These requests are handled through the registered OpenClaw tools:
 
 - OpenClaw loads the native manifest from `openclaw.plugin.json`.
 - The bundled skill at `skills/ai8080/SKILL.md` provides routing guidance for natural-language requests.
-
 ## Support
 
 For support, contact [support@8080.ai](mailto:support@8080.ai).
-
 ## License
 
 GNU General Public License v2.0 only. See `LICENSE`.
