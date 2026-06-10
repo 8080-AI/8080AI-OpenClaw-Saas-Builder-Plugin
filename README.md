@@ -10,8 +10,8 @@ The plugin lets an OpenClaw agent authenticate with [8080.ai](https://8080.ai), 
 - Required env vars: none
 - Optional env template: `.env.example`
 - Network targets:
-  - [https://8080.ai/](https://8080.ai/)
-  - [https://api.8080.ai/api/v1](https://api.8080.ai/api/v1)
+  - `https://8080.ai/`
+  - `https://api.8080.ai/api/v1`
 
 ## What It Ships
 
@@ -61,8 +61,8 @@ The plugin defaults to:
 
 | Field | Default |
 | --- | --- |
-| `siteUrl` | [https://8080.ai/](https://8080.ai/) |
-| `apiBaseUrl` | [https://api.8080.ai/api/v1](https://api.8080.ai/api/v1) |
+| `siteUrl` | `https://8080.ai/` |
+| `apiBaseUrl` | `https://api.8080.ai/api/v1` |
 
 You can override these values from OpenClaw plugin config:
 
@@ -90,24 +90,40 @@ Or ask naturally using any similar wording (applies to all commands):
 - log in using [8080.ai](https://8080.ai)
 - connect me to [8080.ai](https://8080.ai)
 
-Generate your OpenClaw API key:
+Generate an OpenClaw API key:
 
-1. Go to [8080.ai](https://8080.ai) and sign in.
-2. Open your profile section.
-3. Find **OpenClaw Secret Key Generation**.
-4. Generate a new key.
-5. Copy the key immediately. The key is shown only once.
-6. Click **Done** after copying it.
+1. Go to [8080.ai](https://8080.ai) and sign in to your account.
+2. Open your **Profile** page.
+3. Navigate to **OpenClaw Secret Key Generation**.
+4. Click **Generate Secret Key**.
+5. Enter a name for the key (optional) and select an expiration period:
+   - Never Expires
+   - 15 Days
+   - 30 Days
+   - 90 Days
+6. Click **Create Secret Key**.
+7. Copy the generated secret key immediately. For security reasons, the key is displayed only once.
+8. Click **Done**.
 
-Then save the key in OpenClaw:
+Save the key in OpenClaw:
+
+Run the following command in OpenClaw, replacing `<api-key>` with the key you copied:
 
 ```text
 set api-key <api-key>
 ```
 
-The API key is decoded locally from Base64 URL-safe JSON and validated before saving. If the key contains `exp`, the plugin checks `ts + exp` and rejects expired keys. Expiration values use compact durations such as `5m`, `1h`, `15d`, `30d`, or `90d`. If `exp` is omitted, the key does not expire locally.
+The API key is decoded locally from Base64 URL-safe JSON and validated before saving. If the key contains `exp`, the plugin checks `ts + exp` and rejects expired keys. On 8080.ai, API keys can be created for 15 days, 30 days, 90 days, or never expire. If `exp` is omitted, the key does not expire locally.
 
 API keys are stored locally in OpenClaw state under `plugins/8080/api-key.json`, with file permissions managed by the host environment.
+Expired keys:
+
+If your API key expires:
+
+1. Go to **OpenClaw Secret Key Generation** in your 8080.ai **Profile**.
+2. Delete the expired key.
+3. Generate a new key by following the steps in **Generate an OpenClaw API key** above.
+4. Save the new key by following the steps in **Save the key in OpenClaw** above.
 
 ## Commands
 

@@ -329,17 +329,24 @@ export function create8080Command(
         case "login": {
           return {
             text:
-              `🔗 Log in to 8080.ai:\n${siteUrl}\n\n` +
-              `Steps to connect with OpenClaw:\n` +
-              `  1. Log in at ${siteUrl}\n` +
-              `  2. Open your profile section\n` +
-              `  3. Find OpenClaw Secret Key Generation\n` +
-              `  4. Generate a new key\n` +
-              `  5. Copy the key immediately. The key is shown only once\n` +
-              `  6. Click Done after copying it\n` +
-              `  7. Run this command in OpenClaw:\n\n` +
-              `     set api-key <your_api_key>\n\n` +
-              `The plugin will use only the OpenClaw API key for future requests.`,
+              `🔗 **Generate an OpenClaw API Key**\n\n` +
+              `1. Go to 8080.ai and sign in to your account: ${siteUrl}\n` +
+              `2. Open your **Profile** page.\n` +
+              `3. Navigate to **OpenClaw Secret Key Generation**.\n` +
+              `4. Click **Generate Secret Key**.\n` +
+              `5. Enter a name for the key (optional) and select an expiration period:\n` +
+              `   - Never Expires\n` +
+              `   - 15 Days\n` +
+              `   - 30 Days\n` +
+              `   - 90 Days\n` +
+              `6. Click **Create Secret Key**.\n` +
+              `7. Copy the generated secret key immediately. For security reasons, the key is displayed only once.\n` +
+              `8. Click **Done**.\n` +
+              `9. Save the key in OpenClaw by running this command, replacing \`<api-key>\` with the key you copied:\n\n` +
+              `\`\`\`text\n` +
+              `set api-key <api-key>\n` +
+              `\`\`\`\n\n` +
+              `The plugin will validate it locally and save it securely for future requests.`,
           };
         }
 
