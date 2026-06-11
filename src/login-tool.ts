@@ -31,7 +31,7 @@ export function createLoginTool(deps: {
   apiBaseUrl: string;
 }) {
   return {
-    name: "8080ai_login",
+    name: "ai8080_login",
     description:
       "Securely save a validated 8080.ai OpenClaw API key. " +
       "Use this whenever the user provides an API key or asks to authenticate. " +
