@@ -3,8 +3,9 @@
 set -e  # Exit immediately if any command fails
 
 echo "Removing old plugin..."
-# Remove any existing installation to avoid duplication warnings
-openclaw plugins uninstall ai8080 --force || true
+
+# Remove any existing installation to avoid duplication warnings.
+openclaw plugins uninstall 8080ai --force || true
 
 echo "Installing plugin..."
 # --link is essential for development so we don't have to reinstall every time

@@ -135,7 +135,7 @@ export class ApiError extends Error {
 }
 
 export class AuthError extends ApiError {
-  constructor(message = "Your 8080.ai API key expired or was rejected. Run `/ai8080 set api-key <api-key>`, then try again.") {
+  constructor(message = "Your 8080.ai API key expired or was rejected. Run `set api-key <api-key>`, then try again.") {
     super(401, message);
     this.name = "AuthError";
   }
@@ -357,7 +357,7 @@ export async function requireAuthenticatedClient(stateDir: string, apiBaseUrl: s
 
   if (!apiKey) {
     log.info("require_authenticated_client missing_credentials");
-    throw new AuthError("Not authenticated. Run `/ai8080 set api-key <api-key>`.");
+    throw new AuthError("Not authenticated. Run `set api-key <api-key>`.");
   }
 
   return createApiClient({

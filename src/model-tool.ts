@@ -33,7 +33,7 @@ export function createModelTool(deps: { stateDir: () => string; apiBaseUrl: stri
       } catch (err) {
         const msg = err instanceof AuthError
           ? err.message
-          : "Authentication failed. Run `/ai8080 set api-key <api-key>` and try again.";
+          : "Authentication failed. Run `set api-key <api-key>` and try again.";
         return { content: [{ type: "text", text: msg }] };
       }
 

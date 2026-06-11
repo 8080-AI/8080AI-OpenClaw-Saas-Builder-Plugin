@@ -1,5 +1,5 @@
 {
-  "name": "ai8080",
+  "name": "8080ai",
   "version": "0.1.0",
   "description": "OpenClaw plugin for creating, managing, and building 8080.ai projects.",
   "type": "module",
