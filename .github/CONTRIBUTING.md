@@ -56,7 +56,7 @@ The install script uninstalls any existing `8080ai` plugin, installs this checko
 
 ## Development Guidelines
 
-- Keep each change focused on one feature, fix, or documentation update.
+- Keep each change focused on one feature, fix, changes or documentation update
 - Follow the existing TypeScript module style and keep tool-specific logic in the relevant `src/*-tool.ts` file.
 - Keep shared API behavior in `src/api-client.ts` and shared state behavior in the appropriate `src/*-state.ts` helper.
 - Preserve authenticated flow safety. API keys should only be handled through the existing login/API-key helpers.
