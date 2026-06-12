@@ -1,0 +1,119 @@
+# ===========================================================================
+# Publish — Runs when a PR is merged into main
+# ===========================================================================
+name: Publish to ClawHub
+
+on:
+  push:
+    branches: [main]
+
+# Only one publish at a time
+concurrency:
+  group: publish-main
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build & Publish to ClawHub
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+  
+    # Only run if the push was a merge commit (not a direct push)
+    # Remove the `if` to also publish on direct pushes to main
+    # if: github.event.head_commit.message != ''
+
+    steps:
+      # ── 1. Checkout code ──────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Setup Node.js ──────────────────────────────────────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      # ── 3. Install dependencies ───────────────────────────────────────
+      - name: Install dependencies
+        run: npm ci
+
+      # ── 4. Build plugin ──────────────────────────────────────────────
+      - name: Build plugin
+        run: npm run build
+
+      # ── 5. Validate build output ─────────────────────────────────────
+      - name: Validate build output
+        run: |
+          test -f dist/index.js || { echo "❌ Build failed — dist/index.js missing"; exit 1; }
+          echo "✅ Build output verified"
+
+      # ── 5b. Validate package files array ─────────────────────────────
+      - name: Validate package files
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = require('./package.json');
+            const files = pkg.files || [];
+            let missing = [];
+            for (const f of files) {
+              if (!fs.existsSync(f)) missing.push(f);
+            }
+            if (missing.length > 0) {
+              console.error('❌ Missing files listed in package.json files array:');
+              missing.forEach(f => console.error('   -', f));
+              process.exit(1);
+            }
+            console.log('✅ All package files verified for publish');
+          "
+
+      # ── 6. Extract version from package.json ──────────────────────────
+      - name: Extract package version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "📦 Publishing version: $VERSION"
+
+      # ── 7. Install ClawHub CLI ────────────────────────────────────────
+      - name: Install ClawHub CLI
+        run: npm install -g clawhub
+
+      # ── 8. Authenticate to ClawHub ────────────────────────────────────
+      - name: Authenticate to ClawHub
+        run: clawhub login --token "${{ secrets.CLAWHUB_TOKEN }}" --no-browser
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+
+      # ── 9. Verify authentication ─────────────────────────────────────
+      - name: Verify ClawHub authentication
+        run: clawhub whoami
+
+      # ── 10. Publish to ClawHub (dry-run first) ───────────────────────
+      - name: Publish to ClawHub (dry-run)
+        run: |
+          clawhub package publish . \
+            --family code-plugin \
+            --version "${{ steps.version.outputs.version }}" \
+            --source-repo "${{ github.repository }}" \
+            --source-commit "${{ github.sha }}" \
+            --source-ref "main" \
+            --dry-run
+
+      # ── 11. Publish to ClawHub (actual) ──────────────────────────────
+      - name: Publish to ClawHub
+        run: |
+          clawhub package publish . \
+            --family code-plugin \
+            --version "${{ steps.version.outputs.version }}" \
+            --source-repo "${{ github.repository }}" \
+            --source-commit "${{ github.sha }}" \
+            --source-ref "main"
+
+      # ── 12. Confirm publish ──────────────────────────────────────────
+      - name: Confirm publish
+        run: |
+          echo "✅ Successfully published 8080ai v${{ steps.version.outputs.version }} to ClawHub"
+          echo ""
+          echo "Users can now install with:"
+          echo "  openclaw plugins install clawhub:8080ai"
