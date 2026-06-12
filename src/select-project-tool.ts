@@ -1,6 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import { requireAuthenticatedClient, AuthError } from "./api-client.ts";
 import { writeActiveProject } from "./project-state.ts";
+import { buildProjectActivationResult } from "./project-activation.ts";
 
 export function createSelectProjectTool(deps: {
   stateDir: () => string;
@@ -43,12 +44,20 @@ export function createSelectProjectTool(deps: {
         }
 
         await writeActiveProject(stateDir, selected.id, sessionId);
-        const text = `✅ Project \`${selected.title}\` is now active. (${selected.id})`;
+        const activation = await buildProjectActivationResult({
+          client,
+          projectId: selected.id,
+          projectTitle: selected.title,
+          stateDir,
+          openClawSessionId: sessionId,
+        });
+        const text = activation.latestMessageText;
         onUpdate?.({
           content: [{ type: "text", text }],
           details: {
             projectId: selected.id,
           },
+          presentation: activation.presentation,
         });
         return {
           content: [
@@ -60,6 +69,7 @@ export function createSelectProjectTool(deps: {
           details: {
             projectId: selected.id,
           },
+          presentation: activation.presentation,
         };
       } catch (err) {
         if (err instanceof AuthError) {

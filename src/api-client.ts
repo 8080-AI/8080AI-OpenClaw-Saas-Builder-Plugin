@@ -636,6 +636,28 @@ export function createApiClient(opts: ClientOpts) {
       return messages;
     },
 
+    async getProjectChatMessages(projectId: string, chatSessionId: string): Promise<ChatMessage[]> {
+      const query = new URLSearchParams({
+        limit: "100",
+        offset: "0",
+        project_id: projectId,
+        session_id: chatSessionId,
+      });
+      const path = `/chat/messages?${query.toString()}`;
+      const data = await get(path);
+      const messages = extractChatMessages(data).filter((message) => {
+        return !message.project_id || message.project_id === projectId;
+      });
+      log.info("project_chat_messages api response", {
+        projectId,
+        chatSessionId,
+        path,
+        summary: debugResponseSummary("projectChatMessages", data),
+        messagesCount: messages.length,
+      });
+      return messages;
+    },
+
     async hasReviewBuildSystemMessage(projectId: string): Promise<boolean> {
       const messages = await this.getChatMessages(projectId);
       return messages.some((message) => isReviewBuildSystemMessage(projectId, message));
