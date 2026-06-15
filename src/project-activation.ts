@@ -35,6 +35,18 @@ function latestByCreatedAt(messages: ChatMessage[]): ChatMessage | null {
 }
 
 function latestActivationMessage(messages: ChatMessage[]): ChatMessage | null {
+  const latestActionable = latestByCreatedAt(messages.filter((message) => {
+    const content = message.content ?? "";
+    return (
+      INSUFFICIENT_CREDITS_RE.test(content) ||
+      USER_FLOW_RE.test(content) ||
+      FIRST_PAGE_RE.test(content) ||
+      ALL_PAGES_RE.test(content) ||
+      REVIEW_BUILD_RE.test(content)
+    );
+  }));
+  if (latestActionable) return latestActionable;
+
   return latestByCreatedAt(messages.filter((message) => message.author === "user" || message.author === "assistant")) ??
     latestByCreatedAt(messages);
 }
@@ -70,6 +82,14 @@ function groupPlanningAgents(agents: string[]): string[] {
   return groupedAgents.length > 1
     ? [`GROUP:${groupedAgents.join("|")}`, ...otherAgents]
     : agents;
+}
+
+function checkpointAgentsFromMessage(content: string): string[] {
+  const agents: string[] = [];
+  if (/run\s+plan\s+all/i.test(content)) agents.push("plan_all");
+  if (/\bcontinue\b/i.test(content)) agents.push("continue");
+  if (/\breview\b/i.test(content) && !/click\s+\*\*continue\*\*/i.test(content)) agents.push("review");
+  return agents.length > 0 ? agents : ["continue"];
 }
 
 function statusMessages(status: { messages?: ChatMessage[] } | null, projectId: string): ChatMessage[] {
@@ -132,7 +152,7 @@ async function activationAgents(
     FIRST_PAGE_RE.test(content) ||
     ALL_PAGES_RE.test(content)
   ) {
-    return ["review", "continue"];
+    return checkpointAgentsFromMessage(content);
   }
 
   if (REVIEW_BUILD_RE.test(content)) {
