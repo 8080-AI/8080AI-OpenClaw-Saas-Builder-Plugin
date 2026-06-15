@@ -26,6 +26,100 @@ Important files and directories:
 | `plugin-install.sh` | Local development install script for relinking the plugin into OpenClaw. |
 | `README.md` | User-facing installation, authentication, command, and tool documentation. |
 
+## Git Workflow & Branch Naming Convention
+
+We follow a **branch-per-change** workflow. Every contribution—whether it is a new feature, a bug fix, a refactor, or a docs update—must live on its own branch created from `main`.
+
+### Branch Name Format
+
+```
+<type>/<short-description>
+```
+
+- **`type`** — a category prefix (see table below).
+- **`short-description`** — a lowercase, hyphen-separated summary of the change (`kebab-case`).
+
+### Branch Type Prefixes
+
+| Prefix | When to use | Examples |
+| --- | --- | --- |
+| `feature/` | New functionality or capability | `feature/api-key`, `feature/ci-cd`, `feature/image-attachment`, `feature/start-building` |
+| `refactor/` | Code restructuring, cleanup, or bug fixes that don't add new features | `refactor/remove-commands`, `refactor/resolve-bugs`, `refactor/remove-extras` |
+| `docs/` | Documentation-only changes | `docs/add-contributing-guide` |
+| `changes/` | Small, miscellaneous updates (config tweaks, naming, metadata) | `changes/plugin-name`, `changes/plugin-documentation-updates` |
+
+> **Note:** Always use the **singular** form `feature/` (not `features/`). Keep it consistent.
+
+### Protected Branch
+
+| Branch | Purpose |
+| --- | --- |
+| `main` | Production-ready, stable code. **Never push directly to `main`.** All changes reach `main` through pull requests only. |
+
+### Step-by-Step: Creating a Branch & Opening a PR
+
+1. **Make sure you're on `main` and it's up to date:**
+
+   ```bash
+   git checkout main
+   git pull origin main
+   ```
+
+2. **Create your branch using the naming convention:**
+
+   ```bash
+   # New feature
+   git checkout -b feature/your-feature-name
+
+   # Refactor or bug fix
+   git checkout -b refactor/describe-the-change
+
+   # Documentation update
+   git checkout -b docs/what-you-are-documenting
+
+   # Small miscellaneous change
+   git checkout -b changes/what-changed
+   ```
+
+3. **Make your changes, then stage and commit:**
+
+   ```bash
+   git add .
+   git commit -m "short description of what changed"
+   ```
+
+   Write clear, concise commit messages. Examples:
+   - `added ci/cd pipeline and updated package.json`
+   - `implemented natural language routing for tools`
+   - `removed unused commands`
+   - `updated contribution guide with branch conventions`
+
+4. **Push the branch to the remote:**
+
+   ```bash
+   git push origin feature/your-feature-name
+   ```
+
+5. **Open a Pull Request (PR) on GitHub** targeting `main`. In the PR description:
+   - Explain **what** changed.
+   - Explain **why** it changed.
+   - Explain **how** it was verified.
+
+6. **Wait for review.** Do not merge your own PR unless you have explicit approval.
+
+### Quick Reference
+
+```text
+main                              ← stable, production-ready
+ ├── feature/api-key              ← new API key authentication
+ ├── feature/ci-cd                ← CI/CD pipeline setup
+ ├── feature/image-attachment     ← image attachment support
+ ├── refactor/resolve-bugs        ← bug fixes and stability
+ ├── refactor/remove-commands     ← cleaning up unused code
+ ├── docs/add-contributing-guide  ← this contributing guide
+ └── changes/plugin-name          ← renaming the plugin
+```
+
 ## Setup
 
 Install dependencies:
@@ -101,7 +195,7 @@ Run this before opening a pull request:
 ```bash
 npm run build
 ```
-
+   
 There is currently no dedicated test script in `package.json`, so manual verification matters for behavior changes.
 
 Recommended manual checks, depending on what changed:
@@ -133,12 +227,14 @@ Update documentation when behavior changes:
 
 Before submitting:
 
-- Run `npm run build`.
-- Confirm relevant manual OpenClaw flows were checked.
-- Confirm tool contracts are synchronized across `index.ts`, `openclaw.plugin.json`, and `package.json`.
-- Confirm docs are updated for user-facing changes.
-- Confirm no API keys, tokens, `.env` files, or local credentials are included.
-- Explain what changed, why it changed, and how it was verified.
+- [ ] Branch is named following the convention: `<type>/<short-description>`
+- [ ] Branch is created from an up-to-date `main`
+- [ ] Run `npm run build` — no errors
+- [ ] Relevant manual OpenClaw flows were checked
+- [ ] Tool contracts are synchronized across `index.ts`, `openclaw.plugin.json`, and `package.json`
+- [ ] Docs are updated for user-facing changes
+- [ ] No API keys, tokens, `.env` files, or local credentials are included
+- [ ] PR description explains what changed, why, and how it was verified
 
 ## Support
 
