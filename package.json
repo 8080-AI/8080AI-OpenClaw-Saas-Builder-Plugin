@@ -1,6 +1,6 @@
 {
   "name": "8080ai",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "OpenClaw plugin for creating, managing, and building 8080.ai projects.",
   "type": "module",
   "license": "GPL-2.0-only",
@@ -45,6 +45,14 @@
         "ai8080_select_button",
         "ai8080_task_list"
       ]
+    },
+    "compat": {
+      "pluginApi": ">=2026.3.0",
+      "minGatewayVersion": "2026.3.0"
+    },
+    "build": {
+      "openclawVersion": "2026.5.7",
+      "pluginSdkVersion": "2026.3.0"
     }
   },
   "dependencies": {
