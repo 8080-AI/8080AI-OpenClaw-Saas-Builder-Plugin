@@ -1,11 +1,10 @@
 # ===========================================================================
-# Publish — Runs when a PR is merged into main
+# Publish — Runs manually
 # ===========================================================================
 name: Publish to ClawHub
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 # Only one publish at a time
 concurrency:
@@ -16,12 +15,7 @@ jobs:
   publish:
     name: Build & Publish to ClawHub
     runs-on: ubuntu-latest
-    timeout-minutes: 15
   
-    # Only run if the push was a merge commit (not a direct push)
-    # Remove the `if` to also publish on direct pushes to main
-    # if: github.event.head_commit.message != ''
-
     steps:
       # ── 1. Checkout code ──────────────────────────────────────────────
       - name: Checkout repository
@@ -67,53 +61,43 @@ jobs:
             console.log('✅ All package files verified for publish');
           "
 
-      # ── 6. Extract version from package.json ──────────────────────────
-      - name: Extract package version
-        id: version
-        run: |
-          VERSION=$(node -p "require('./package.json').version")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "📦 Publishing version: $VERSION"
-
-      # ── 7. Install ClawHub CLI ────────────────────────────────────────
+      # ── 6. Install ClawHub CLI ────────────────────────────────────────
       - name: Install ClawHub CLI
         run: npm install -g clawhub
 
-      # ── 8. Authenticate to ClawHub ────────────────────────────────────
+      # ── 7. Authenticate to ClawHub ────────────────────────────────────
       - name: Authenticate to ClawHub
         run: clawhub login --token "${{ secrets.CLAWHUB_TOKEN }}" --no-browser
         env:
           CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
 
-      # ── 9. Verify authentication ─────────────────────────────────────
+      # ── 8. Verify authentication ─────────────────────────────────────
       - name: Verify ClawHub authentication
         run: clawhub whoami
 
-      # ── 10. Publish to ClawHub (dry-run first) ───────────────────────
+      # ── 9. Publish to ClawHub (dry-run first) ────────────────────────
       - name: Publish to ClawHub (dry-run)
         run: |
           clawhub package publish . \
             --family code-plugin \
-            --version "${{ steps.version.outputs.version }}" \
             --source-repo "${{ github.repository }}" \
             --source-commit "${{ github.sha }}" \
             --source-ref "main" \
             --dry-run
 
-      # ── 11. Publish to ClawHub (actual) ──────────────────────────────
+      # ── 10. Publish to ClawHub (actual) ──────────────────────────────
       - name: Publish to ClawHub
         run: |
           clawhub package publish . \
             --family code-plugin \
-            --version "${{ steps.version.outputs.version }}" \
             --source-repo "${{ github.repository }}" \
             --source-commit "${{ github.sha }}" \
             --source-ref "main"
 
-      # ── 12. Confirm publish ──────────────────────────────────────────
+      # ── 11. Confirm publish ──────────────────────────────────────────
       - name: Confirm publish
         run: |
-          echo "✅ Successfully published 8080ai v${{ steps.version.outputs.version }} to ClawHub"
+          echo "✅ Successfully published 8080ai to ClawHub"
           echo ""
           echo "Users can now install with:"
           echo "  openclaw plugins install clawhub:8080ai"
