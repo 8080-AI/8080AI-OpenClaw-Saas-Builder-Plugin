@@ -28,7 +28,7 @@ Important files and directories:
 
 ## Git Workflow & Branch Naming Convention
 
-We follow a **branch-per-change** workflow. Every contribution—whether it is a new feature, a bug fix, a refactor, or a docs update—must live on its own branch created from `develop`.
+We follow a **branch-per-change** workflow. Every contribution—whether it is a new feature, a bug fix, a refactor, a changes or a docs update—must live on its own branch created from `develop`.
 
 ### Branch Name Format
 
@@ -43,7 +43,7 @@ We follow a **branch-per-change** workflow. Every contribution—whether it is a
 
 | Prefix | When to use | Examples |
 | --- | --- | --- |
-| `features/` | New functionality or capability | `features/api-key`, `features/ci-cd`, `features/image-attachment`, `features/start-building` |
+| `feature/` | New functionality or capability | `feature/show-start-building`, `feature/start-building`, `feature/show-project-history` |
 | `fix/` | Bug fixes and stability updates | `fix/login-error`, `fix/project-status`, `fix/streaming-response` |
 | `refactor/` | Code restructuring or cleanup that does not change behavior | `refactor/remove-commands`, `refactor/api-client`, `refactor/remove-extras` |
 | `docs/` | Documentation-only changes | `docs/add-contributing-guide` |
@@ -56,7 +56,7 @@ We follow a **branch-per-change** workflow. Every contribution—whether it is a
 | Branch | Purpose |
 | --- | --- |
 | `main` | Production-ready, stable code. **Never push directly to `main`.** All changes reach `main` through pull requests only. |
-| `develop` | Active development integration branch. Create all `fix/`, `changes/`, `features/`, `docs/`, and `refactor/` branches from `develop`; merge reviewed work back into `develop` before promotion to `main`. |
+| `develop` | Active development integration branch. Create all `fix/`, `changes/`, `feature/`, `docs/`, and `refactor/` branches from `develop`; merge reviewed work back into `develop` before promotion to `main`. |
 
 ### Step-by-Step: Creating a Branch & Opening a PR
 
@@ -71,7 +71,7 @@ We follow a **branch-per-change** workflow. Every contribution—whether it is a
 
    ```bash
    # New feature
-   git checkout -b features/your-feature-name
+   git checkout -b feature/your-feature-name
 
    # Bug fix
    git checkout -b fix/describe-the-fix
@@ -102,7 +102,7 @@ We follow a **branch-per-change** workflow. Every contribution—whether it is a
 4. **Push the branch to the remote:**
 
    ```bash
-   git push origin features/your-feature-name
+   git push origin feature/your-feature-name
    ```
 
 5. **Open a Pull Request (PR) on GitHub** targeting `develop`. In the PR description:
@@ -117,9 +117,8 @@ We follow a **branch-per-change** workflow. Every contribution—whether it is a
 ```text
 main                              ← stable, production-ready
  └── develop                      ← active development integration
-     ├── features/api-key         ← new API key authentication
-     ├── features/ci-cd           ← CI/CD pipeline setup
-     ├── features/image-attachment ← image attachment support
+     ├── feature/start-buidling         ← for showing start building button
+     ├── feature/show-project-history          ← for showing previous latest chat message of selected project
      ├── fix/resolve-bugs         ← bug fixes and stability
      ├── refactor/remove-commands ← cleaning up unused code
      ├── docs/add-contributing-guide
