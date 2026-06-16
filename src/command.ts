@@ -25,7 +25,7 @@ const HELP_TEXT = `8080.ai plugin commands:
   /ai8080 set api-key <api-key>  Validate and save an 8080.ai API key
   /ai8080 credits                Show your remaining 8080.ai credits
   /ai8080 list                   List your projects
-  /ai8080 select <number>        Select a project by its number from the list
+  /ai8080 select <number|name|id> Select a project by number, name, or ID
   /ai8080 task-list              Show active project tasks grouped by status
   /ai8080 message <text>         Send follow-up message to the AI (uses active project)
   /ai8080 select-button <number> Trigger suggested agents by their number
@@ -38,6 +38,51 @@ export function generateSessionId(): string {
 
 export function stripA2UI(text: string): string {
   return text.replace(/<!--\s*a2ui[\s\S]*?-->/g, "").trim();
+}
+
+function normalizeSelector(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function projectSelectionHelp(exampleTitle?: string): string {
+  const naturalTitle = exampleTitle || "<project-name>";
+  return [
+    "Select a project with either a command or natural language:",
+    "",
+    "- Command: `/ai8080 select <number>`, `/ai8080 select <project-name>`, or `/ai8080 select <project-id>`",
+    `- Natural: \`select 1\`, \`switch to ${naturalTitle}\`, or \`make ${naturalTitle} active\``,
+    "",
+    "After selecting, continue with either:",
+    "",
+    "- Command: `/ai8080 message <text>`",
+    "- Natural: `send <text> to my 8080.ai project`",
+  ].join("\n");
+}
+
+function selectProjectFromChoice<T extends { id: string; title: string }>(
+  projects: T[],
+  choice: string
+): { project?: T; ambiguous: T[] } {
+  const normalizedChoice = normalizeSelector(choice);
+  const num = parseInt(choice, 10);
+  if (!Number.isNaN(num) && String(num) === choice.trim()) {
+    return { project: projects[num - 1], ambiguous: [] };
+  }
+
+  const exact = projects.find((project) =>
+    normalizeSelector(project.id) === normalizedChoice ||
+    normalizeSelector(project.title) === normalizedChoice
+  );
+  if (exact) return { project: exact, ambiguous: [] };
+
+  const matches = projects.filter((project) =>
+    normalizeSelector(project.title).includes(normalizedChoice) ||
+    normalizeSelector(project.id).includes(normalizedChoice)
+  );
+
+  return matches.length === 1
+    ? { project: matches[0], ambiguous: [] }
+    : { project: undefined, ambiguous: matches };
 }
 
 /**
@@ -415,7 +460,9 @@ export function create8080Command(
             log.info("task_list no active project", { sessionId });
             return {
               text:
-                "No active project found. Run `/ai8080 list`, then `/ai8080 select <number>` first.\n\n" +
+                "No active project found. Run `/ai8080 list` first, then select a project.\n\n" +
+                "Use a command like `/ai8080 select 1`, `/ai8080 select <project-name>`, or `/ai8080 select <project-id>`.\n\n" +
+                "Or use natural language like `select 1` or `switch to <project-name>`.\n\n" +
                 "You can also run `/ai8080 task-list <project_id>`.",
             };
           }
@@ -480,9 +527,7 @@ export function create8080Command(
             return {
               text:
                 `### 8080.ai Projects\n\n${lines.join("\n")}\n\n<!-- a2ui ${a2ui} -->\n\n` +
-                `Run \`/ai8080 select <number>\` to make a project active for this OpenClaw session.\n\n` +
-                `Example: \`/ai8080 select 1\`\n\n` +
-                `After selecting, you can continue chatting with that active project using \`/ai8080 message <text>\`.`,
+                projectSelectionHelp(projects[0]?.title),
             };
           } catch (err) {
             if (err instanceof AuthError) return { text: (err as Error).message };
@@ -493,9 +538,13 @@ export function create8080Command(
 
         // ------------------------------------------------------------------
         case "select": {
-          const choice = rest[0]?.trim();
+          const choice = rest.join(" ").trim();
           if (!choice) {
-            return { text: "Usage: `/ai8080 select <number>`\n\nRun `/ai8080 list` first to see available projects." };
+            return {
+              text:
+                "Usage: `/ai8080 select <number|project-name|project-id>`\n\n" +
+                projectSelectionHelp(),
+            };
           }
 
           try {
@@ -503,23 +552,26 @@ export function create8080Command(
             const projects = await client.listProjects();
             if (projects.length === 0) return { text: "No projects found." };
 
-            const num = parseInt(choice, 10);
-            if (isNaN(num) || num < 1 || num > projects.length) {
+            const selection = selectProjectFromChoice(projects, choice);
+            if (!selection.project) {
               const activeProjectId = await readActiveProject(stateDir, sessionId);
               const lines = projects.map((p, i) => {
                 const isActive = p.id === activeProjectId;
                 const marker = isActive ? "👉" : "  ";
                 return `${marker} ${i + 1}. ${p.title} (\`${p.id}\`) [${p.status}]`;
               });
+              const reason = selection.ambiguous.length > 1
+                ? `"${choice}" matches multiple projects. Pick a number or use the full project name.`
+                : `"${choice}" is not valid. Pick a number between 1 and ${projects.length}, a project name, or a project ID.`;
               return {
                 text:
-                  `⚠️  "${choice}" is not valid. Pick a number between 1 and ${projects.length}.\n\n` +
+                  `⚠️  ${reason}\n\n` +
                   `### 8080.ai Projects:\n\n${lines.join("\n")}\n\n` +
-                  `Type \`/ai8080 select <number>\` to switch the active project.`,
+                  projectSelectionHelp(projects[0]?.title),
               };
             }
 
-            const selected = projects[num - 1];
+            const selected = selection.project;
             await writeActiveProject(stateDir, selected.id, sessionId);
             const activation = await buildProjectActivationResult({
               client,
@@ -543,13 +595,19 @@ export function create8080Command(
         case "message": {
           const content = rest.join(" ").trim();
           if (!content) {
-            return { text: "Usage: /ai8080 message <text>" };
+            return {
+              text:
+                "Usage: `/ai8080 message <text>`\n\n" +
+                "You can also use natural language like `send this update to my 8080.ai project: <text>`.",
+            };
           }
 
           let projectId = (await readActiveProject(stateDir, sessionId)) ?? "";
           if (!projectId) {
             return {
-              text: "No project active. Use `/ai8080 list` to select one or start a new project first.",
+              text:
+                "No project active. Use `/ai8080 list` to choose one or start a new project first.\n\n" +
+                "Then select it with `/ai8080 select <number|project-name|project-id>` or say `select 1` / `switch to <project-name>`.",
             };
           }
 
@@ -611,7 +669,11 @@ export function create8080Command(
         case "select-button": {
           const choice = rest[0]?.trim();
           if (!choice) {
-            return { text: "Usage: `/ai8080 select-button <number>`" };
+            return {
+              text:
+                "Usage: `/ai8080 select-button <number>`\n\n" +
+                "You can also use natural language like `choose option 1`, `continue`, or `review`.",
+            };
           }
 
           const suggestions = await readLatestSuggestions(stateDir, sessionId);
@@ -641,7 +703,12 @@ export function create8080Command(
               selectedAgent = suggestions.agents.find((agent) => agent === "start_building" || agent === "start_build");
             }
             if (!selectedAgent) {
-              return { text: `⚠️  "${choice}" is not valid. Pick a number between 1 and ${suggestions.agents.length}, or use an option name like \`start-building\`.` };
+              return {
+                text:
+                  `⚠️  "${choice}" is not valid. Pick a number between 1 and ${suggestions.agents.length}, or use an option name like \`start-building\`.\n\n` +
+                  `Command: \`/ai8080 select-button <number>\`\n` +
+                  `Natural: \`choose option 1\`, \`continue\`, or \`review\`.`,
+              };
             }
           }
 

@@ -1,9 +1,11 @@
 import { Type } from "@sinclair/typebox";
 import { requireAuthenticatedClient, AuthError } from "./api-client.ts";
+import { buildProjectActivationResult } from "./project-activation.ts";
 
 export function createProjectStatusTool(deps: {
   stateDir: () => string;
   apiBaseUrl: string;
+  sessionId: string;
 }) {
   return {
     name: "ai8080_get_project_status",
@@ -23,7 +25,7 @@ export function createProjectStatusTool(deps: {
       _id: string,
       params: { projectId?: string },
       _signal: AbortSignal | undefined,
-      onUpdate: (partial: { content: { type: "text"; text: string }[] }) => void
+      onUpdate: ((partial: { content: { type: "text"; text: string }[]; details?: unknown; presentation?: unknown }) => void) | undefined
     ) {
       const stateDir = deps.stateDir();
       const { apiBaseUrl, sessionId } = deps;
@@ -77,19 +79,25 @@ export function createProjectStatusTool(deps: {
           lines.push(`\n**Req Doc:** ${status.requirementDocUrl}`);
         if (status.error) lines.push(`\n❌ **Error:** ${status.error}`);
 
-        // Show extra fields from API for discovery
-        const knownKeys = new Set(["id", "phase", "status", "title", "activeAgent", "agentMessage", "requirementDocUrl", "error", "current_step", "steps", "progress"]);
-        const extraKeys = Object.keys(status).filter(k => !knownKeys.has(k) && status[k] !== undefined && status[k] !== null);
-        if (extraKeys.length > 0) {
-          lines.push("");
-          lines.push("**Other fields:**");
-          for (const k of extraKeys) {
-            const val = typeof status[k] === "object" ? JSON.stringify(status[k]) : String(status[k]);
-            lines.push(`  ${k}: ${val.length > 100 ? val.slice(0, 100) + "…" : val}`);
-          }
-        }
+        const activation = await buildProjectActivationResult({
+          client,
+          projectId,
+          projectTitle: status.title || projectId,
+          stateDir,
+          openClawSessionId: sessionId,
+          introText: "",
+        });
+        const text = lines.join("\n") + activation.latestMessageText;
+        const result = {
+          content: [{ type: "text" as const, text }],
+          details: {
+            projectId,
+          },
+          presentation: activation.presentation,
+        };
 
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+        onUpdate?.(result);
+        return result;
       } catch (err) {
         if (err instanceof AuthError) {
           return { content: [{ type: "text", text: (err as Error).message }] };

@@ -43,7 +43,9 @@ export function createTaskListTool(deps: {
           content: [{
             type: "text",
             text:
-              "No active project found. Run `/ai8080 list`, then `/ai8080 select <number>` first.\n\n" +
+              "No active project found. Run `/ai8080 list` first, then select a project.\n\n" +
+              "Use a command like `/ai8080 select 1`, `/ai8080 select <project-name>`, or `/ai8080 select <project-id>`.\n\n" +
+              "Or use natural language like `select 1` or `switch to <project-name>`.\n\n" +
               "You can also run `/ai8080 task-list <project_id>`.",
           }],
           details: null,

@@ -18,7 +18,7 @@ export function createListProjectsTool(deps: {
       "Do NOT use this tool for task-list requests or requests to show tasks inside a project; use ai8080_task_list instead. " +
       "The tool returns both a numbered text list and a native UI for project selection. " +
       "IMPORTANT: Show the full numbered project list from the tool result. Do not replace it with only a count. " +
-      "Tell the user to run /ai8080 select <number> to activate one for the current session.",
+      "Tell the user they can run /ai8080 select <number|project-name|project-id> or use natural language like 'select 1' or 'switch to project-name'.",
     parameters: Type.Object({}),
 
     async execute(
@@ -60,8 +60,10 @@ export function createListProjectsTool(deps: {
         });
         const text =
           `### 8080.ai Projects (${projects.length})\n\n${lines.join("\n")}\n\n` +
-          `Run \`/ai8080 select <number>\` to make a project active for this OpenClaw session.\n\n` +
-          `Example: \`/ai8080 select 1\``;
+          `Select a project with either a command or natural language:\n\n` +
+          `- Command: \`/ai8080 select <number>\`, \`/ai8080 select <project-name>\`, or \`/ai8080 select <project-id>\`\n` +
+          `- Natural: \`select 1\`, \`switch to ${projects[0]?.title ?? "<project-name>"}\`, or \`make ${projects[0]?.title ?? "<project-name>"} active\`\n\n` +
+          `After selecting, continue with \`/ai8080 message <text>\` or say \`send <text> to my 8080.ai project\`.`;
 
         log.info("list_projects full list prepared", {
           count: projects.length,

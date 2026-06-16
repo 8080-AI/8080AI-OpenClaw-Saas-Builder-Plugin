@@ -178,6 +178,7 @@ export async function buildProjectActivationResult(params: {
   projectTitle: string;
   stateDir: string;
   openClawSessionId: string;
+  introText?: string;
 }): Promise<ActivationResult> {
   const { client, projectId, projectTitle, stateDir, openClawSessionId } = params;
   const status = await client.getProjectStatus(projectId).catch(() => null);
@@ -199,10 +200,14 @@ export async function buildProjectActivationResult(params: {
     : "";
   const suggestionText = agents.length > 0
     ? `\n\n${buildSuggestedAgentsText(projectId, agents)}` +
-      `\nType \`/ai8080 select-button <number>\` to proceed.`
+      `\nProceed with either a command or natural language:\n\n` +
+      `- Command: \`/ai8080 select-button <number>\`\n` +
+      `- Natural: \`choose option 1\`, \`continue\`, or \`review\`.`
     : "";
+  const introText = params.introText ??
+    `✅ Project \`${projectTitle}\` is now active for this OpenClaw session. (${projectId})`;
   const text =
-    `✅ Project \`${projectTitle}\` is now active for this OpenClaw session. (${projectId})` +
+    introText +
     latestMessageText +
     suggestionText;
 
