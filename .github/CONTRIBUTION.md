@@ -26,6 +26,105 @@ Important files and directories:
 | `plugin-install.sh` | Local development install script for relinking the plugin into OpenClaw. |
 | `README.md` | User-facing installation, authentication, command, and tool documentation. |
 
+## Git Workflow & Branch Naming Convention
+
+We follow a **branch-per-change** workflow. Every contribution—whether it is a new feature, a bug fix, a refactor, a changes or a docs update—must live on its own branch created from `develop`.
+
+### Branch Name Format
+
+```
+<type>/<short-description>
+```
+
+- **`type`** — a category prefix (see table below).
+- **`short-description`** — a lowercase, hyphen-separated summary of the change (`kebab-case`).
+
+### Branch Type Prefixes
+
+| Prefix | When to use | Examples |
+| --- | --- | --- |
+| `feature/` | New functionality or capability | `feature/show-start-building`, `feature/start-building`, `feature/show-project-history` |
+| `fix/` | Bug fixes and stability updates | `fix/login-error`, `fix/project-status`, `fix/streaming-response` |
+| `refactor/` | Code restructuring or cleanup that does not change behavior | `refactor/remove-commands`, `refactor/api-client`, `refactor/remove-extras` |
+| `docs/` | Documentation-only changes | `docs/add-contributing-guide` |
+| `changes/` | Small, miscellaneous updates (config tweaks, naming, metadata) | `changes/plugin-name`, `changes/plugin-documentation-updates` |
+
+> **Note:** Always create change branches from `develop`, not from `main`.
+
+### Protected Branches
+
+| Branch | Purpose |
+| --- | --- |
+| `main` | Production-ready, stable code. **Never push directly to `main`.** All changes reach `main` through pull requests only. |
+| `develop` | Active development integration branch. Create all `fix/`, `changes/`, `feature/`, `docs/`, and `refactor/` branches from `develop`; merge reviewed work back into `develop` before promotion to `main`. |
+
+### Step-by-Step: Creating a Branch & Opening a PR
+
+1. **Make sure you're on `develop` and it's up to date:**
+
+   ```bash
+   git checkout develop
+   git pull origin develop
+   ```
+
+2. **Create your branch using the naming convention:**
+
+   ```bash
+   # New feature
+   git checkout -b feature/your-feature-name
+
+   # Bug fix
+   git checkout -b fix/describe-the-fix
+
+   # Refactor
+   git checkout -b refactor/describe-the-change
+
+   # Documentation update
+   git checkout -b docs/what-you-are-documenting
+
+   # Small miscellaneous change
+   git checkout -b changes/what-changed
+   ```
+
+3. **Make your changes, then stage and commit:**
+
+   ```bash
+   git add .
+   git commit -m "short description of what changed"
+   ```
+
+   Write clear, concise commit messages. Examples:
+   - `added ci/cd pipeline and updated package.json`
+   - `implemented natural language routing for tools`
+   - `removed unused commands`
+   - `updated contribution guide with branch conventions`
+
+4. **Push the branch to the remote:**
+
+   ```bash
+   git push origin feature/your-feature-name
+   ```
+
+5. **Open a Pull Request (PR) on GitHub** targeting `develop`. In the PR description:
+   - Explain **what** changed.
+   - Explain **why** it changed.
+   - Explain **how** it was verified.
+
+6. **Wait for review.** Do not merge your own PR unless you have explicit approval.
+
+### Quick Reference
+
+```text
+main                              ← stable, production-ready
+ └── develop                      ← active development integration
+     ├── feature/start-buidling         ← for showing start building button
+     ├── feature/show-project-history          ← for showing previous latest chat message of selected project
+     ├── fix/resolve-bugs         ← bug fixes and stability
+     ├── refactor/remove-commands ← cleaning up unused code
+     ├── docs/add-contributing-guide
+     └── changes/plugin-name      ← renaming the plugin
+```
+
 ## Setup
 
 Install dependencies:
@@ -56,7 +155,7 @@ The install script uninstalls any existing `8080ai` plugin, installs this checko
 
 ## Development Guidelines
 
-- Keep each change focused on one feature, fix, changes or documentation update
+- Keep each change focused on one feature, fix, refactor, change, or documentation update.
 - Follow the existing TypeScript module style and keep tool-specific logic in the relevant `src/*-tool.ts` file.
 - Keep shared API behavior in `src/api-client.ts` and shared state behavior in the appropriate `src/*-state.ts` helper.
 - Preserve authenticated flow safety. API keys should only be handled through the existing login/API-key helpers.
@@ -101,7 +200,7 @@ Run this before opening a pull request:
 ```bash
 npm run build
 ```
-
+   
 There is currently no dedicated test script in `package.json`, so manual verification matters for behavior changes.
 
 Recommended manual checks, depending on what changed:
@@ -126,19 +225,21 @@ Update documentation when behavior changes:
 
 - `README.md` for users
 - `skills/ai8080/SKILL.md` for agent routing
-- `CONTRIBUTING.md` for contributor workflow changes
+- `.github/CONTRIBUTION.md` for contributor workflow changes
 - `.env.example` only if environment-based configuration changes
 
 ## Pull Request Checklist
 
 Before submitting:
 
-- Run `npm run build`.
-- Confirm relevant manual OpenClaw flows were checked.
-- Confirm tool contracts are synchronized across `index.ts`, `openclaw.plugin.json`, and `package.json`.
-- Confirm docs are updated for user-facing changes.
-- Confirm no API keys, tokens, `.env` files, or local credentials are included.
-- Explain what changed, why it changed, and how it was verified.
+- [ ] Branch is named following the convention: `<type>/<short-description>`
+- [ ] Branch is created from an up-to-date `develop`
+- [ ] Run `npm run build` — no errors
+- [ ] Relevant manual OpenClaw flows were checked
+- [ ] Tool contracts are synchronized across `index.ts`, `openclaw.plugin.json`, and `package.json`
+- [ ] Docs are updated for user-facing changes
+- [ ] No API keys, tokens, `.env` files, or local credentials are included
+- [ ] PR description explains what changed, why, and how it was verified
 
 ## Support
 
