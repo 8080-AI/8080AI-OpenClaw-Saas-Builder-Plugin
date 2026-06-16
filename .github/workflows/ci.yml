@@ -1,94 +1,121 @@
-# ===========================================================================
-# CI — Runs on every Pull Request to validate the build
-# ===========================================================================
-name: CI
+  # ===========================================================================
+  # CI — Runs on every Pull Request to validate the build
+  # ===========================================================================
+  name: CI
 
-on:
-  pull_request:
-    branches: [main]
+  on:
+    pull_request:
+      branches: [main]
 
-# Cancel previous runs for the same PR when new commits are pushed
-concurrency:
-  group: ci-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+  # Cancel previous runs for the same PR when new commits are pushed
+  concurrency:
+    group: ci-${{ github.head_ref || github.run_id }}
+    cancel-in-progress: true
 
-jobs:
-  build:
-    name: Build & Validate
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  jobs:
+    build:
+      name: Build & Validate
+      runs-on: ubuntu-latest
+      timeout-minutes: 10
 
-    steps:
-      # ── 1. Checkout code ──────────────────────────────────────────────
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      steps:
+        # ── 1. Checkout code ──────────────────────────────────────────────
+        - name: Checkout repository
+          uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
 
-      # ── 2. Setup Node.js ──────────────────────────────────────────────
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: 'npm'
+        # ── 2. Validate package version ──────────────────────────────────
+        - name: Validate package version is unreleased
+          run: |
+            VERSION=$(node -p "require('./package.json').version")
+            TAG="v$VERSION"
 
-      # ── 3. Install dependencies ───────────────────────────────────────
-      - name: Install dependencies
-        run: npm ci
+            echo "Checking package version: $VERSION"
 
-      # ── 4. Build plugin ──────────────────────────────────────────────
-      - name: Build plugin
-        run: npm run build
+            node -e "
+              const version = require('./package.json').version;
+              if (!/^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$/.test(version)) {
+                console.error('❌ package.json version must be valid semver');
+                process.exit(1);
+              }
+            "
 
-      # ── 5. Validate build output exists ───────────────────────────────
-      - name: Validate build output
-        run: |
-          echo "Checking dist/index.js exists..."
-          test -f dist/index.js || { echo "❌ dist/index.js not found"; exit 1; }
-          echo "✅ Build output verified"
+            git fetch --tags
 
-      # ── 6. Validate package files array ───────────────────────────────
-      # Ensures every entry in package.json "files" array exists.
-      # This is the list of files/dirs that npm pack includes in the
-      # tarball — if any are missing, the published plugin is broken.
-      - name: Validate package files
-        run: |
-          node -e "
-            const fs = require('fs');
-            const pkg = require('./package.json');
-            const files = pkg.files || [];
-            let missing = [];
-            for (const f of files) {
-              if (!fs.existsSync(f)) missing.push(f);
-            }
-            if (missing.length > 0) {
-              console.error('❌ Missing files listed in package.json files array:');
-              missing.forEach(f => console.error('   -', f));
-              process.exit(1);
-            }
-            console.log('✅ All package files present:');
-            files.forEach(f => {
-              const stat = fs.statSync(f);
-              const type = stat.isDirectory() ? 'dir' : 'file';
-              console.log('   ✓', f, '(' + type + ')');
-            });
-          "
+            if git rev-parse "$TAG" >/dev/null 2>&1; then
+              echo "❌ Tag $TAG already exists. Update package.json version before merging."
+              exit 1
+            fi
 
-      # ── 7. Validate plugin manifest & openclaw metadata ──────────────
-      - name: Validate plugin metadata
-        run: |
-          echo "Checking openclaw.plugin.json..."
-          test -f openclaw.plugin.json || { echo "❌ openclaw.plugin.json not found"; exit 1; }
-          echo "Checking package.json openclaw metadata..."
-          node -e "
-            const pkg = require('./package.json');
-            const oc = pkg.openclaw;
-            if (!oc) { console.error('❌ Missing openclaw block'); process.exit(1); }
-            if (!oc.compat?.pluginApi) { console.error('❌ Missing openclaw.compat.pluginApi'); process.exit(1); }
-            if (!oc.build?.openclawVersion) { console.error('❌ Missing openclaw.build.openclawVersion'); process.exit(1); }
-            console.log('✅ Plugin metadata validated');
-            console.log('   pluginApi:', oc.compat.pluginApi);
-            console.log('   openclawVersion:', oc.build.openclawVersion);
-          "
+            echo "✅ $TAG is available"
 
-      # ── 8. Dry-run pack to verify tarball ────────────────────────────
-      - name: Verify npm pack (dry-run)
-        run: npm pack --dry-run
+        # ── 3. Setup Node.js ──────────────────────────────────────────────
+        - name: Setup Node.js
+          uses: actions/setup-node@v4
+          with:
+            node-version: '22'
+            cache: 'npm'
+
+        # ── 4. Install dependencies ───────────────────────────────────────
+        - name: Install dependencies
+          run: npm ci
+
+        # ── 5. Build plugin ──────────────────────────────────────────────
+        - name: Build plugin
+          run: npm run build
+
+        # ── 6. Validate build output exists ───────────────────────────────
+        - name: Validate build output
+          run: |
+            echo "Checking dist/index.js exists..."
+            test -f dist/index.js || { echo "❌ dist/index.js not found"; exit 1; }
+            echo "✅ Build output verified"
+
+        # ── 7. Validate package files array ───────────────────────────────
+        # Ensures every entry in package.json "files" array exists.
+        # This is the list of files/dirs that npm pack includes in the
+        # tarball — if any are missing, the published plugin is broken.
+        - name: Validate package files
+          run: |
+            node -e "
+              const fs = require('fs');
+              const pkg = require('./package.json');
+              const files = pkg.files || [];
+              let missing = [];
+              for (const f of files) {
+                if (!fs.existsSync(f)) missing.push(f);
+              }
+              if (missing.length > 0) {
+                console.error('❌ Missing files listed in package.json files array:');
+                missing.forEach(f => console.error('   -', f));
+                process.exit(1);
+              }
+              console.log('✅ All package files present:');
+              files.forEach(f => {
+                const stat = fs.statSync(f);
+                const type = stat.isDirectory() ? 'dir' : 'file';
+                console.log('   ✓', f, '(' + type + ')');
+              });
+            "
+
+        # ── 8. Validate plugin manifest & openclaw metadata ──────────────
+        - name: Validate plugin metadata
+          run: |
+            echo "Checking openclaw.plugin.json..."
+            test -f openclaw.plugin.json || { echo "❌ openclaw.plugin.json not found"; exit 1; }
+            echo "Checking package.json openclaw metadata..."
+            node -e "
+              const pkg = require('./package.json');
+              const oc = pkg.openclaw;
+              if (!oc) { console.error('❌ Missing openclaw block'); process.exit(1); }
+              if (!oc.compat?.pluginApi) { console.error('❌ Missing openclaw.compat.pluginApi'); process.exit(1); }
+              if (!oc.build?.openclawVersion) { console.error('❌ Missing openclaw.build.openclawVersion'); process.exit(1); }
+              console.log('✅ Plugin metadata validated');
+              console.log('   pluginApi:', oc.compat.pluginApi);
+              console.log('   openclawVersion:', oc.build.openclawVersion);
+            "
+
+        # ── 9. Dry-run pack to verify tarball ────────────────────────────
+        - name: Verify npm pack (dry-run)
+          run: npm pack --dry-run
