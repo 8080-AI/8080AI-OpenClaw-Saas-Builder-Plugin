@@ -24,7 +24,6 @@ jobs:
       github.event.pull_request.merged == true &&
       github.event.pull_request.head.ref == 'develop'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
   
     steps:
       # ── 1. Checkout code ──────────────────────────────────────────────
@@ -122,18 +121,27 @@ jobs:
       - name: Verify ClawHub authentication
         run: clawhub whoami
 
-      # ── 11. Publish to ClawHub (dry-run first) ───────────────────────
+      # ── 11. Create git tag ───────────────────────────────────────────
+      - name: Create git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag "${{ steps.version.outputs.tag }}" "${{ steps.version.outputs.commit_sha }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      # ── 12. Publish to ClawHub (dry-run first) ───────────────────────
       - name: Publish to ClawHub (dry-run)
         run: |
           clawhub package publish . \
             --family code-plugin \
             --version "${{ steps.version.outputs.version }}" \
             --source-repo "${{ github.repository }}" \
-            --source-commit "${{ steps.version  .outputs.commit_sha }}" \
+            --source-commit "${{ steps.version.outputs.commit_sha }}" \
             --source-ref "${{ steps.version.outputs.tag }}" \
             --dry-run
 
-      # ── 12. Publish to ClawHub (actual) ──────────────────────────────
+      # ── 13. Publish to ClawHub (actual) ──────────────────────────────
       - name: Publish to ClawHub
         run: |
           clawhub package publish . \
@@ -142,15 +150,6 @@ jobs:
             --source-repo "${{ github.repository }}" \
             --source-commit "${{ steps.version.outputs.commit_sha }}" \
             --source-ref "${{ steps.version.outputs.tag }}"
-
-      # ── 13. Create git tag ───────────────────────────────────────────
-      - name: Create git tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git tag "${{ steps.version.outputs.tag }}" "${{ steps.version.outputs.commit_sha }}"
-          git push origin "${{ steps.version.outputs.tag }}"
 
       # ── 14. Create GitHub release ────────────────────────────────────
       - name: Create GitHub release
@@ -168,3 +167,4 @@ jobs:
           echo ""
           echo "Users can now install with:"
           echo "  openclaw plugins install clawhub:8080ai"
+

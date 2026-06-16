@@ -16,7 +16,6 @@
     build:
       name: Build & Validate
       runs-on: ubuntu-latest
-      timeout-minutes: 10
 
       steps:
         # ── 1. Checkout code ──────────────────────────────────────────────
