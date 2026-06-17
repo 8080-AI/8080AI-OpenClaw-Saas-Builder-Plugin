@@ -1,11 +1,16 @@
 # ===========================================================================
-# Publish — Runs when a PR is merged into main
+# Publish — Runs after develop is merged into main
 # ===========================================================================
 name: Publish to ClawHub
 
 on:
-  push:
+  pull_request:
     branches: [main]
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: read
 
 # Only one publish at a time
 concurrency:
@@ -15,17 +20,18 @@ concurrency:
 jobs:
   publish:
     name: Build & Publish to ClawHub
+    if: >
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'develop'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
   
-    # Only run if the push was a merge commit (not a direct push)
-    # Remove the `if` to also publish on direct pushes to main
-    # if: github.event.head_commit.message != ''
-
     steps:
       # ── 1. Checkout code ──────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       # ── 2. Setup Node.js ──────────────────────────────────────────────
       - name: Setup Node.js
@@ -67,53 +73,121 @@ jobs:
             console.log('✅ All package files verified for publish');
           "
 
-      # ── 6. Extract version from package.json ──────────────────────────
+      # ── 6. Extract package version ───────────────────────────────────
       - name: Extract package version
         id: version
         run: |
           VERSION=$(node -p "require('./package.json').version")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "📦 Publishing version: $VERSION"
+          TAG="v$VERSION"
+          COMMIT_SHA=$(git rev-parse HEAD)
 
-      # ── 7. Install ClawHub CLI ────────────────────────────────────────
+          node -e "
+            const version = require('./package.json').version;
+            if (!/^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$/.test(version)) {
+              console.error('❌ package.json version must be valid semver');
+              process.exit(1);
+            }
+          "
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "📦 Publishing version: $VERSION"
+          echo "🏷️ Release tag: $TAG"
+
+      # ── 7. Ensure version tag is available ───────────────────────────
+      - name: Ensure version tag does not already exist
+        run: |
+          git fetch --tags
+
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "❌ Tag ${{ steps.version.outputs.tag }} already exists. This version was already released."
+            exit 1
+          fi
+
+          echo "✅ Tag ${{ steps.version.outputs.tag }} is available"
+
+      # ── 8. Create package tarball ────────────────────────────────────
+      - name: Create package tarball
+        id: package
+        run: |
+          mkdir -p package
+          TARBALL=$(npm pack --pack-destination package | tail -n 1)
+          TARBALL_PATH="package/$TARBALL"
+
+          test -f "$TARBALL_PATH" || { echo "❌ Tarball was not created"; exit 1; }
+
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "tarball_path=$TARBALL_PATH" >> "$GITHUB_OUTPUT"
+          echo "✅ Created tarball: $TARBALL_PATH"
+
+      # ── 9. Upload package tarball artifact ───────────────────────────
+      - name: Upload package tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-tarball
+          path: ${{ steps.package.outputs.tarball_path }}
+          if-no-files-found: error
+
+      # ── 10. Install ClawHub CLI ───────────────────────────────────────
       - name: Install ClawHub CLI
         run: npm install -g clawhub
 
-      # ── 8. Authenticate to ClawHub ────────────────────────────────────
+      # ── 11. Authenticate to ClawHub ───────────────────────────────────
       - name: Authenticate to ClawHub
         run: clawhub login --token "${{ secrets.CLAWHUB_TOKEN }}" --no-browser
         env:
           CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
 
-      # ── 9. Verify authentication ─────────────────────────────────────
+      # ── 12. Verify authentication ────────────────────────────────────
       - name: Verify ClawHub authentication
         run: clawhub whoami
 
-      # ── 10. Publish to ClawHub (dry-run first) ───────────────────────
+      # ── 13. Publish to ClawHub (dry-run first) ───────────────────────
       - name: Publish to ClawHub (dry-run)
         run: |
-          clawhub package publish . \
+          clawhub package publish "${{ steps.package.outputs.tarball_path }}" \
             --family code-plugin \
             --version "${{ steps.version.outputs.version }}" \
             --source-repo "${{ github.repository }}" \
-            --source-commit "${{ github.sha }}" \
-            --source-ref "main" \
+            --source-commit "${{ steps.version.outputs.commit_sha }}" \
+            --source-ref "${{ steps.version.outputs.tag }}" \
             --dry-run
 
-      # ── 11. Publish to ClawHub (actual) ──────────────────────────────
+      # ── 14. Publish to ClawHub (actual) ──────────────────────────────
       - name: Publish to ClawHub
         run: |
-          clawhub package publish . \
+          clawhub package publish "${{ steps.package.outputs.tarball_path }}" \
             --family code-plugin \
             --version "${{ steps.version.outputs.version }}" \
             --source-repo "${{ github.repository }}" \
-            --source-commit "${{ github.sha }}" \
-            --source-ref "main"
+            --source-commit "${{ steps.version.outputs.commit_sha }}" \
+            --source-ref "${{ steps.version.outputs.tag }}"
 
-      # ── 12. Confirm publish ──────────────────────────────────────────
+      # ── 15. Create git tag ───────────────────────────────────────────
+      - name: Create git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag "${{ steps.version.outputs.tag }}" "${{ steps.version.outputs.commit_sha }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      # ── 16. Create GitHub release ────────────────────────────────────
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          files: ${{ steps.package.outputs.tarball_path }}
+
+      # ── 17. Confirm publish ──────────────────────────────────────────
       - name: Confirm publish
         run: |
           echo "✅ Successfully published 8080ai v${{ steps.version.outputs.version }} to ClawHub"
+          echo "✅ Created package tarball ${{ steps.package.outputs.tarball }}"
+          echo "✅ Created GitHub release ${{ steps.version.outputs.tag }}"
           echo ""
           echo "Users can now install with:"
           echo "  openclaw plugins install clawhub:8080ai"
