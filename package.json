@@ -4,6 +4,10 @@
   "description": "OpenClaw plugin for creating, managing, and building 8080.ai projects.",
   "type": "module",
   "license": "GPL-2.0-only",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/8080-AI/8080AI-OpenClaw-Saas-Builder-Plugin.git"
+  },
   "keywords": [
     "openclaw",
     "openclaw-plugin",
