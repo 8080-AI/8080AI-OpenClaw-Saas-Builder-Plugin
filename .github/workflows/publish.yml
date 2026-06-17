@@ -113,7 +113,7 @@ jobs:
         run: |
           mkdir -p package
           TARBALL=$(npm pack --pack-destination package | tail -n 1)
-          TARBALL_PATH="package/$TARBALL"
+          TARBALL_PATH="$(pwd)/package/$TARBALL"
 
           test -f "$TARBALL_PATH" || { echo "❌ Tarball was not created"; exit 1; }
 
