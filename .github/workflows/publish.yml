@@ -107,21 +107,43 @@ jobs:
 
           echo "✅ Tag ${{ steps.version.outputs.tag }} is available"
 
-      # ── 8. Install ClawHub CLI ────────────────────────────────────────
+      # ── 8. Create package tarball ────────────────────────────────────
+      - name: Create package tarball
+        id: package
+        run: |
+          mkdir -p package
+          TARBALL=$(npm pack --pack-destination package | tail -n 1)
+          TARBALL_PATH="package/$TARBALL"
+
+          test -f "$TARBALL_PATH" || { echo "❌ Tarball was not created"; exit 1; }
+
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "tarball_path=$TARBALL_PATH" >> "$GITHUB_OUTPUT"
+          echo "✅ Created tarball: $TARBALL_PATH"
+
+      # ── 9. Upload package tarball artifact ───────────────────────────
+      - name: Upload package tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-tarball
+          path: ${{ steps.package.outputs.tarball_path }}
+          if-no-files-found: error
+
+      # ── 10. Install ClawHub CLI ───────────────────────────────────────
       - name: Install ClawHub CLI
         run: npm install -g clawhub
 
-      # ── 9. Authenticate to ClawHub ────────────────────────────────────
+      # ── 11. Authenticate to ClawHub ───────────────────────────────────
       - name: Authenticate to ClawHub
         run: clawhub login --token "${{ secrets.CLAWHUB_TOKEN }}" --no-browser
         env:
           CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
 
-      # ── 10. Verify authentication ────────────────────────────────────
+      # ── 12. Verify authentication ────────────────────────────────────
       - name: Verify ClawHub authentication
         run: clawhub whoami
 
-      # ── 11. Create git tag ───────────────────────────────────────────
+      # ── 13. Create git tag ───────────────────────────────────────────
       - name: Create git tag
         run: |
           git config user.name "github-actions[bot]"
@@ -130,10 +152,10 @@ jobs:
           git tag "${{ steps.version.outputs.tag }}" "${{ steps.version.outputs.commit_sha }}"
           git push origin "${{ steps.version.outputs.tag }}"
 
-      # ── 12. Publish to ClawHub (dry-run first) ───────────────────────
+      # ── 14. Publish to ClawHub (dry-run first) ───────────────────────
       - name: Publish to ClawHub (dry-run)
         run: |
-          clawhub package publish . \
+          clawhub package publish "${{ steps.package.outputs.tarball_path }}" \
             --family code-plugin \
             --version "${{ steps.version.outputs.version }}" \
             --source-repo "${{ github.repository }}" \
@@ -141,30 +163,31 @@ jobs:
             --source-ref "${{ steps.version.outputs.tag }}" \
             --dry-run
 
-      # ── 13. Publish to ClawHub (actual) ──────────────────────────────
+      # ── 15. Publish to ClawHub (actual) ──────────────────────────────
       - name: Publish to ClawHub
         run: |
-          clawhub package publish . \
+          clawhub package publish "${{ steps.package.outputs.tarball_path }}" \
             --family code-plugin \
             --version "${{ steps.version.outputs.version }}" \
             --source-repo "${{ github.repository }}" \
             --source-commit "${{ steps.version.outputs.commit_sha }}" \
             --source-ref "${{ steps.version.outputs.tag }}"
 
-      # ── 14. Create GitHub release ────────────────────────────────────
+      # ── 16. Create GitHub release ────────────────────────────────────
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
+          files: ${{ steps.package.outputs.tarball_path }}
 
-      # ── 15. Confirm publish ──────────────────────────────────────────
+      # ── 17. Confirm publish ──────────────────────────────────────────
       - name: Confirm publish
         run: |
           echo "✅ Successfully published 8080ai v${{ steps.version.outputs.version }} to ClawHub"
+          echo "✅ Created package tarball ${{ steps.package.outputs.tarball }}"
           echo "✅ Created GitHub release ${{ steps.version.outputs.tag }}"
           echo ""
           echo "Users can now install with:"
           echo "  openclaw plugins install clawhub:8080ai"
-

@@ -115,6 +115,24 @@
               console.log('   openclawVersion:', oc.build.openclawVersion);
             "
 
-        # ── 9. Dry-run pack to verify tarball ────────────────────────────
-        - name: Verify npm pack (dry-run)
-          run: npm pack --dry-run
+        # ── 9. Create package tarball ────────────────────────────────────
+        - name: Create package tarball
+          id: package
+          run: |
+            mkdir -p package
+            TARBALL=$(npm pack --pack-destination package | tail -n 1)
+            TARBALL_PATH="package/$TARBALL"
+
+            test -f "$TARBALL_PATH" || { echo "❌ Tarball was not created"; exit 1; }
+
+            echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+            echo "tarball_path=$TARBALL_PATH" >> "$GITHUB_OUTPUT"
+            echo "✅ Created tarball: $TARBALL_PATH"
+
+        # ── 10. Upload package tarball artifact ──────────────────────────
+        - name: Upload package tarball
+          uses: actions/upload-artifact@v4
+          with:
+            name: package-tarball
+            path: ${{ steps.package.outputs.tarball_path }}
+            if-no-files-found: error
