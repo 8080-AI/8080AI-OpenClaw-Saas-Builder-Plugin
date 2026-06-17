@@ -71,9 +71,7 @@ function groupPlanningAgents(agents: string[]): string[] {
     "System Requirements Agent",
     "Design Agent",
     "Project Manager",
-    "System Architect Agent",
     "System Architect",
-    "User Flow Planner Agent",
     "User Flow Planner",
     "plan_all",
   ];
