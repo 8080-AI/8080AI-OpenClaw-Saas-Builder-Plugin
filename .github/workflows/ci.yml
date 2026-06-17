@@ -47,6 +47,30 @@
               exit 1
             fi
 
+            LATEST_TAG=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n 1)
+
+            if [ -n "$LATEST_TAG" ]; then
+              CURRENT_VERSION="$VERSION" LATEST_VERSION="${LATEST_TAG#v}" node -e "
+                const parse = (version) => {
+                  const match = version.match(/^([0-9]+)\\.([0-9]+)\\.([0-9]+)/);
+                  return match.slice(1).map(Number);
+                };
+
+                const current = parse(process.env.CURRENT_VERSION);
+                const latest = parse(process.env.LATEST_VERSION);
+                const isGreater = current.some((part, index) => (
+                  part > latest[index] && current.slice(0, index).every((value, i) => value === latest[i])
+                ));
+
+                if (!isGreater) {
+                  console.error('❌ package.json version must be greater than latest released tag v' + process.env.LATEST_VERSION);
+                  process.exit(1);
+                }
+              "
+
+              echo "✅ $VERSION is greater than latest released tag $LATEST_TAG"
+            fi
+
             echo "✅ $TAG is available"
 
         # ── 3. Setup Node.js ──────────────────────────────────────────────
