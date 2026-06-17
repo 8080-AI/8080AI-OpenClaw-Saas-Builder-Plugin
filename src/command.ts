@@ -16,6 +16,7 @@ import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
 import { log } from "../logger.ts";
+import { buildProjectActivationResult } from "./project-activation.ts";
 
 const HELP_TEXT = `8080.ai plugin commands:
 
@@ -520,26 +521,16 @@ export function create8080Command(
 
             const selected = projects[num - 1];
             await writeActiveProject(stateDir, selected.id, sessionId);
-            const defaultAgents = ["start_building"];
-            await writeLatestSuggestions(stateDir, sessionId, {
+            const activation = await buildProjectActivationResult({
+              client,
               projectId: selected.id,
-              agents: defaultAgents,
-              messageId: "",
+              projectTitle: selected.title,
+              stateDir,
+              openClawSessionId: sessionId,
             });
-            log.info("select project default start_building suggestion written", {
-              projectId: selected.id,
-              source: "command_select",
-              sessionId,
-              agents: defaultAgents,
-            });
-            const presentation = buildSuggestedAgentsPresentation(selected.id, defaultAgents);
             return {
-              text:
-                `✅ Project \`${selected.title}\` is now active for this OpenClaw session. (${selected.id})\n\n` +
-                `### Suggested Next Steps:\n` +
-                `1. 🛠️ Start Building\n\n` +
-                `Type \`/ai8080 select-button 1\` or \`Start Building\` to proceed.`,
-              presentation,
+              text: activation.latestMessageText,
+              presentation: activation.presentation,
             };
           } catch (err) {
             if (err instanceof AuthError) return { text: (err as Error).message };

@@ -75,7 +75,7 @@ export function createContinueProjectTool(deps: {
         const hasPlanAllSuggestion = suggestedAgents.some((agent) =>
           agent === "plan_all" || (agent.startsWith("GROUP:") && agent.slice(6).split("|").includes("plan_all"))
         );
-        if (hasPlanAllSuggestion) {
+        if (hasPlanAllSuggestion && !hasContinueSuggestion) {
           const [existingDesignPages, latestAgentComplete] = await Promise.all([
             client.getDesignPages(activeProjectId).catch(() => null),
             client.hasLatestCompletedAgentLog(activeProjectId),
