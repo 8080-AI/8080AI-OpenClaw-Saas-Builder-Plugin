@@ -347,7 +347,7 @@ export function create8080Command(
               `\`\`\`text\n` +
               `set api-key <api-key>\n` +
               `\`\`\`\n\n` +
-              `The plugin will validate it locally and save it securely for future requests.`,
+              `I'll validate it locally and save it securely for future requests.`,
           };
         }
 

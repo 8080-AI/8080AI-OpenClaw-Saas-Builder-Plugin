@@ -2,7 +2,7 @@ import { Type } from "@sinclair/typebox";
 import { AuthError, isPauseForReviewText, isReviewArchitectureStartBuildingChatMessage, requireAuthenticatedClient } from "./api-client.ts";
 import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
 import { readLatestSuggestionsForProject, writeLatestSuggestions } from "./suggestions-state.ts";
-import { silentToolResult } from "./silent-result.ts";
+import { silentToolResult } from "./exact-response.ts";
 import { log } from "../logger.ts";
 import { readActiveModel } from "./model-state.ts";
 import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
