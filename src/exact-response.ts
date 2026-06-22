@@ -24,6 +24,8 @@ export function exactToolResult(
     content: [{ type: "text", text }],
     details: {
       ...details,
+      // The hook reads this metadata and replaces any model-written prose with
+      // the exact tool text.
       responseMode: "exact",
       exactUserResponse: text,
     },
@@ -38,6 +40,7 @@ export function silentToolResult(details: Record<string, unknown> = {}) {
     content: [],
     details: {
       ...details,
+      // The hook reads these flags and blocks the next assistant filler message.
       responseMode: "silent",
       silent: true,
       suppressUserResponse: true,
