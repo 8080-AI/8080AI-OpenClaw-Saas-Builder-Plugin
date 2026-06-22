@@ -13,6 +13,7 @@ import { createSelectProjectTool } from "./src/select-project-tool.ts";
 import { createTaskListTool } from "./src/task-list-tool.ts";
 import { createSelectButtonTool } from "./src/select-button-tool.ts";
 import { generateSessionId } from "./src/command.ts";
+import { registerExactResponseHooks } from "./src/exact-response-hooks.ts";
 import { configureLogger, log } from "./logger.ts";
 type PluginConfig = {
   siteUrl?: string;
@@ -36,6 +37,7 @@ export default definePluginEntry({
   register(api) {
     configureLogger(api.logger);
     log.info("Registering plugin", { pluginId: api.pluginId });
+    registerExactResponseHooks(api);
     const config = (api.pluginConfig ?? {}) as PluginConfig;
     const siteUrl = resolveStringConfig(config.siteUrl, DEFAULT_SITE_URL).replace(/\/$/, "");
     const apiBaseUrl = resolveStringConfig(config.apiBaseUrl, DEFAULT_API_BASE_URL).replace(/\/$/, "");
