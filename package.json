@@ -51,18 +51,18 @@
       ]
     },
     "compat": {
-      "pluginApi": ">=2026.6.8",
-      "minGatewayVersion": "2026.6.8"
+      "pluginApi": ">=2026.5.7",
+      "minGatewayVersion": "2026.5.7"
     },
     "build": {
-      "openclawVersion": "2026.6.8",
-      "pluginSdkVersion": "2026.6.8"
+      "openclawVersion": "2026.5.7",
+      "pluginSdkVersion": "2026.5.7"
     }
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0",
     "eventsource-parser": "^3.0.8",
-    "openclaw": "2026.6.8"
+    "openclaw": "2026.5.7"
   },
   "devDependencies": {
     "@types/node": "^25.7.0",
