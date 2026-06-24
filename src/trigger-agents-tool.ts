@@ -5,7 +5,7 @@ import { groupAgents, hasGeneratedData } from "./command.ts";
 import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { readLatestSuggestionsForProject, writeLatestSuggestions } from "./suggestions-state.ts";
-import { silentToolResult } from "./silent-result.ts";
+import { silentToolResult } from "./exact-response.ts";
 import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
 import { log } from "../logger.ts";

@@ -11,7 +11,7 @@ import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
-import { silentToolResult } from "./silent-result.ts";
+import { silentToolResult } from "./exact-response.ts";
 import { log } from "../logger.ts";
 
 // AgentToolResult shape required by the OpenClaw SDK's onUpdate callback.
