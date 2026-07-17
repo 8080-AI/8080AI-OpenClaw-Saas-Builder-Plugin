@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import { AuthError, isPauseForReviewText, isReviewArchitectureStartBuildingChatMessage, requireAuthenticatedClient } from "./api-client.ts";
+import { AuthError, isPauseForReviewText, isReviewArchitectureStartBuildingChatMessage, requireAuthenticatedClient, determineContinueButtonLabel, getDesignPageRecords, hasCompletedDesignPages } from "./api-client.ts";
 import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
 import { readLatestSuggestionsForProject, writeLatestSuggestions } from "./suggestions-state.ts";
 import { silentToolResult } from "./exact-response.ts";
@@ -20,22 +20,39 @@ export function createContinueProjectTool(deps: {
       "Signal 8080.ai to resume design/planning after a requirement-review checkpoint. " +
       "Use only when the user chooses Continue, Resume, Proceed with planning, or Approve requirements. " +
       "Do not use for Run Plan All or Start Building; those must trigger the suggested agents or build action. " +
-      "If this tool returns no visible content, do not summarize, announce, or confirm the action; remain silent until the plugin returns visible next-step actions.",
+      "If this tool returns no visible content, do not summarize, announce, or confirm the action; remain silent until the plugin returns visible next-step actions. " +
+      "For long-running 8080.ai actions, always pass timeoutMs=600000 so OpenClaw allows the tool call to wait for agent completion.",
     parameters: Type.Object({
       projectId: Type.Optional(Type.String({
         description: "The 8080.ai project ID. Optional if a project is already active.",
       })),
+      timeoutMs: Type.Number({
+        default: 600000,
+        minimum: 1,
+        maximum: 600000,
+        description: "Required OpenClaw dynamic-tool timeout override in milliseconds. Always use 600000 for 8080.ai long-running actions.",
+      }),
     }),
 
     async execute(
       _id: string,
-      params: { projectId?: string },
+      params: { projectId?: string; timeoutMs?: number },
       _signal: AbortSignal | undefined,
       onUpdate: (partial: { content: { type: "text"; text: string }[] }) => void
     ) {
       const stateDir = deps.stateDir();
       const { apiBaseUrl, sessionId } = deps;
       let activeProjectId = params.projectId;
+      let latestSuggestions: Awaited<ReturnType<typeof readLatestSuggestionsForProject>> = null;
+
+      const toolAbortController = new AbortController();
+      if (_signal) {
+        if (_signal.aborted) {
+          toolAbortController.abort();
+        } else {
+          _signal.addEventListener("abort", () => toolAbortController.abort());
+        }
+      }
 
       try {
         const { readActiveProject } = await import("./project-state.ts");
@@ -48,7 +65,7 @@ export function createContinueProjectTool(deps: {
         }
 
         const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
-        let latestSuggestions = await readLatestSuggestionsForProject(stateDir, sessionId, activeProjectId);
+        latestSuggestions = await readLatestSuggestionsForProject(stateDir, sessionId, activeProjectId);
         if (!latestSuggestions || !latestSuggestions.messageId) {
           try {
             const status = await client.getProjectStatus(activeProjectId);
@@ -72,6 +89,7 @@ export function createContinueProjectTool(deps: {
         }
         const suggestedAgents = latestSuggestions?.agents ?? [];
         const hasContinueSuggestion = suggestedAgents.includes("continue");
+        let reattachRunningLog: BasicAgentLog | undefined;
         const hasPlanAllSuggestion = suggestedAgents.some((agent) =>
           agent === "plan_all" || (agent.startsWith("GROUP:") && agent.slice(6).split("|").includes("plan_all"))
         );
@@ -86,6 +104,7 @@ export function createContinueProjectTool(deps: {
               projectId: activeProjectId,
               agents: recoveredSuggestions,
               messageId: latestSuggestions?.messageId ?? "",
+              buttons: latestSuggestions?.buttons,
             });
             log.info("continue_project recovered review actions from generated design pages", {
               projectId: activeProjectId,
@@ -94,8 +113,9 @@ export function createContinueProjectTool(deps: {
               recoveredSuggestions,
               latestAgentComplete,
             });
-            const text = buildSuggestedAgentsText(activeProjectId, recoveredSuggestions);
-            const presentation = buildSuggestedAgentsPresentation(activeProjectId, recoveredSuggestions);
+            const continueButtonLabel = recoveredSuggestions.includes("continue") ? await determineContinueButtonLabel(client, activeProjectId) : undefined;
+            const text = buildSuggestedAgentsText(activeProjectId, recoveredSuggestions, "", continueButtonLabel, latestSuggestions?.buttons);
+            const presentation = buildSuggestedAgentsPresentation(activeProjectId, recoveredSuggestions, "", continueButtonLabel, latestSuggestions?.buttons);
             return {
               content: [{ type: "text", text }],
               details: {
@@ -116,13 +136,13 @@ export function createContinueProjectTool(deps: {
               type: "text",
               text:
                 "8080.ai is ready to run the planning agents.\n\n" +
-                buildSuggestedAgentsText(activeProjectId, suggestedAgents),
+                buildSuggestedAgentsText(activeProjectId, suggestedAgents, "", false, latestSuggestions?.buttons),
             }],
             details: {
               status: "waiting_for_run_plan_all",
               suggestions: suggestedAgents,
             },
-            presentation: buildSuggestedAgentsPresentation(activeProjectId, suggestedAgents),
+            presentation: buildSuggestedAgentsPresentation(activeProjectId, suggestedAgents, "", false, latestSuggestions?.buttons),
           };
         }
         const shouldTriggerSuggestedAgents =
@@ -151,33 +171,103 @@ export function createContinueProjectTool(deps: {
           await client.triggerAgents(activeProjectId, agentsToTrigger, latestSuggestions?.messageId ?? "", activeModel);
 
           let pausedForReview = false;
-          await client.streamProjectEvents(activeProjectId, {
-            onAgentLog: (agentLog) => {
-              log.info("continue_project fallback event agent_log", {
-                projectId: activeProjectId,
-                action: agentLog.action,
-                agentType: agentLog.agent_type,
-                summary: agentLog.summary,
-              });
-            },
-            onChatMessage: (msg) => {
-              if (isPauseForReviewText(msg.content)) {
-                pausedForReview = true;
-              }
-              log.info("continue_project fallback event chat_message", {
-                projectId: activeProjectId,
-                isPauseForReview: isPauseForReviewText(msg.content),
-              });
-            },
-            onPlanningComplete: (data) => {
-              if (data.status === "paused_for_review") {
-                pausedForReview = true;
-              }
-            },
-            idleTimeoutMs: 60_000,
-            progressTimeoutMs: 45_000,
-            maxTimeoutMs: 180_000,
-          });
+          let streamError: string | null = null;
+          const suggestedAgentsFromEvents: string[] = [];
+          let suggestedAgentsMessageId = "";
+
+          try {
+            await client.streamProjectEvents(activeProjectId, {
+              onRaw: (raw) => {
+                try {
+                  const data = JSON.parse(raw);
+                  if (data.type === "error") {
+                    streamError = data.message || data.content || JSON.stringify(data);
+                  }
+                  const agents = data.agents || data.suggested_agents || data.suggestedAgents || data.pending_suggested_agents;
+                  if (agents) {
+                    let agentList: string[] = [];
+                    if (Array.isArray(agents)) agentList = agents;
+                    else if (typeof agents === "object" && agents !== null) {
+                      for (const [key, value] of Object.entries(agents)) {
+                        if (typeof value === "string") agentList.push(value);
+                        else if (value === true) agentList.push(key);
+                      }
+                    }
+                    if (agentList.length > 0) {
+                      for (const a of agentList) {
+                        if (!suggestedAgentsFromEvents.includes(a)) {
+                          suggestedAgentsFromEvents.push(a);
+                        }
+                      }
+                      if (data.message_id || data.messageId) {
+                        suggestedAgentsMessageId = String(data.message_id || data.messageId);
+                      }
+                    }
+                  }
+                } catch (err) {
+                  // ignore
+                }
+              },
+              onAgentLog: (agentLog) => {
+                log.info("continue_project fallback event agent_log", {
+                  projectId: activeProjectId,
+                  action: agentLog.action,
+                  agentType: agentLog.agent_type,
+                  summary: agentLog.summary,
+                });
+                if (agentLog.action === "failed" || agentLog.action === "error") {
+                  streamError = `Agent ${agentLog.agent_type} failed: ${agentLog.summary}`;
+                }
+              },
+              onChatMessage: (msg) => {
+                if (isPauseForReviewText(msg.content)) {
+                  pausedForReview = true;
+                }
+                log.info("continue_project fallback event chat_message", {
+                  projectId: activeProjectId,
+                  isPauseForReview: isPauseForReviewText(msg.content),
+                });
+              },
+              onPlanningComplete: (data) => {
+                if (data.status === "paused_for_review") {
+                  pausedForReview = true;
+                }
+              },
+              idleTimeoutMs: 60_000,
+              progressTimeoutMs: 300_000,
+              maxTimeoutMs: 480_000,
+              signal: toolAbortController.signal,
+            });
+          } catch (err) {
+            log.info("continue_project fallback event stream failed; continuing with project polling", {
+              projectId: activeProjectId,
+              error: err instanceof Error ? err.message : String(err),
+              aborted: toolAbortController.signal.aborted,
+            });
+          }
+
+          if (toolAbortController.signal.aborted) {
+            if (_signal?.aborted) {
+              return {
+                content: [{ type: "text", text: "Operation aborted by client." }],
+                details: { status: "aborted", projectId: activeProjectId }
+              };
+            }
+            await writeLatestSuggestions(stateDir, sessionId, {
+              projectId: activeProjectId,
+              agents: [],
+              messageId: suggestedAgentsMessageId || latestSuggestions?.messageId || "",
+            });
+            return silentToolResult({
+              status: "running",
+              suggestions: [],
+              projectId: activeProjectId,
+            });
+          }
+
+          if (streamError) {
+            throw new Error(streamError);
+          }
 
           log.info("suggested agents continue_project fallback stream finished", {
             projectId: activeProjectId,
@@ -186,17 +276,21 @@ export function createContinueProjectTool(deps: {
           });
 
           if (pausedForReview) {
-            const suggestions = ["continue", "review"];
+            let suggestions = suggestedAgentsFromEvents.length > 0
+              ? suggestedAgentsFromEvents
+              : ["continue", "review"];
             await writeLatestSuggestions(stateDir, sessionId, {
               projectId: activeProjectId,
               agents: suggestions,
-              messageId: latestSuggestions?.messageId ?? "",
+              messageId: suggestedAgentsMessageId || latestSuggestions?.messageId || "",
+              buttons: latestSuggestions?.buttons,
             });
-            const text = buildSuggestedAgentsText(activeProjectId, suggestions);
+            const continueButtonLabel = suggestions.includes("continue") ? await determineContinueButtonLabel(client, activeProjectId) : undefined;
+            const text = buildSuggestedAgentsText(activeProjectId, suggestions, "", continueButtonLabel, latestSuggestions?.buttons);
             return {
               content: [{ type: "text", text }],
               details: { status: "paused_for_review", suggestions },
-              presentation: buildSuggestedAgentsPresentation(activeProjectId, suggestions),
+              presentation: buildSuggestedAgentsPresentation(activeProjectId, suggestions, "", continueButtonLabel, latestSuggestions?.buttons),
             };
           }
 
@@ -297,6 +391,23 @@ export function createContinueProjectTool(deps: {
         }
 
         if (!hasContinueSuggestion) {
+          const recentLogs = await client.getAgentLogs(activeProjectId).catch(() => []);
+          reattachRunningLog = findLatestRunningDesignLog(recentLogs);
+          if (reattachRunningLog) {
+            log.info("continue_project reattaching to running design job", {
+              projectId: activeProjectId,
+              source: "continue_project_tool",
+              suggestions: suggestedAgents,
+              action: reattachRunningLog.action,
+              agentType: reattachRunningLog.agent_type,
+              summary: reattachRunningLog.summary,
+              messageId: reattachRunningLog.message_id,
+              createdAt: reattachRunningLog.created_at,
+            });
+          }
+        }
+
+        if (!hasContinueSuggestion && !reattachRunningLog) {
           log.info("continue_project blocked without continue suggestion", {
             projectId: activeProjectId,
             source: "continue_project_tool",
@@ -309,17 +420,27 @@ export function createContinueProjectTool(deps: {
           });
         }
 
-        await writeLatestSuggestions(stateDir, sessionId, {
-          projectId: activeProjectId,
-          agents: [],
-          messageId: latestSuggestions?.messageId ?? "",
-        });
-        log.info("continue_project consuming continue suggestion", {
-          projectId: activeProjectId,
-          source: "continue_project_tool",
-          messageId: latestSuggestions?.messageId ?? "",
-        });
-        await client.resumeDesign(activeProjectId);
+        if (hasContinueSuggestion) {
+          await writeLatestSuggestions(stateDir, sessionId, {
+            projectId: activeProjectId,
+            agents: [],
+            messageId: latestSuggestions?.messageId ?? "",
+          });
+          log.info("continue_project consuming continue suggestion", {
+            projectId: activeProjectId,
+            source: "continue_project_tool",
+            messageId: latestSuggestions?.messageId ?? "",
+          });
+          await client.resumeDesign(activeProjectId);
+        } else {
+          log.info("continue_project continuing already-running design job without resume call", {
+            projectId: activeProjectId,
+            source: "continue_project_tool",
+            action: reattachRunningLog?.action,
+            agentType: reattachRunningLog?.agent_type,
+            summary: reattachRunningLog?.summary,
+          });
+        }
 
         const logs: string[] = [];
         
@@ -328,73 +449,173 @@ export function createContinueProjectTool(deps: {
         let lastProjectEvent: Record<string, unknown> | null = null;
         let sawStartBuildingReviewMessage = false;
         let rawEventCount = 0;
-        await client.streamProjectEvents(activeProjectId, {
-          onRaw: (raw) => {
-            rawEventCount++;
-            try {
-              lastProjectEvent = JSON.parse(raw) as Record<string, unknown>;
-              const matchesStartBuildingReviewMessage = isReviewArchitectureStartBuildingChatMessage(lastProjectEvent);
-              log.info("continue_project /events raw event for regex", {
+        let streamError: string | null = null;
+        const suggestedAgentsFromEvents: string[] = [];
+        let suggestedAgentsMessageId = "";
+        let suggestedAgentsButtons: any[] | undefined = undefined;
+
+        try {
+          await client.streamProjectEvents(activeProjectId, {
+            onRaw: (raw) => {
+              rawEventCount++;
+              try {
+                lastProjectEvent = JSON.parse(raw) as Record<string, unknown>;
+                
+                if (lastProjectEvent.type === "error") {
+                  streamError = String(lastProjectEvent.message || lastProjectEvent.content || JSON.stringify(lastProjectEvent));
+                }
+
+                const agents = lastProjectEvent.agents || lastProjectEvent.suggested_agents || lastProjectEvent.suggestedAgents || lastProjectEvent.pending_suggested_agents;
+                if (agents) {
+                  let agentList: string[] = [];
+                  if (Array.isArray(agents)) agentList = agents;
+                  else if (typeof agents === "object" && agents !== null) {
+                    for (const [key, value] of Object.entries(agents)) {
+                      if (typeof value === "string") agentList.push(value);
+                      else if (value === true) agentList.push(key);
+                    }
+                  }
+                  if (agentList.length > 0) {
+                    for (const a of agentList) {
+                      if (!suggestedAgentsFromEvents.includes(a)) {
+                        suggestedAgentsFromEvents.push(a);
+                      }
+                    }
+                    if (lastProjectEvent.message_id || lastProjectEvent.messageId) {
+                      suggestedAgentsMessageId = String(lastProjectEvent.message_id || lastProjectEvent.messageId);
+                    }
+                  }
+                }
+
+                const buttons = lastProjectEvent.buttons || lastProjectEvent.pending_suggested_buttons || lastProjectEvent.suggested_buttons;
+                if (buttons && Array.isArray(buttons)) {
+                  suggestedAgentsButtons = buttons;
+                }
+
+                const matchesStartBuildingReviewMessage = isReviewArchitectureStartBuildingChatMessage(lastProjectEvent);
+                log.info("continue_project /events raw event for regex", {
+                  projectId: activeProjectId,
+                  source: "continue_project_tool",
+                  eventIndex: rawEventCount,
+                  raw,
+                  type: lastProjectEvent.type,
+                  status: lastProjectEvent.status,
+                  action: lastProjectEvent.action,
+                  content: lastProjectEvent.content,
+                  message: lastProjectEvent.message,
+                  summary: lastProjectEvent.summary,
+                  matchesStartBuildingReviewMessage,
+                });
+                if (matchesStartBuildingReviewMessage) {
+                  sawStartBuildingReviewMessage = true;
+                }
+              } catch (err) {
+                log.info("continue_project /events raw parse failed for regex", {
+                  projectId: activeProjectId,
+                  source: "continue_project_tool",
+                  eventIndex: rawEventCount,
+                  raw,
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
+            },
+            onAgentLog: (agentLog) => {
+              logCount++;
+              const entry = `[${agentLog.agent_type}] ${agentLog.summary}`;
+              logs.push(entry);
+              log.info("continue_project event agent_log", {
                 projectId: activeProjectId,
-                source: "continue_project_tool",
-                eventIndex: rawEventCount,
-                raw,
-                type: lastProjectEvent.type,
-                status: lastProjectEvent.status,
-                action: lastProjectEvent.action,
-                content: lastProjectEvent.content,
-                message: lastProjectEvent.message,
-                summary: lastProjectEvent.summary,
-                matchesStartBuildingReviewMessage,
+                action: agentLog.action,
+                agentType: agentLog.agent_type,
+                summary: agentLog.summary,
               });
-              if (matchesStartBuildingReviewMessage) {
+              if (agentLog.action === "failed" || agentLog.action === "error") {
+                streamError = `Agent ${agentLog.agent_type} failed: ${agentLog.summary}`;
+              }
+            },
+            onChatMessage: (msg) => {
+              logCount++;
+              if (isPauseForReviewText(msg.content)) {
+                pausedForReview = true;
+              }
+              const entry = `[System] ${msg.content}`;
+              logs.push(entry);
+              log.info("continue_project event chat_message", {
+                projectId: activeProjectId,
+                isPauseForReview: isPauseForReviewText(msg.content),
+              });
+              if (isReviewArchitectureStartBuildingChatMessage(msg)) {
                 sawStartBuildingReviewMessage = true;
               }
-            } catch (err) {
-              log.info("continue_project /events raw parse failed for regex", {
-                projectId: activeProjectId,
-                source: "continue_project_tool",
-                eventIndex: rawEventCount,
-                raw,
-                error: err instanceof Error ? err.message : String(err),
-              });
-            }
-          },
-          onAgentLog: (log) => {
-            logCount++;
-            const entry = `[${log.agent_type}] ${log.summary}`;
-            logs.push(entry);
-            log.info("continue_project event agent_log", {
-              projectId: activeProjectId,
-              action: log.action,
-              agentType: log.agent_type,
-              summary: log.summary,
-            });
-          },
-          onChatMessage: (msg) => {
-            logCount++;
-            if (isPauseForReviewText(msg.content)) {
-              pausedForReview = true;
-            }
-            const entry = `[System] ${msg.content}`;
-            logs.push(entry);
-            log.info("continue_project event chat_message", {
-              projectId: activeProjectId,
-              isPauseForReview: isPauseForReviewText(msg.content),
-            });
-            if (isReviewArchitectureStartBuildingChatMessage(msg)) {
-              sawStartBuildingReviewMessage = true;
-            }
-          },
-          onPlanningComplete: (data) => {
-            if (data.status === "paused_for_review") {
-              pausedForReview = true;
-            }
-          },
-          idleTimeoutMs: 60_000,
-          progressTimeoutMs: 45_000,
-          maxTimeoutMs: 180_000,
-        });
+              if (msg.status === "paused_for_review") {
+                pausedForReview = true;
+              }
+              const agents = msg.agents || msg.suggested_agents || msg.suggestedAgents || msg.pending_suggested_agents;
+              if (agents) {
+                let agentList: string[] = [];
+                if (Array.isArray(agents)) agentList = agents;
+                else if (typeof agents === "object" && agents !== null) {
+                  for (const [key, value] of Object.entries(agents)) {
+                    if (typeof value === "string") agentList.push(value);
+                    else if (value === true) agentList.push(key);
+                  }
+                }
+                if (agentList.length > 0) {
+                  for (const a of agentList) {
+                    if (!suggestedAgentsFromEvents.includes(a)) {
+                      suggestedAgentsFromEvents.push(a);
+                    }
+                  }
+                  if (msg.message_id || msg.messageId) {
+                    suggestedAgentsMessageId = String(msg.message_id || msg.messageId);
+                  }
+                }
+              }
+              const buttons = msg.buttons || msg.pending_suggested_buttons || msg.suggested_buttons;
+              if (buttons && Array.isArray(buttons)) {
+                suggestedAgentsButtons = buttons;
+              }
+            },
+            onPlanningComplete: (data) => {
+              if (data.status === "paused_for_review") {
+                pausedForReview = true;
+              }
+            },
+            idleTimeoutMs: 120_000,
+            progressTimeoutMs: 400_000,
+            maxTimeoutMs: 480_000,
+            signal: toolAbortController.signal,
+          });
+        } catch (err) {
+          log.info("continue_project event stream failed; continuing with project polling", {
+            projectId: activeProjectId,
+            error: err instanceof Error ? err.message : String(err),
+            aborted: toolAbortController.signal.aborted,
+          });
+        }
+
+        if (toolAbortController.signal.aborted) {
+          if (_signal?.aborted) {
+            return {
+              content: [{ type: "text", text: "Operation aborted by client." }],
+              details: { status: "aborted", projectId: activeProjectId }
+            };
+          }
+          await writeLatestSuggestions(stateDir, sessionId, {
+            projectId: activeProjectId,
+            agents: [],
+            messageId: suggestedAgentsMessageId || latestSuggestions?.messageId || "",
+          });
+          return silentToolResult({
+            status: "running",
+            suggestions: [],
+            projectId: activeProjectId,
+          });
+        }
+
+        if (streamError) {
+          throw new Error(streamError);
+        }
 
         // If we got no logs after a while, or the stream closed, proceed to fetch results
         if (logCount === 0) {
@@ -461,13 +682,37 @@ export function createContinueProjectTool(deps: {
         if (pausedForReview) {
           const statusAfterPause = await client.getProjectStatus(activeProjectId).catch(() => null);
           const pendingAfterPause = extractPendingSuggestion(statusAfterPause?.pending_suggested_agents);
-          const backendSuggestions = pendingAfterPause.agents.filter((agent) => agent === "continue" || agent === "review");
-          const hasBackendContinue = backendSuggestions.includes("continue");
+          
+          let rawSuggestions = suggestedAgentsFromEvents.length > 0
+            ? suggestedAgentsFromEvents
+            : pendingAfterPause.agents;
+            
+          let rawButtons = suggestedAgentsButtons !== undefined
+            ? suggestedAgentsButtons
+            : pendingAfterPause.buttons;
+
+          let rawMessageId = suggestedAgentsMessageId || pendingAfterPause.messageId || latestSuggestions?.messageId || "";
+
+          const backendSuggestions = rawSuggestions.filter((agent) =>
+            agent === "continue" ||
+            agent === "review" ||
+            agent === "generate_first_page" ||
+            agent === "generate_all_pages" ||
+            agent === "generate_architecture" ||
+            agent === "start_building"
+          );
+          const hasBackendContinue = backendSuggestions.some((agent) =>
+            agent === "continue" ||
+            agent === "generate_first_page" ||
+            agent === "generate_all_pages" ||
+            agent === "generate_architecture" ||
+            agent === "start_building"
+          );
           const suggestions = hasBackendContinue ? backendSuggestions : ["continue", "review"];
           const hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(activeProjectId);
           log.info("continue_project paused_for_review backend suggestion gate", {
             projectId: activeProjectId,
-            pendingSuggestions: pendingAfterPause.agents,
+            pendingSuggestions: rawSuggestions,
             backendSuggestions,
             filteredSuggestions: suggestions,
             hasBackendContinue,
@@ -480,10 +725,12 @@ export function createContinueProjectTool(deps: {
             await writeLatestSuggestions(stateDir, sessionId, {
               projectId: activeProjectId,
               agents: suggestions,
-              messageId: pendingAfterPause.messageId || latestSuggestions?.messageId || "",
+              messageId: rawMessageId,
+              buttons: rawButtons,
             });
-            const finalResult = buildSuggestedAgentsText(activeProjectId, suggestions);
-            const presentation = buildSuggestedAgentsPresentation(activeProjectId, suggestions);
+            const continueButtonLabel = suggestions.includes("continue") ? await determineContinueButtonLabel(client, activeProjectId) : undefined;
+            const finalResult = buildSuggestedAgentsText(activeProjectId, suggestions, "", continueButtonLabel, rawButtons);
+            const presentation = buildSuggestedAgentsPresentation(activeProjectId, suggestions, "", continueButtonLabel, rawButtons);
             onUpdate?.({ content: [{ type: "text", text: finalResult }] });
             return {
               content: [{ type: "text", text: finalResult }],
@@ -529,11 +776,13 @@ export function createContinueProjectTool(deps: {
               projectId: activeProjectId,
               agents: suggestions,
               messageId: pendingAfterReadiness.messageId || latestSuggestions?.messageId || "",
+              buttons: pendingAfterReadiness.buttons,
             });
+            const continueButtonLabel = suggestions.includes("continue") ? await determineContinueButtonLabel(client, activeProjectId) : undefined;
             const finalResult =
               "8080.ai has generated the design, tasks, and architecture, but the final review/start-building event has not appeared in `/events` yet.\n\n" +
-              buildSuggestedAgentsText(activeProjectId, suggestions);
-            const presentation = buildSuggestedAgentsPresentation(activeProjectId, suggestions);
+              buildSuggestedAgentsText(activeProjectId, suggestions, "", continueButtonLabel, pendingAfterReadiness.buttons);
+            const presentation = buildSuggestedAgentsPresentation(activeProjectId, suggestions, "", continueButtonLabel, pendingAfterReadiness.buttons);
             onUpdate?.({ content: [{ type: "text", text: finalResult }] });
             return {
               content: [{ type: "text", text: finalResult }],
@@ -622,14 +871,16 @@ export function createContinueProjectTool(deps: {
               projectId: activeProjectId,
               agents: suggestions,
               messageId: latestSuggestions?.messageId ?? "",
+              buttons: pendingAfterReadiness.buttons,
             });
           }
+          const continueButtonLabel = suggestions.includes("continue") ? await determineContinueButtonLabel(client, activeProjectId) : undefined;
           const finalResult =
             `✅ **Generation complete!**${logsText}\n\n` +
             (canShowStartBuilding
-              ? `Review the design and architecture and start building.\n\n${buildSuggestedAgentsText(activeProjectId, suggestions)}`
+              ? `Review the design and architecture and start building.\n\n${buildSuggestedAgentsText(activeProjectId, suggestions, "", continueButtonLabel, pendingAfterReadiness.buttons)}`
               : canBuildForPlan
-                ? `The design, tasks, and architecture are available.${suggestions.length > 0 ? `\n\n${buildSuggestedAgentsText(activeProjectId, suggestions)}` : ""}`
+                ? `The design, tasks, and architecture are available.${suggestions.length > 0 ? `\n\n${buildSuggestedAgentsText(activeProjectId, suggestions, "", continueButtonLabel, pendingAfterReadiness.buttons)}` : ""}`
                 : getUpgradeToBuildText());
           onUpdate?.({ content: [{ type: "text", text: finalResult }] });
           return {
@@ -639,65 +890,139 @@ export function createContinueProjectTool(deps: {
               suggestions,
             },
             presentation: suggestions.length > 0
-              ? buildSuggestedAgentsPresentation(activeProjectId, suggestions)
+              ? buildSuggestedAgentsPresentation(activeProjectId, suggestions, "", continueButtonLabel, pendingAfterReadiness.buttons)
               : undefined,
           };
         } else {
-          const statusAfter = await client.getProjectStatus(activeProjectId).catch(() => null);
-          const pending = extractPendingSuggestion(statusAfter?.pending_suggested_agents);
-          const backendSuggestions = pending.agents.filter((agent) => agent === "continue" || agent === "review");
-          const hasBackendContinue = backendSuggestions.includes("continue");
-          const hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(activeProjectId);
-          const canShowReviewActions =
-            (hasBackendContinue && (hasLatestCompletedAgentLog || pausedForReview || eventEndedAtReviewCheckpoint)) ||
-            (hasDesignPages && hasLatestCompletedAgentLog) ||
-            designPagesReady;
-          const suggestions = canShowReviewActions
-            ? (backendSuggestions.length > 0 ? backendSuggestions : ["continue", "review"])
-            : [];
-          log.info("continue_project backend suggestion gate", {
-            projectId: activeProjectId,
-            source: "continue_project_tool",
-            pendingSuggestions: pending.agents,
-            backendSuggestions,
-            messageId: pending.messageId,
-            hasBackendContinue,
-            hasLatestCompletedAgentLog,
-            pausedForReview,
-            eventEndedAtReviewCheckpoint,
-            canShowReviewActions,
-            hasTasks,
-            hasArchitecture,
-            hasDesignPages,
-            designPagesReady,
-            designPagesSummary: summarizeDesignPages(designPages),
-            lastEventType: lastProjectEvent?.type,
-            eventEndedWithStartBuildingMessage,
-            reason: hasBackendContinue
-              ? "backend_pending_suggested_agents_contains_continue"
-              : hasDesignPages && hasLatestCompletedAgentLog
-                ? "design_pages_generated_and_latest_agent_log_completed"
-              : designPagesReady
-                ? "design_pages_generation_completed"
-              : canShowReviewActions
-                ? "completed_agent_log_or_events_review_checkpoint"
-                : "waiting_for_completed_agent_log_or_events_review_checkpoint",
-          });
+          // Poll for design completion if the SSE stream ends before the
+          // backend exposes the next action. Keep waiting until 8080.ai is ready
+          // or the user/client cancels the tool call.
+          const POLL_INTERVAL_MS = 10_000;
+          let pollAttempt = 0;
+          let canShowReviewActions = false;
+          let backendSuggestions: string[] = [];
+          let pending = extractPendingSuggestion(null);
+          let hasBackendContinue = false;
+          let hasLatestCompletedAgentLog = false;
+          let latestDesignPagesReady = designPagesReady;
+          let latestHasDesignPages = hasGeneratedData(designPages);
+
+          while (!toolAbortController.signal.aborted) {
+            if (toolAbortController.signal.aborted) {
+              break;
+            }
+            const statusAfter = await client.getProjectStatus(activeProjectId).catch(() => null);
+            
+            // Check for failed agent logs or error status
+            const logsList = await client.getAgentLogs(activeProjectId).catch(() => []);
+            const failedLog = logsList.find(l => l.action === "failed" || l.action === "error" || (typeof l.summary === "string" && /failed|error/i.test(l.summary)));
+            if (failedLog) {
+              throw new Error(`Agent ${failedLog.agent_type} failed: ${failedLog.summary}`);
+            }
+            if (statusAfter?.error) {
+              throw new Error(statusAfter.error);
+            }
+
+            pending = extractPendingSuggestion(statusAfter?.pending_suggested_agents);
+            
+            let rawSuggestions = suggestedAgentsFromEvents.length > 0
+              ? suggestedAgentsFromEvents
+              : pending.agents;
+
+            backendSuggestions = rawSuggestions.filter((agent) =>
+              agent === "continue" ||
+              agent === "review" ||
+              agent === "generate_first_page" ||
+              agent === "generate_all_pages" ||
+              agent === "generate_architecture" ||
+              agent === "start_building"
+            );
+            hasBackendContinue = backendSuggestions.some((agent) =>
+              agent === "continue" ||
+              agent === "generate_first_page" ||
+              agent === "generate_all_pages" ||
+              agent === "generate_architecture" ||
+              agent === "start_building"
+            );
+            hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(activeProjectId);
+
+            // Re-check design pages in case they finished since the SSE stream ended
+            if (!latestDesignPagesReady) {
+              const freshDesignPages = await client.getDesignPages(activeProjectId).catch(() => null);
+              latestDesignPagesReady = hasCompletedDesignPages(freshDesignPages);
+              latestHasDesignPages = hasGeneratedData(freshDesignPages);
+            }
+
+            canShowReviewActions =
+              (hasBackendContinue && (hasLatestCompletedAgentLog || pausedForReview || eventEndedAtReviewCheckpoint)) ||
+              (latestHasDesignPages && hasLatestCompletedAgentLog) ||
+              latestDesignPagesReady;
+
+            log.info("continue_project backend suggestion gate", {
+              projectId: activeProjectId,
+              source: "continue_project_tool",
+              pollAttempt,
+              pendingSuggestions: rawSuggestions,
+              backendSuggestions,
+              messageId: pending.messageId,
+              hasBackendContinue,
+              hasLatestCompletedAgentLog,
+              pausedForReview,
+              eventEndedAtReviewCheckpoint,
+              canShowReviewActions,
+              hasTasks,
+              hasArchitecture,
+              hasDesignPages: latestHasDesignPages,
+              designPagesReady: latestDesignPagesReady,
+              lastEventType: lastProjectEvent?.type,
+              eventEndedWithStartBuildingMessage,
+              reason: hasBackendContinue
+                ? "backend_pending_suggested_agents_contains_continue"
+                : latestHasDesignPages && hasLatestCompletedAgentLog
+                  ? "design_pages_generated_and_latest_agent_log_completed"
+                : latestDesignPagesReady
+                  ? "design_pages_generation_completed"
+                : canShowReviewActions
+                  ? "completed_agent_log_or_events_review_checkpoint"
+                  : "waiting_for_completed_agent_log_or_events_review_checkpoint",
+            });
+
+            if (canShowReviewActions) break;
+
+            pollAttempt++;
+            log.info("continue_project polling for design completion", {
+              projectId: activeProjectId,
+              pollAttempt,
+              nextPollInMs: POLL_INTERVAL_MS,
+            });
+            await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+          }
+
+          if (toolAbortController.signal.aborted) {
+            return {
+              content: [{ type: "text", text: "Operation aborted by client." }],
+              details: { status: "aborted", projectId: activeProjectId }
+            };
+          }
+
+          const suggestions = backendSuggestions.length > 0 ? backendSuggestions : ["continue", "review"];
+            
+          let finalButtons = suggestedAgentsButtons !== undefined
+            ? suggestedAgentsButtons
+            : pending.buttons;
+
+          let finalMessageId = suggestedAgentsMessageId || pending.messageId || latestSuggestions?.messageId || "";
+
           await writeLatestSuggestions(stateDir, sessionId, {
             projectId: activeProjectId,
             agents: suggestions,
-            messageId: pending.messageId || latestSuggestions?.messageId || "",
+            messageId: finalMessageId,
+            buttons: finalButtons,
           });
-          if (!canShowReviewActions) {
-            return silentToolResult({
-              status: "running",
-              suggestions,
-              projectId: activeProjectId,
-            });
-          }
-          const finalResult = buildSuggestedAgentsText(activeProjectId, suggestions);
+          const continueButtonLabel = suggestions.includes("continue") ? await determineContinueButtonLabel(client, activeProjectId) : undefined;
+          const finalResult = buildSuggestedAgentsText(activeProjectId, suggestions, "", continueButtonLabel, finalButtons);
           const presentation = canShowReviewActions
-            ? buildSuggestedAgentsPresentation(activeProjectId, suggestions)
+            ? buildSuggestedAgentsPresentation(activeProjectId, suggestions, "", continueButtonLabel, finalButtons)
             : undefined;
           onUpdate?.({ content: [{ type: "text", text: finalResult }], details: null, presentation });
           return {
@@ -717,6 +1042,7 @@ export function createContinueProjectTool(deps: {
               projectId: activeProjectId,
               agents: suggestions,
               messageId: latestSuggestions?.messageId ?? "",
+              buttons: latestSuggestions?.buttons,
             });
             const text =
               `${(err as Error).message}\n\n` +
@@ -727,7 +1053,7 @@ export function createContinueProjectTool(deps: {
                 status: "auth_expired",
                 suggestions,
               },
-              presentation: buildSuggestedAgentsPresentation(activeProjectId, suggestions),
+              presentation: buildSuggestedAgentsPresentation(activeProjectId, suggestions, "", false, latestSuggestions?.buttons),
             };
           }
           return { content: [{ type: "text", text: (err as Error).message }] };
@@ -744,50 +1070,34 @@ function previewLogText(value: unknown, maxLength = 240): string | undefined {
   return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
 }
 
-function getDesignPageRecords(data: unknown): Record<string, unknown>[] {
-  if (Array.isArray(data)) {
-    return data.filter((page): page is Record<string, unknown> => Boolean(page) && typeof page === "object");
-  }
-  if (!data || typeof data !== "object") return [];
+type BasicAgentLog = {
+  action?: string | null;
+  agent_type?: string | null;
+  summary?: string | null;
+  message_id?: string | null;
+  created_at?: string | null;
+};
 
-  for (const value of Object.values(data as Record<string, unknown>)) {
-    if (!Array.isArray(value)) continue;
-    const pages = value.filter((page): page is Record<string, unknown> => Boolean(page) && typeof page === "object");
-    if (pages.length > 0) return pages;
-  }
+function findLatestRunningDesignLog(logs: BasicAgentLog[]): BasicAgentLog | undefined {
+  return [...logs]
+    .sort((a, b) => new Date(b.created_at ?? 0).getTime() - new Date(a.created_at ?? 0).getTime())
+    .find((entry) => {
+      const action = String(entry.action ?? "").toLowerCase();
+      if (action !== "started" && action !== "running") return false;
 
-  return [];
-}
+      const agentType = String(entry.agent_type ?? "").toLowerCase();
+      const summary = String(entry.summary ?? "").toLowerCase();
+      const messageId = String(entry.message_id ?? "").toLowerCase();
+      const text = `${agentType} ${summary}`;
 
-function hasCompletedDesignPages(data: unknown): boolean {
-  const pages = getDesignPageRecords(data);
-  if (pages.length === 0) return false;
-
-  return pages.every((page) => {
-    if (page.generation_failed === true || page.credit_blocked === true) return false;
-
-    const sectionsDone = typeof page.sections_done === "number" ? page.sections_done : undefined;
-    const sectionsTotal = typeof page.sections_total === "number" ? page.sections_total : undefined;
-    const phase = typeof page.generation_phase === "string" ? page.generation_phase.toLowerCase() : "";
-    const isReviewPhase = ["review", "reviewing"].some((token) => phase.includes(token));
-    const hasRenderableOutput = Boolean(
-      page.compiled_html || page.jsx_content || page.screenshot_url || page.screenshot_thumb_url
-    );
-
-    if (sectionsTotal !== undefined && sectionsTotal > 0) {
-      const sectionsComplete = sectionsDone !== undefined && sectionsDone >= sectionsTotal;
-      if (sectionsComplete && isReviewPhase && hasRenderableOutput) return true;
-      if (page.generation_in_progress === true) return false;
-      return sectionsComplete;
-    }
-
-    if (page.generation_in_progress === true && !(isReviewPhase && hasRenderableOutput)) return false;
-    if (phase && !["complete", "completed", "done", "screenshot", "review"].some((token) => phase.includes(token))) {
-      return false;
-    }
-
-    return hasRenderableOutput;
-  });
+      return (
+        messageId === "resume-design" ||
+        agentType.includes("design") ||
+        text.includes("designing") ||
+        text.includes("starting design") ||
+        text.includes("resuming pipeline")
+      );
+    });
 }
 
 function summarizeDesignPages(data: unknown) {

@@ -1,5 +1,9 @@
 import { Type } from "@sinclair/typebox";
-import { requireAuthenticatedClient, AuthError } from "./api-client.ts";
+import { requireAuthenticatedClient, AuthError, checkGenerateFirstPageCondition, determineContinueButtonLabel, getDesignPageRecords, hasCompletedDesignPages } from "./api-client.ts";
+import { extractPendingSuggestion } from "./suggested-agents.ts";
+import { writeLatestSuggestions } from "./suggestions-state.ts";
+import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
+import { log } from "../logger.ts";
 
 export function createProjectStatusTool(deps: {
   stateDir: () => string;
@@ -89,7 +93,53 @@ export function createProjectStatusTool(deps: {
           }
         }
 
-        return { content: [{ type: "text", text: lines.join("\n") }] };
+        const pending = extractPendingSuggestion(status.pending_suggested_agents);
+        let agents = pending.agents;
+        let presentation: unknown;
+
+        if (agents.length === 0) {
+          try {
+            const [designPages, hasLatestCompletedAgentLog] = await Promise.all([
+              client.getDesignPages(projectId).catch(() => null),
+              client.hasLatestCompletedAgentLog(projectId).catch(() => false),
+            ]);
+            const designPagesReady = hasCompletedDesignPages(designPages);
+            const hasDesignPages = getDesignPageRecords(designPages).length > 0;
+            const canShowReviewActions = (hasDesignPages && hasLatestCompletedAgentLog) || designPagesReady;
+            if (canShowReviewActions) {
+              agents = ["continue", "review"];
+              log.info("project_status recovered suggestions from design completion state", {
+                projectId,
+                agents,
+                hasLatestCompletedAgentLog,
+                designPagesReady,
+              });
+            }
+          } catch (err) {
+            log.info("project_status failed to recover suggestions", err);
+          }
+        }
+
+        if (agents && agents.length > 0) {
+          await writeLatestSuggestions(stateDir, sessionId, {
+            projectId,
+            agents,
+            messageId: pending.messageId,
+            buttons: pending.buttons,
+          });
+
+          const continueButtonLabel = agents.includes("continue") ? await determineContinueButtonLabel(client, projectId) : undefined;
+          const suggestionText = buildSuggestedAgentsText(projectId, agents, "", continueButtonLabel, pending.buttons);
+          lines.push("");
+          lines.push(suggestionText);
+
+          presentation = buildSuggestedAgentsPresentation(projectId, agents, "", continueButtonLabel, pending.buttons);
+        }
+
+        return {
+          content: [{ type: "text", text: lines.join("\n") }],
+          presentation,
+        };
       } catch (err) {
         if (err instanceof AuthError) {
           return { content: [{ type: "text", text: (err as Error).message }] };

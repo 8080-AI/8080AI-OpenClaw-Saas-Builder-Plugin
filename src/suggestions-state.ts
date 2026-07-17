@@ -6,6 +6,7 @@ export type ProjectSuggestions = {
   projectId: string;
   messageId: string;
   agents: string[];
+  buttons?: any[];
 };
 
 /**

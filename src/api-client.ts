@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------------------
 import { createParser } from "eventsource-parser";
 import { ApiKeyExpiredError, readApiKey } from "./api-key.ts";
+import { extractEventSuggestion, type PendingSuggestion } from "./suggested-agents.ts";
 import { log } from "../logger.ts";
 
 export function isStartBuildingAgent(agent: string): boolean {
@@ -112,11 +113,167 @@ function summarizeAgentLogs(logs: AgentLog[], limit = 5) {
     }));
 }
 
-function isCompletedAgentLog(entry: AgentLog | undefined): boolean {
+export function isCompletedAgentLog(entry: AgentLog | undefined): boolean {
   if (!entry) return false;
   if (entry.action === "completed") return true;
   if (typeof entry.summary !== "string") return false;
   return /^completed\b/i.test(entry.summary.trim());
+}
+
+function isDesignAgentLog(entry: AgentLog): boolean {
+  return entry.agent_type === "Design Agent" || entry.agent_type === "Design" || entry.agent_type === "Page Designer";
+}
+
+function inferExpectedDesignPageCount(logs: AgentLog[]): number | undefined {
+  let expected: number | undefined;
+
+  for (const log of logs) {
+    if (!isDesignAgentLog(log) || typeof log.summary !== "string") continue;
+    const summary = log.summary;
+    const foundMatch = summary.match(/\bfound\s+(\d+)\s+pages?\b/i);
+    const processingMatch = summary.match(/\bprocessing\s+(\d+)\s+pages?\b/i);
+    const progressMatch = summary.match(/\b\d+\s*\/\s*(\d+)\b/);
+    const rawCount = foundMatch?.[1] ?? processingMatch?.[1] ?? progressMatch?.[1];
+    const count = rawCount ? Number.parseInt(rawCount, 10) : NaN;
+    if (Number.isFinite(count) && count > 0) {
+      expected = Math.max(expected ?? 0, count);
+    }
+  }
+
+  return expected;
+}
+
+export function getDesignPageRecords(data: unknown): Record<string, unknown>[] {
+  if (Array.isArray(data)) {
+    return data.filter((page): page is Record<string, unknown> => Boolean(page) && typeof page === "object");
+  }
+  if (!data || typeof data !== "object") return [];
+
+  for (const value of Object.values(data as Record<string, unknown>)) {
+    if (!Array.isArray(value)) continue;
+    const pages = value.filter((page): page is Record<string, unknown> => Boolean(page) && typeof page === "object");
+    if (pages.length > 0) return pages;
+  }
+
+  return [];
+}
+
+function isCompletedDesignPageRecord(page: Record<string, unknown>): boolean {
+  if (page.generation_failed === true || page.credit_blocked === true) return false;
+
+  const sectionsDone = typeof page.sections_done === "number" ? page.sections_done : undefined;
+  const sectionsTotal = typeof page.sections_total === "number" ? page.sections_total : undefined;
+  const phase = typeof page.generation_phase === "string" ? page.generation_phase.toLowerCase() : "";
+  const isReviewPhase = ["review", "reviewing"].some((token) => phase.includes(token));
+  const hasRenderableOutput = Boolean(
+    page.compiled_html || page.jsx_content || page.screenshot_url || page.screenshot_thumb_url
+  );
+
+  if (sectionsTotal !== undefined && sectionsTotal > 0) {
+    const sectionsComplete = sectionsDone !== undefined && sectionsDone >= sectionsTotal;
+    if (sectionsComplete && isReviewPhase && hasRenderableOutput) return true;
+    if (page.generation_in_progress === true) return false;
+    return sectionsComplete;
+  }
+
+  if (page.generation_in_progress === true && !(isReviewPhase && hasRenderableOutput)) return false;
+  if (phase && !["complete", "completed", "done", "screenshot", "review"].some((token) => phase.includes(token))) {
+    return false;
+  }
+
+  return hasRenderableOutput;
+}
+
+export function hasCompletedDesignPages(data: unknown): boolean {
+  const pages = getDesignPageRecords(data);
+  if (pages.length === 0) return false;
+
+  return pages.every(isCompletedDesignPageRecord);
+}
+
+export async function determineContinueButtonLabel(
+  client: {
+    getAgentLogs(projectId: string): Promise<AgentLog[]>;
+    getDesignPages?(projectId: string): Promise<unknown>;
+  },
+  projectId: string
+): Promise<string> {
+  try {
+    const logs = await client.getAgentLogs(projectId).catch(() => []);
+    let pages: Record<string, unknown>[] = [];
+    let anyDesignPageCompleted = false;
+    let allKnownDesignPagesCompleted = false;
+
+    if (typeof client.getDesignPages === "function") {
+      const designPages = await client.getDesignPages(projectId).catch(() => null);
+      pages = getDesignPageRecords(designPages);
+      anyDesignPageCompleted = pages.some(isCompletedDesignPageRecord);
+      allKnownDesignPagesCompleted = pages.length > 0 && pages.every(isCompletedDesignPageRecord);
+    }
+
+    if (!Array.isArray(logs) || logs.length === 0) {
+      return anyDesignPageCompleted ? "Generate All Pages" : "Continue";
+    }
+
+    const designAgentCompleted = logs.some((log) => {
+      return isDesignAgentLog(log) && isCompletedAgentLog(log);
+    });
+    const expectedDesignPageCount = inferExpectedDesignPageCount(logs);
+    const allExpectedDesignPagesCompleted = allKnownDesignPagesCompleted &&
+      (!expectedDesignPageCount || pages.length >= expectedDesignPageCount);
+
+    if (designAgentCompleted) {
+      if (allExpectedDesignPagesCompleted) {
+        return "Generate Architecture";
+      } else {
+        return "Generate All Pages";
+      }
+    }
+
+    if (anyDesignPageCompleted) {
+      return expectedDesignPageCount && allExpectedDesignPagesCompleted
+        ? "Generate Architecture"
+        : "Generate All Pages";
+    }
+
+    const hasDesignStartedOrCompleted = logs.some((log) => {
+      return isDesignAgentLog(log) && (log.action === "started" || isCompletedAgentLog(log));
+    });
+
+    if (hasDesignStartedOrCompleted) {
+      return "Continue";
+    }
+
+    const hasSrdCompleted = logs.some((log) => {
+      const isSrdAgent = log.agent_type === "System Requirements Agent" || log.agent_type === "System Requirements";
+      return isSrdAgent && isCompletedAgentLog(log);
+    });
+
+    const hasUserFlowCompleted = logs.some((log) => {
+      const isUserFlowAgent = log.agent_type === "User Flow Planner Agent" || log.agent_type === "User Flow Planner";
+      return isUserFlowAgent && isCompletedAgentLog(log);
+    });
+
+    if (hasSrdCompleted && hasUserFlowCompleted) {
+      return "Generate First Page";
+    }
+
+    return "Continue";
+  } catch {
+    return "Continue";
+  }
+}
+
+
+export async function checkGenerateFirstPageCondition(
+  client: {
+    getAgentLogs(projectId: string): Promise<AgentLog[]>;
+    getDesignPages?(projectId: string): Promise<unknown>;
+  },
+  projectId: string
+): Promise<boolean> {
+  const label = await determineContinueButtonLabel(client, projectId);
+  return label === "Generate First Page";
 }
 
 function normalizeAiChatModel(model: string | undefined): string | undefined {
@@ -884,13 +1041,23 @@ export function createApiClient(opts: ClientOpts) {
         onSrdChunk?: (chunk: any) => void;
         onAiOverview?: (msg: any) => void;
         onPlanningComplete?: (data: { status: string; triggered_by?: string }) => void;
+        onSuggestedAgents?: (suggestion: PendingSuggestion) => void;
         onRaw?: (raw: string) => void;
         idleTimeoutMs?: number;
         maxTimeoutMs?: number;
         progressTimeoutMs?: number;
+        signal?: AbortSignal;
       }
     ): Promise<void> {
       const controller = new AbortController();
+      let externalAbort = false;
+      if (callbacks.signal) {
+        callbacks.signal.addEventListener("abort", () => {
+          externalAbort = true;
+          log.info("streamProjectEvents received external abort signal", { projectId });
+          controller.abort();
+        });
+      }
       const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/projects/${projectId}/events`;
       log.info("project_events api request", {
         projectId,
@@ -943,6 +1110,11 @@ export function createApiClient(opts: ClientOpts) {
               Boolean(pauseStatus);
             if (isProgressEvent) {
               lastProgressAt = Date.now();
+            }
+            const suggestion = extractEventSuggestion(data);
+            if (suggestion.agents.length > 0) {
+              lastProgressAt = Date.now();
+              callbacks.onSuggestedAgents?.(suggestion);
             }
             if (data.type === "agent_log" && callbacks.onAgentLog) {
               callbacks.onAgentLog(data);
@@ -1029,6 +1201,8 @@ export function createApiClient(opts: ClientOpts) {
           log.info("Stream stopped after max timeout", { projectId });
         } else if (progressTimedOut) {
           log.info("Stream stopped after progress timeout", { projectId });
+        } else if (externalAbort) {
+          log.info("Stream stopped after external abort", { projectId });
         } else {
           log.info("Stream error", err);
         }

@@ -36,16 +36,25 @@ export function exactToolResult(
 }
 
 export function silentToolResult(details: Record<string, unknown> = {}) {
+  const status = details.status;
+  let text = "8080.ai is processing in the background. Please check back in a moment.";
+  if (status === "running" || status === "agents_running") {
+    text = "8080.ai agents are currently running. Please wait a moment for them to finish, and then check the status.";
+  } else if (status === "waiting_for_next_actions" || status === "waiting_for_review_actions") {
+    text = "8080.ai is generating the next steps. Please check back in a moment.";
+  } else if (status === "blocked_without_continue_suggestion") {
+    text = "The project is currently not in a state where it can be continued. Please check the current status on the 8080.ai dashboard.";
+  } else if (status === "empty_response") {
+    text = "Received an empty response from 8080.ai. Please try again or check the status.";
+  }
+
   return {
-    content: [],
+    content: [{ type: "text", text }],
     details: {
       ...details,
-      // The hook reads these flags and blocks the next assistant filler message.
-      responseMode: "silent",
-      silent: true,
-      suppressUserResponse: true,
-      modelInstruction:
-        "Do not send any user-facing message for this tool result. The 8080.ai agents are still running; only show text/buttons when the tool returns visible content.",
-    } satisfies SilentToolDetails,
+      responseMode: "exact",
+      exactUserResponse: text,
+    },
   };
 }
+
