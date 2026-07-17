@@ -211,6 +211,41 @@ test("determineContinueButtonLabel", async (t) => {
     assert.strictEqual(result, "Generate Architecture");
   });
 
+  await t.test("should return 'Continue' if tasks and architecture are already generated", async () => {
+    const mockClient = {
+      getAgentLogs: async () => [
+        {
+          agent_type: "Design Agent",
+          action: "completed",
+          summary: "Finished design",
+          created_at: new Date().toISOString(),
+          message_id: "msg3",
+        },
+      ] as AgentLog[],
+      getDesignPages: async () => [
+        {
+          page_name: "Todo",
+          generation_in_progress: false,
+          sections_done: 3,
+          sections_total: 3,
+          generation_phase: "complete",
+          screenshot_url: "http://screenshot",
+        },
+      ],
+      getTasks: async () => [
+        {
+          title: "Create Task Model",
+          status: "todo",
+        },
+      ],
+      getArchitecture: async () => ({
+        service_network: [{ name: "API" }],
+      }),
+    };
+    const result = await determineContinueButtonLabel(mockClient, "test-project");
+    assert.strictEqual(result, "Continue");
+  });
+
   await t.test("should return 'Generate All Pages' if Design Agent is completed but some design pages are not completed", async () => {
     const mockClient = {
       getAgentLogs: async () => [

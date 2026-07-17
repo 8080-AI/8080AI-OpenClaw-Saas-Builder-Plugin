@@ -95,6 +95,15 @@ function debugResponseSummary(label: string, data: unknown): string {
   return `${label}=${typeof data}`;
 }
 
+function hasGeneratedData(data: unknown): boolean {
+  if (!data) return false;
+  if (Array.isArray(data)) return data.length > 0;
+  if (typeof data === "object") {
+    return Object.values(data).some((value) => Array.isArray(value) && value.length > 0);
+  }
+  return false;
+}
+
 function previewLogText(value: unknown, maxLength = 240): string | undefined {
   if (typeof value !== "string") return undefined;
   return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
@@ -195,11 +204,21 @@ export async function determineContinueButtonLabel(
   client: {
     getAgentLogs(projectId: string): Promise<AgentLog[]>;
     getDesignPages?(projectId: string): Promise<unknown>;
+    getTasks?(projectId: string): Promise<unknown>;
+    getArchitecture?(projectId: string): Promise<unknown>;
   },
   projectId: string
 ): Promise<string> {
   try {
-    const logs = await client.getAgentLogs(projectId).catch(() => []);
+    const [logs, tasks, architecture] = await Promise.all([
+      client.getAgentLogs(projectId).catch(() => []),
+      typeof client.getTasks === "function" ? client.getTasks(projectId).catch(() => null) : Promise.resolve(null),
+      typeof client.getArchitecture === "function" ? client.getArchitecture(projectId).catch(() => null) : Promise.resolve(null),
+    ]);
+    if (hasGeneratedData(tasks) && hasGeneratedData(architecture)) {
+      return "Continue";
+    }
+
     let pages: Record<string, unknown>[] = [];
     let anyDesignPageCompleted = false;
     let allKnownDesignPagesCompleted = false;
