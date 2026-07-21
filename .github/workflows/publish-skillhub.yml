@@ -1,0 +1,61 @@
+# ===========================================================================
+# Publish SkillHub Skill
+# ===========================================================================
+name: Publish to SkillHub
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  publish-skillhub:
+    name: Publish ai8080 SkillHub skill
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate SkillHub skill
+        run: |
+          test -f skillhub/ai8080/SKILL.md
+          test -f skillhub/ai8080/.skillhub.json
+          grep -q "^name:" skillhub/ai8080/SKILL.md
+          grep -q "^description:" skillhub/ai8080/SKILL.md
+          grep -q "openclaw plugins install clawhub:8080ai" skillhub/ai8080/SKILL.md
+
+      - name: Package SkillHub skill
+        run: |
+          mkdir -p skillhub-dist
+          cd skillhub
+          zip -r ../skillhub-dist/ai8080-skill.zip ai8080
+
+      - name: Upload SkillHub package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: skillhub-ai8080
+          path: skillhub-dist/ai8080-skill.zip
+          if-no-files-found: error
+
+      - name: Login to SkillHub
+        run: npx @skill-hub/cli login --token "$SKILLHUB_TOKEN"
+        env:
+          SKILLHUB_TOKEN: ${{ secrets.SKILLHUB_TOKEN }}
+
+      - name: Verify SkillHub authentication
+        run: npx @skill-hub/cli whoami
+
+      - name: Push SkillHub skill
+        working-directory: skillhub/ai8080
+        run: npx @skill-hub/cli push
+
+      - name: Publish SkillHub skill
+        working-directory: skillhub/ai8080
+        run: npx @skill-hub/cli publish
