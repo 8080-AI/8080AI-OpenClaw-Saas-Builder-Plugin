@@ -13,7 +13,8 @@ import {
 import { writeLatestSuggestions, readLatestSuggestions } from "./suggestions-state.ts";
 import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
-import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
+import { formatStartBuildingTasks } from "./task-summary.ts";
+import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
 import { log } from "../logger.ts";
 import { buildProjectActivationResult } from "./project-activation.ts";
@@ -717,47 +718,34 @@ export function create8080Command(
                   text: "Start Building is not available yet. Architecture and tasks must be generated first.",
                 };
               }
-              const [subscription, plans, profile] = await Promise.all([
-                client.getSubscription().catch(() => null),
-                client.getSubscriptionPlans().catch(() => []),
-                client.getProfile().catch(() => null),
-              ]);
-              const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
-              const canBuildForPlan = canUseStartBuilding(subscriptionTier);
-              log.info("start_building selected plan decision", {
-                projectId: suggestions.projectId,
-                subscriptionTier,
-                canBuildForPlan,
-                plansCount: plans.length,
-              });
-              if (!canBuildForPlan) {
+              const creditCheck = await precheckStartBuildingCredits(client, suggestions.projectId, tasksForBuild, activeModel, [], siteUrl);
+              if (!creditCheck.allowed) {
                 return {
-                  text: getUpgradeToBuildText(siteUrl),
+                  text: creditCheck.message ?? "Add Credits",
                 };
               }
-              let taskSummaryText = "";
-              if (canShowStartBuildingTasks(subscriptionTier)) {
-                taskSummaryText = formatStartBuildingTasks(tasksForBuild, suggestions.projectId, siteUrl);
-                log.info("start_building task list 1 in command", {
-                  projectId: suggestions.projectId,
-                  tier: subscriptionTier,
-                  tasks: tasksForBuild,
-                  taskSummaryText,
-                  shown: Boolean(taskSummaryText),
-                });
-              } else {
-                log.info("start_building task list 2 in command ", {
-                  projectId: suggestions.projectId,
-                  tier: subscriptionTier,
-                  shown: false,
-                  reason: "plan_not_allowed",
-                });
-              }
+              const taskSummaryText = formatStartBuildingTasks(tasksForBuild, suggestions.projectId, siteUrl);
+              log.info("start_building task list in command", {
+                projectId: suggestions.projectId,
+                runnableTaskCount: creditCheck.runnableTaskCount,
+                requiredCredits: creditCheck.requiredCredits,
+                availableCredits: creditCheck.availableCredits,
+                taskSummaryText,
+                shown: Boolean(taskSummaryText),
+              });
               log.info("start_building selected build api about to call", {
                 projectId: suggestions.projectId,
                 activeModel,
               });
-              await client.startBuilding(suggestions.projectId, activeModel);
+              try {
+                await client.startBuilding(suggestions.projectId, activeModel);
+              } catch (err) {
+                const insufficientCreditsText = getInsufficientCreditsMessageFromError(err, siteUrl);
+                if (insufficientCreditsText) {
+                  return { text: insufficientCreditsText };
+                }
+                throw err;
+              }
               const designPreviewText = await getDesignPreviewText(client, suggestions.projectId, siteUrl);
               log.info("start_building selected build api completed", {
                 projectId: suggestions.projectId,
@@ -927,18 +915,10 @@ export function create8080Command(
               if (hasTasks && hasArchitecture) {
                 // Create a public design share link
                 let shareUrl = "";
-                const [subscription, plans, profile] = await Promise.all([
-                  client.getSubscription().catch(() => null),
-                  client.getSubscriptionPlans().catch(() => []),
-                  client.getProfile().catch(() => null),
-                ]);
-                const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
-                const canBuildForPlan = canUseStartBuilding(subscriptionTier);
-                log.info("start_building show plan decision", {
+                const canBuildForPlan = true;
+                log.info("start_building show decision", {
                   projectId: suggestions.projectId,
-                  subscriptionTier,
                   canBuildForPlan,
-                  plansCount: plans.length,
                 });
                 const canShowStartBuilding = canBuildForPlan && eventEndedWithStartBuildingMessage;
                 const statusAfterReadiness = await client.getProjectStatus(suggestions.projectId).catch(() => null);
@@ -958,10 +938,10 @@ export function create8080Command(
                   canBuildForPlan,
                   willShowStartBuilding: canShowStartBuilding,
                   reason: canShowStartBuilding
-                    ? "paid_plan_tasks_architecture_and_review_build_signal_ready"
+                    ? "tasks_architecture_and_review_build_signal_ready"
                     : !eventEndedWithStartBuildingMessage
                       ? "waiting_for_events_review_start_building_message"
-                      : "plan_not_allowed",
+                      : "waiting_for_start_building_signal",
                 });
                 const nextAgents = canShowStartBuilding
                   ? ["start_building"]
@@ -979,7 +959,6 @@ export function create8080Command(
                   hasBackendContinue,
                   hasTasks,
                   hasArchitecture,
-                  subscriptionTier,
                   canBuildForPlan,
                 });
                 if (startBuildingAgents.length > 0) {
@@ -987,9 +966,9 @@ export function create8080Command(
                     projectId: suggestions.projectId,
                     source: "command_continue",
                     reason: canShowStartBuilding
-                      ? "paid_plan_resume_completed_with_architecture_tasks_and_review_build_signal"
+                      ? "resume_completed_with_architecture_tasks_and_review_build_signal"
                       : eventEndedWithStartBuildingMessage
-                        ? "waiting_for_plan_permission"
+                        ? "waiting_for_start_building_signal"
                         : "waiting_for_events_review_start_building_message",
                   });
                   await writeLatestSuggestions(stateDir, sessionId, {
@@ -1004,7 +983,7 @@ export function create8080Command(
                     ? eventEndedWithStartBuildingMessage
                       ? `8080.ai is still finishing the latest agent step. I will show Continue only after 8080.ai exposes it.${startBuildingAgents.length > 0 ? `\n\n${buildSuggestedAgentsText(suggestions.projectId, startBuildingAgents)}` : ""}`
                       : `8080.ai has not emitted the final /events review/start-building message yet. I will show Continue only after 8080.ai exposes it.${startBuildingAgents.length > 0 ? `\n\n${buildSuggestedAgentsText(suggestions.projectId, startBuildingAgents)}` : ""}`
-                    : getUpgradeToBuildText(siteUrl);
+                    : `The design, tasks, and architecture are available.`;
                 try {
                   const share = await client.createDesignShare(suggestions.projectId);
                   // Build the public share URL, prioritizing the design-specific format with share_id
