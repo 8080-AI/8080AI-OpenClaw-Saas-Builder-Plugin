@@ -1,4 +1,3 @@
-const TASK_LIST_TIERS = new Set(["standard", "plus", "pro"]);
 const UPGRADE_TO_BUILD_TEXT =
   `🚀 **Want to build this project end-to-end?**\n` +
   `Visit [8080.ai](https://8080.ai) and upgrade to a **Premium plan** to unlock full project building — ` +
@@ -14,7 +13,7 @@ type TaskLike = {
   effort_days?: unknown;
 };
 
-function getTaskArray(data: unknown): TaskLike[] {
+export function getTaskArray(data: unknown): TaskLike[] {
   if (Array.isArray(data)) return data as TaskLike[];
   if (data && typeof data === "object") {
     const record = data as Record<string, unknown>;
@@ -35,13 +34,13 @@ function normalizeStatus(value: unknown): string {
 }
 
 export function canShowStartBuildingTasks(subscriptionTier: unknown): boolean {
-  if (typeof subscriptionTier !== "string") return false;
-  const tier = subscriptionTier.toLowerCase();
-  return [...TASK_LIST_TIERS].some((allowedTier) => tier === allowedTier || tier.includes(allowedTier));
+  void subscriptionTier;
+  return true;
 }
 
 export function canUseStartBuilding(subscriptionTier: unknown): boolean {
-  return canShowStartBuildingTasks(subscriptionTier);
+  void subscriptionTier;
+  return true;
 }
 
 export function getUpgradeToBuildText(siteUrl = "https://8080.ai"): string {

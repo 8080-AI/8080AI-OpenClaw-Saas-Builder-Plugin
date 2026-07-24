@@ -6,7 +6,8 @@ import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion, type PendingSuggestion } from "./suggested-agents.ts";
 import { readLatestSuggestionsForProject, writeLatestSuggestions } from "./suggestions-state.ts";
 import { silentToolResult } from "./exact-response.ts";
-import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
+import { formatStartBuildingTasks } from "./task-summary.ts";
+import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
 import { log } from "../logger.ts";
 
@@ -154,32 +155,19 @@ export function createTriggerAgentsTool(deps: {
               details: { projectId: params.projectId, action: "build", blocked: true },
             };
           }
-          const [subscription, plans, profile] = await Promise.all([
-            client.getSubscription().catch(() => null),
-            client.getSubscriptionPlans().catch(() => []),
-            client.getProfile().catch(() => null),
-          ]);
-          const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
-          const canBuildForPlan = canUseStartBuilding(subscriptionTier);
-          log.info("start_building selected plan decision", {
-            projectId: params.projectId,
-            subscriptionTier,
-            canBuildForPlan,
-            plansCount: plans.length,
-          });
-          if (!canBuildForPlan) {
+          const creditCheck = await precheckStartBuildingCredits(client, params.projectId, tasksForBuild, activeModel);
+          if (!creditCheck.allowed) {
             return {
-              content: [{ type: "text", text: getUpgradeToBuildText("https://8080.ai") }],
-              details: { projectId: params.projectId, action: "build", blocked: true, subscriptionTier },
+              content: [{ type: "text", text: creditCheck.message ?? "Add Credits" }],
+              details: { projectId: params.projectId, action: "build", blocked: true, reason: "insufficient_credits", creditCheck },
             };
           }
-          const taskSummaryText = canShowStartBuildingTasks(subscriptionTier)
-            ? formatStartBuildingTasks(tasksForBuild, params.projectId)
-            : "";
+          const taskSummaryText = formatStartBuildingTasks(tasksForBuild, params.projectId);
           log.info("start_building task list in trigger_agents", {
             projectId: params.projectId,
-            tier: subscriptionTier,
-            tasks: tasksForBuild,
+            runnableTaskCount: creditCheck.runnableTaskCount,
+            requiredCredits: creditCheck.requiredCredits,
+            availableCredits: creditCheck.availableCredits,
             taskSummaryText,
             shown: Boolean(taskSummaryText),
           });
@@ -196,7 +184,18 @@ export function createTriggerAgentsTool(deps: {
             projectId: params.projectId,
             activeModel,
           });
-          await client.startBuilding(params.projectId, activeModel);
+          try {
+            await client.startBuilding(params.projectId, activeModel);
+          } catch (err) {
+            const insufficientCreditsText = getInsufficientCreditsMessageFromError(err);
+            if (insufficientCreditsText) {
+              return {
+                content: [{ type: "text", text: insufficientCreditsText }],
+                details: { projectId: params.projectId, action: "build", blocked: true, reason: "insufficient_credits" },
+              };
+            }
+            throw err;
+          }
           const designPreviewText = await getDesignPreviewText(client, params.projectId);
           log.info("start_building selected build api completed", {
             projectId: params.projectId,

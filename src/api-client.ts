@@ -303,7 +303,8 @@ function normalizeAiChatModel(model: string | undefined): string | undefined {
 export class ApiError extends Error {
   constructor(
     public status: number,
-    message: string
+    message: string,
+    public details?: unknown
   ) {
     super(message);
     this.name = "ApiError";
@@ -480,9 +481,17 @@ async function apiFetch(
 
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
+    let details: unknown;
     try {
       const text = await res.text();
-      if (text) msg += `: ${text}`;
+      if (text) {
+        msg += `: ${text}`;
+        try {
+          details = JSON.parse(text);
+        } catch {
+          details = text;
+        }
+      }
     } catch { }
     log.info("api_client response error_body", {
       method,
@@ -491,7 +500,7 @@ async function apiFetch(
       messagePreview: msg.slice(0, 500),
       hadOpenClawApiKeyHeader: true,
     });
-    throw new ApiError(res.status, msg);
+    throw new ApiError(res.status, msg, details);
   }
 
   const text = await res.text();
@@ -596,6 +605,14 @@ export function createApiClient(opts: ClientOpts) {
 
     async getProfile(): Promise<UserProfile> {
       return get("/profile/") as Promise<UserProfile>;
+    },
+
+    async getCurrentUser(): Promise<Record<string, unknown>> {
+      return get("/auth/me") as Promise<Record<string, unknown>>;
+    },
+
+    async getProjectCreditSource(projectId: string): Promise<Record<string, unknown> | null> {
+      return get(`/projects/${projectId}/credit-source`) as Promise<Record<string, unknown> | null>;
     },
 
     // 8080.ai uses /projects/ (with slash) for listing
@@ -886,7 +903,8 @@ export function createApiClient(opts: ClientOpts) {
     async startBuilding(projectId: string, activeModel: string): Promise<void> {
       const path = `/projects/${projectId}/build`;
       const body = {
-        default_model: "super_large",
+        default_model: activeModel || "super_large",
+        force_execution_task_ids: [],
       };
       log.info("start_building build api request", { projectId, path, activeModel, body });
       const response = await post(path, body);

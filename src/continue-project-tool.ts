@@ -5,7 +5,8 @@ import { readLatestSuggestionsForProject, writeLatestSuggestions } from "./sugge
 import { silentToolResult } from "./exact-response.ts";
 import { log } from "../logger.ts";
 import { readActiveModel } from "./model-state.ts";
-import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
+import { formatStartBuildingTasks } from "./task-summary.ts";
+import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
 
@@ -332,29 +333,14 @@ export function createContinueProjectTool(deps: {
             };
           }
 
-          const [subscription, plans, profile] = await Promise.all([
-            client.getSubscription().catch(() => null),
-            client.getSubscriptionPlans().catch(() => []),
-            client.getProfile().catch(() => null),
-          ]);
-          const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
-          const canBuildForPlan = canUseStartBuilding(subscriptionTier);
-          log.info("start_building selected plan decision", {
-            projectId: activeProjectId,
-            source: "continue_project_tool_fallback",
-            subscriptionTier,
-            canBuildForPlan,
-            plansCount: plans.length,
-          });
-          if (!canBuildForPlan) {
+          const creditCheck = await precheckStartBuildingCredits(client, activeProjectId, tasksForBuild, activeModel);
+          if (!creditCheck.allowed) {
             return {
-              content: [{ type: "text", text: getUpgradeToBuildText() }],
+              content: [{ type: "text", text: creditCheck.message ?? "Add Credits" }],
             };
           }
 
-          const taskSummaryText = canShowStartBuildingTasks(subscriptionTier)
-            ? formatStartBuildingTasks(tasksForBuild, activeProjectId)
-            : "";
+          const taskSummaryText = formatStartBuildingTasks(tasksForBuild, activeProjectId);
           onUpdate?.({
             content: [{
               type: "text",
@@ -368,7 +354,17 @@ export function createContinueProjectTool(deps: {
             source: "continue_project_tool_fallback",
             activeModel,
           });
-          await client.startBuilding(activeProjectId, activeModel);
+          try {
+            await client.startBuilding(activeProjectId, activeModel);
+          } catch (err) {
+            const insufficientCreditsText = getInsufficientCreditsMessageFromError(err);
+            if (insufficientCreditsText) {
+              return {
+                content: [{ type: "text", text: insufficientCreditsText }],
+              };
+            }
+            throw err;
+          }
           const designPreviewText = await getDesignPreviewText(client, activeProjectId);
           log.info("start_building selected build api completed", {
             projectId: activeProjectId,
@@ -797,19 +793,11 @@ export function createContinueProjectTool(deps: {
             };
           }
 
-          const [subscription, plans, profile] = await Promise.all([
-            client.getSubscription().catch(() => null),
-            client.getSubscriptionPlans().catch(() => []),
-            client.getProfile().catch(() => null),
-          ]);
-          const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
-          const canBuildForPlan = canUseStartBuilding(subscriptionTier);
-          log.info("start_building show plan decision", {
+          const canBuildForPlan = true;
+          log.info("start_building show decision", {
             projectId: activeProjectId,
             source: "continue_project_tool",
-            subscriptionTier,
             canBuildForPlan,
-            plansCount: plans.length,
           });
           const canShowStartBuilding = canBuildForPlan && eventEndedWithStartBuildingMessage;
           const statusAfterReadiness = await client.getProjectStatus(activeProjectId).catch(() => null);
@@ -829,10 +817,10 @@ export function createContinueProjectTool(deps: {
             canBuildForPlan,
             willShowStartBuilding: canShowStartBuilding,
             reason: canShowStartBuilding
-              ? "paid_plan_tasks_architecture_and_review_build_signal_ready"
+              ? "tasks_architecture_and_review_build_signal_ready"
               : !eventEndedWithStartBuildingMessage
                 ? "waiting_for_events_review_start_building_message"
-                : "plan_not_allowed",
+                : "waiting_for_start_building_signal",
           });
           const canShowReviewActions =
             hasBackendContinue &&
@@ -853,7 +841,6 @@ export function createContinueProjectTool(deps: {
             canShowReviewActions,
             hasTasks,
             hasArchitecture,
-            subscriptionTier,
             canBuildForPlan,
           });
           log.info("start_building shown", {
@@ -861,10 +848,10 @@ export function createContinueProjectTool(deps: {
             source: "continue_project_tool",
             shown: canShowStartBuilding,
             reason: canShowStartBuilding
-              ? "paid_plan_resume_completed_with_architecture_tasks_and_review_build_signal"
+              ? "resume_completed_with_architecture_tasks_and_review_build_signal"
               : canBuildForPlan
                 ? "waiting_for_events_review_start_building_message"
-                : "plan_not_allowed",
+                : "waiting_for_start_building_signal",
           });
           if (suggestions.length > 0) {
             await writeLatestSuggestions(stateDir, sessionId, {
@@ -881,7 +868,7 @@ export function createContinueProjectTool(deps: {
               ? `Review the design and architecture and start building.\n\n${buildSuggestedAgentsText(activeProjectId, suggestions, "", continueButtonLabel, pendingAfterReadiness.buttons)}`
               : canBuildForPlan
                 ? `The design, tasks, and architecture are available.${suggestions.length > 0 ? `\n\n${buildSuggestedAgentsText(activeProjectId, suggestions, "", continueButtonLabel, pendingAfterReadiness.buttons)}` : ""}`
-                : getUpgradeToBuildText());
+                : `The design, tasks, and architecture are available.`);
           onUpdate?.({ content: [{ type: "text", text: finalResult }] });
           return {
             content: [{ type: "text", text: finalResult }],

@@ -9,7 +9,8 @@ import {
 import { groupAgents, hasGeneratedData } from "./command.ts";
 import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
-import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
+import { formatStartBuildingTasks } from "./task-summary.ts";
+import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
 import { silentToolResult } from "./exact-response.ts";
 import { log } from "../logger.ts";
@@ -193,43 +194,37 @@ export function createSendMessageTool(deps: {
                 details: { projectId: activeProjectId, action: "build", blocked: true },
               };
             }
-            const [subscription, plans, profile] = await Promise.all([
-              client.getSubscription().catch(() => null),
-              client.getSubscriptionPlans().catch(() => []),
-              client.getProfile().catch(() => null),
-            ]);
-            const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
-            const canBuildForPlan = canUseStartBuilding(subscriptionTier);
-            log.info("start_building selected plan decision", {
-              projectId: activeProjectId,
-              subscriptionTier,
-              canBuildForPlan,
-              plansCount: plans.length,
-            });
-            if (!canBuildForPlan) {
+            const model = await readActiveModel(stateDir);
+            const creditCheck = await precheckStartBuildingCredits(client, activeProjectId, tasksForBuild, model, [], siteUrl);
+            if (!creditCheck.allowed) {
               return {
-                content: [{ type: "text", text: getUpgradeToBuildText(siteUrl) }],
-                details: { projectId: activeProjectId, action: "build", blocked: true, subscriptionTier },
+                content: [{ type: "text", text: creditCheck.message ?? "Add Credits" }],
+                details: { projectId: activeProjectId, action: "build", blocked: true, reason: "insufficient_credits", creditCheck },
               };
             }
-            let taskSummaryText = "";
-            if (canShowStartBuildingTasks(subscriptionTier)) {
-              taskSummaryText = formatStartBuildingTasks(tasksForBuild, activeProjectId, siteUrl);
-              log.info("start_building task list", { projectId: activeProjectId, tier: subscriptionTier, tasks: tasksForBuild, taskSummaryText, shown: Boolean(taskSummaryText) });
-            } else {
-              log.info("start_building task list", { projectId: activeProjectId, tier: subscriptionTier, shown: false, reason: "plan_not_allowed" });
-            }
+            const taskSummaryText = formatStartBuildingTasks(tasksForBuild, activeProjectId, siteUrl);
+            log.info("start_building task list", { projectId: activeProjectId, runnableTaskCount: creditCheck.runnableTaskCount, requiredCredits: creditCheck.requiredCredits, availableCredits: creditCheck.availableCredits, taskSummaryText, shown: Boolean(taskSummaryText) });
 
             accumulatedText =
               `🚀 Triggering **Building Phase** for project \`${activeProjectId}\`...\n\n` +
               (taskSummaryText ? `${taskSummaryText}\n\n` : "");
             await stream(onUpdate, accumulatedText);
-            const model = await readActiveModel(stateDir);
             log.info("start_building selected build api about to call", {
               projectId: activeProjectId,
               activeModel: model,
             });
-            await client.startBuilding(activeProjectId, model);
+            try {
+              await client.startBuilding(activeProjectId, model);
+            } catch (err) {
+              const insufficientCreditsText = getInsufficientCreditsMessageFromError(err, siteUrl);
+              if (insufficientCreditsText) {
+                return {
+                  content: [{ type: "text", text: insufficientCreditsText }],
+                  details: { projectId: activeProjectId, action: "build", blocked: true, reason: "insufficient_credits" },
+                };
+              }
+              throw err;
+            }
             const designPreviewText = await getDesignPreviewText(client, activeProjectId, siteUrl);
             log.info("start_building selected build api completed", {
               projectId: activeProjectId,
@@ -453,18 +448,10 @@ export function createSendMessageTool(deps: {
               if (share?.share_url) {
                 readinessText += `🎨 **Design Preview:** [${share.share_url}](${share.share_url})\n`;
               }
-              const [subscription, plans, profile] = await Promise.all([
-                client.getSubscription().catch(() => null),
-                client.getSubscriptionPlans().catch(() => []),
-                client.getProfile().catch(() => null),
-              ]);
-              const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
-              canBuildForPlan = canUseStartBuilding(subscriptionTier);
-              log.info("start_building show plan decision", {
+              canBuildForPlan = true;
+              log.info("start_building show decision", {
                 projectId: activeProjectId,
-                subscriptionTier,
                 canBuildForPlan,
-                plansCount: plans.length,
               });
 
               // Add "Start Building" to the agents if not already there
@@ -486,10 +473,10 @@ export function createSendMessageTool(deps: {
                   canBuildForPlan,
                   willShowStartBuilding: canShowStartBuilding,
                   reason: canShowStartBuilding
-                    ? "paid_plan_tasks_architecture_and_review_build_signal_ready"
+                    ? "tasks_architecture_and_review_build_signal_ready"
                     : !hasReviewBuildPhase
                       ? "waiting_for_review_build_phase_signal"
-                      : "plan_not_allowed",
+                      : "waiting_for_start_building_signal",
                 });
                 if (canShowStartBuilding) {
                   log.info("start_building added", {
@@ -519,9 +506,6 @@ export function createSendMessageTool(deps: {
                   hasTasks,
                   canBuildForPlan,
                 });
-              }
-              if (!canBuildForPlan) {
-                readinessText += `\n${getUpgradeToBuildText(siteUrl)}`;
               }
             }
           } catch (err) {
