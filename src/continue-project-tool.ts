@@ -176,11 +176,14 @@ export function createContinueProjectTool(deps: {
           const suggestedAgentsFromEvents: string[] = [];
           let suggestedAgentsMessageId = "";
 
+          const emitFallbackProgress = createProgressEmitter(onUpdate, activeProjectId, "planning");
+
           try {
             await client.streamProjectEvents(activeProjectId, {
               onRaw: (raw) => {
                 try {
                   const data = JSON.parse(raw);
+                  emitFallbackProgress(data);
                   if (data.type === "error") {
                     streamError = data.message || data.content || JSON.stringify(data);
                   }
@@ -235,8 +238,8 @@ export function createContinueProjectTool(deps: {
                 }
               },
               idleTimeoutMs: 60_000,
-              progressTimeoutMs: 300_000,
-              maxTimeoutMs: 480_000,
+              progressTimeoutMs: 120_000,
+              maxTimeoutMs: 180_000,
               signal: toolAbortController.signal,
             });
           } catch (err) {
@@ -450,12 +453,15 @@ export function createContinueProjectTool(deps: {
         let suggestedAgentsMessageId = "";
         let suggestedAgentsButtons: any[] | undefined = undefined;
 
+        const emitProgress = createProgressEmitter(onUpdate, activeProjectId, "design");
+
         try {
           await client.streamProjectEvents(activeProjectId, {
             onRaw: (raw) => {
               rawEventCount++;
               try {
                 lastProjectEvent = JSON.parse(raw) as Record<string, unknown>;
+                emitProgress(lastProjectEvent);
                 
                 if (lastProjectEvent.type === "error") {
                   streamError = String(lastProjectEvent.message || lastProjectEvent.content || JSON.stringify(lastProjectEvent));
@@ -578,8 +584,8 @@ export function createContinueProjectTool(deps: {
               }
             },
             idleTimeoutMs: 120_000,
-            progressTimeoutMs: 400_000,
-            maxTimeoutMs: 480_000,
+            progressTimeoutMs: 120_000,
+            maxTimeoutMs: 180_000,
             signal: toolAbortController.signal,
           });
         } catch (err) {
@@ -885,6 +891,8 @@ export function createContinueProjectTool(deps: {
           // backend exposes the next action. Keep waiting until 8080.ai is ready
           // or the user/client cancels the tool call.
           const POLL_INTERVAL_MS = 10_000;
+          const MAX_POLL_WAIT_MS = 90_000;
+          const pollStartedAt = Date.now();
           let pollAttempt = 0;
           let canShowReviewActions = false;
           let backendSuggestions: string[] = [];
@@ -976,6 +984,28 @@ export function createContinueProjectTool(deps: {
 
             if (canShowReviewActions) break;
 
+            if (Date.now() - pollStartedAt >= MAX_POLL_WAIT_MS) {
+              const stillProcessingText = buildStillProcessingText(activeProjectId, latestDesignPagesReady, latestHasDesignPages);
+              log.info("continue_project returning still-processing checkpoint before OpenClaw watchdog", {
+                projectId: activeProjectId,
+                source: "continue_project_tool",
+                pollAttempt,
+                elapsedMs: Date.now() - pollStartedAt,
+                hasDesignPages: latestHasDesignPages,
+                designPagesReady: latestDesignPagesReady,
+              });
+              onUpdate?.({ content: [{ type: "text", text: stillProcessingText }] });
+              return {
+                content: [{ type: "text", text: stillProcessingText }],
+                details: {
+                  status: "running",
+                  projectId: activeProjectId,
+                  suggestions: [],
+                  reason: "still_processing",
+                },
+              };
+            }
+
             pollAttempt++;
             log.info("continue_project polling for design completion", {
               projectId: activeProjectId,
@@ -1055,6 +1085,60 @@ export function createContinueProjectTool(deps: {
 function previewLogText(value: unknown, maxLength = 240): string | undefined {
   if (typeof value !== "string") return undefined;
   return value.length > maxLength ? `${value.slice(0, maxLength)}...` : value;
+}
+
+function buildStillProcessingText(projectId: string, designPagesReady = false, hasDesignPages = false): string {
+  const statusLine = designPagesReady
+    ? "8080.ai has generated design output and is preparing the next review action."
+    : hasDesignPages
+      ? "8080.ai is still processing design output."
+      : "8080.ai is still processing this project.";
+
+  return [
+    "⏳ **8080.ai is still processing**",
+    statusLine,
+    "I stopped waiting in OpenClaw so the chat does not get stuck. The work is still running on 8080.ai.",
+    `Try **Continue** again shortly or check project status for \`${projectId}\`.`,
+  ].join("\n\n");
+}
+
+function summarizeProgressEvent(event: Record<string, unknown>, fallbackPhase: string): string {
+  if (event.type === "design_pages" && Array.isArray(event.design_pages)) {
+    const page = event.design_pages.find((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object");
+    if (page) {
+      const pageName = typeof page.page_name === "string" ? page.page_name : "page";
+      const done = typeof page.sections_done === "number" ? page.sections_done : undefined;
+      const total = typeof page.sections_total === "number" ? page.sections_total : undefined;
+      const phase = typeof page.generation_phase === "string" ? page.generation_phase : fallbackPhase;
+      const sectionText = done !== undefined && total !== undefined ? ` (${done}/${total} sections)` : "";
+      return `8080.ai is ${phase} ${pageName}${sectionText}...`;
+    }
+  }
+
+  const agentType = typeof event.agent_type === "string" ? event.agent_type : undefined;
+  const content = previewLogText(event.content, 120) ?? previewLogText(event.summary, 120) ?? previewLogText(event.message, 120);
+  if (agentType && content) return `${agentType}: ${content}`;
+  if (content) return content;
+  return `8080.ai is still processing ${fallbackPhase}...`;
+}
+
+function createProgressEmitter(
+  onUpdate: ((partial: { content: { type: "text"; text: string }[] }) => void) | undefined,
+  projectId: string,
+  fallbackPhase: string
+) {
+  let lastProgressUpdateAt = 0;
+  return (event: Record<string, unknown>) => {
+    const now = Date.now();
+    if (now - lastProgressUpdateAt < 25_000) return;
+    lastProgressUpdateAt = now;
+    const progressText = [
+      "⏳ **8080.ai is processing...**",
+      summarizeProgressEvent(event, fallbackPhase),
+      `Project: \`${projectId}\``,
+    ].join("\n\n");
+    onUpdate?.({ content: [{ type: "text", text: progressText }] });
+  };
 }
 
 type BasicAgentLog = {
