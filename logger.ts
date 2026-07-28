@@ -3,9 +3,6 @@ type OpenClawLogger = {
 };
 
 let openClawLogger: OpenClawLogger | undefined;
-const STDERR_LOGGING_ENABLED =
-  process.env.OPENCLAW_8080AI_DEBUG === "1" ||
-  process.env.OPENCLAW_8080AI_DEBUG?.toLowerCase() === "true";
 
 function formatArg(value: unknown): string {
   if (value instanceof Error) return value.stack || value.message;
@@ -25,9 +22,6 @@ function write(args: unknown[]): void {
     openClawLogger.info(formatted);
     return;
   }
-
-  if (!STDERR_LOGGING_ENABLED) return;
-  process.stderr.write(`[8080.ai info] ${message}\n`);
 }
 
 export function configureLogger(logger: OpenClawLogger): void {

@@ -33,15 +33,7 @@ function normalizeStatus(value: unknown): string {
   return cleanValue(value, "unknown").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-// export function canShowStartBuildingTasks(subscriptionTier: unknown): boolean {
-//   void subscriptionTier;
-//   return true;
-// }
 
-// export function canUseStartBuilding(subscriptionTier: unknown): boolean {
-//   void subscriptionTier;
-//   return true;
-// }
 
 export function getUpgradeToBuildText(siteUrl = "https://8080.ai"): string {
   return UPGRADE_TO_BUILD_TEXT.replace("https://8080.ai", siteUrl.replace(/\/$/, ""));
