@@ -95,7 +95,7 @@ Generate an OpenClaw API key:
 4. Click **Generate Secret Key**.
 5. Enter a name for the key (optional) and select an expiration period:
    - Never Expires
-   - 15 Daysbut only if the comments are real security explanations, not “ignore this audit” comments.
+   - 15 Days
    - 30 Days
    - 90 Days
 6. Click **Create Secret Key**.
