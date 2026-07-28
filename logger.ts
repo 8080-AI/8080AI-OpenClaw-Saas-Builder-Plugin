@@ -3,7 +3,6 @@ type OpenClawLogger = {
 };
 
 let openClawLogger: OpenClawLogger | undefined;
-const DEBUG_LOGGING_ENABLED = false; // Set to true to enable debug logging to stderr when OpenClaw logger is not available
 
 function formatArg(value: unknown): string {
   if (value instanceof Error) return value.stack || value.message;
@@ -16,8 +15,6 @@ function formatArg(value: unknown): string {
 }
 
 function write(args: unknown[]): void {
-  if (!DEBUG_LOGGING_ENABLED) return;
-
   const message = args.map(formatArg).join(" ");
   const formatted = `[8080.ai] ${message}`;
 
@@ -25,8 +22,6 @@ function write(args: unknown[]): void {
     openClawLogger.info(formatted);
     return;
   }
-
-  process.stderr.write(`[8080.ai info] ${message}\n`);
 }
 
 export function configureLogger(logger: OpenClawLogger): void {

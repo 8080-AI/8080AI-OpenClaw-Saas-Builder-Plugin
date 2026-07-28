@@ -139,10 +139,22 @@ function modeFromResult(toolName: string | undefined, result: unknown): Omit<Pen
     details?.silent === true ||
     details?.suppressUserResponse === true;
 
-  // Silent tool results mean 8080.ai is still doing background work, so the
-  // next assistant filler message should be suppressed instead of rewritten.
+  // Silent tool results mean 8080.ai is still doing background work. To prevent
+  // incomplete turn errors in OpenClaw, we now return a user-friendly status
+  // message instead of blocking the assistant response.
   if (isSilent && !contentText.trim()) {
-    return { mode: "silent", toolName };
+    const status = details?.status;
+    let text = "8080.ai is processing in the background. Please check back in a moment.";
+    if (status === "running" || status === "agents_running") {
+      text = "8080.ai agents are currently running. Please wait a moment for them to finish, and then check the status.";
+    } else if (status === "waiting_for_next_actions" || status === "waiting_for_review_actions") {
+      text = "8080.ai is generating the next steps. Please check back in a moment.";
+    } else if (status === "blocked_without_continue_suggestion") {
+      text = "The project is currently not in a state where it can be continued. Please check the current status on the 8080.ai dashboard.";
+    } else if (status === "empty_response") {
+      text = "Received an empty response from 8080.ai. Please try again or check the status.";
+    }
+    return { mode: "exact", text, toolName };
   }
 
   const exactText = explicitExactText ?? markedText ?? contentText.trim();

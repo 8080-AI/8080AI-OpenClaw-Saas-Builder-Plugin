@@ -55,14 +55,14 @@
       "minGatewayVersion": "2026.5.7"
     },
     "build": {
-      "openclawVersion": "2026.5.7",
-      "pluginSdkVersion": "2026.5.7"
+      "openclawVersion": "2026.6.10",
+      "pluginSdkVersion": "2026.6.10"
     }
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0",
     "eventsource-parser": "^3.0.8",
-    "openclaw": "2026.5.7"
+    "openclaw": "^2026.6.9"
   },
   "devDependencies": {
     "@types/node": "^25.7.0",

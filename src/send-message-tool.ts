@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import { requireAuthenticatedClient, AuthError, filterStartBuildingAgents, isPauseForReviewText, isReviewArchitectureStartBuildingChatMessage } from "./api-client.ts";
+import { requireAuthenticatedClient, AuthError, filterStartBuildingAgents, isPauseForReviewText, isReviewArchitectureStartBuildingChatMessage, checkGenerateFirstPageCondition, determineContinueButtonLabel } from "./api-client.ts";
 import {
   buildRequirementsUrl,
   buildSuggestedAgentsPresentation,
@@ -9,7 +9,8 @@ import {
 import { groupAgents, hasGeneratedData } from "./command.ts";
 import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
-import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
+import { formatStartBuildingTasks } from "./task-summary.ts";
+import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
 import { silentToolResult } from "./exact-response.ts";
 import { log } from "../logger.ts";
@@ -27,6 +28,22 @@ async function stream(onUpdate: OnUpdate | undefined, text: string, presentation
   await new Promise(r => setTimeout(r, 0));
 }
 
+function isPlanningActivityLog(entry: { action?: string | null; agent_type?: string | null; summary?: string | null }): boolean {
+  const action = String(entry.action ?? "").toLowerCase();
+  const agentType = String(entry.agent_type ?? "").toLowerCase();
+  const summary = String(entry.summary ?? "").toLowerCase();
+
+  if (action !== "started" && action !== "running" && action !== "completed") return false;
+  return (
+    agentType.includes("requirements") ||
+    agentType.includes("user flow") ||
+    agentType.includes("planner") ||
+    summary.includes("generating updates") ||
+    summary.includes("designing screen flows") ||
+    summary.includes("generated")
+  );
+}
+
 export function createSendMessageTool(deps: {
   stateDir: () => string;
   siteUrl: string;
@@ -40,7 +57,8 @@ export function createSendMessageTool(deps: {
       "Use when the user wants to add new requirements, make changes, or ask questions about the project. " +
       "IMPORTANT: Pass the user's EXACT message. Do not expand or rewrite it. " +
       "The AI will return a response. You MUST output this response EXACTLY word-for-word to the user without summarizing. " +
-      "For Run Plan All or Continue selections, if the tool returns no visible content, do not summarize, announce, or confirm the action; remain silent until visible Continue/Review actions are returned.",
+      "For Run Plan All or Continue selections, if the tool returns no visible content, do not summarize, announce, or confirm the action; remain silent until visible Continue/Review actions are returned. " +
+      "For long-running 8080.ai actions, always pass timeoutMs=600000 so OpenClaw allows the tool call to wait for agent completion.",
     parameters: Type.Object({
       projectId: Type.Optional(Type.String({
         description: "The 8080.ai project ID. If omitted, the tool will automatically use the currently active project for the session.",
@@ -51,10 +69,16 @@ export function createSendMessageTool(deps: {
       MediaPaths: Type.Optional(Type.Array(Type.String(), {
         description: "Absolute paths to any media files (images, documents) attached by the user. Handled automatically by OpenClaw.",
       })),
+      timeoutMs: Type.Number({
+        default: 600000,
+        minimum: 1,
+        maximum: 600000,
+        description: "Required OpenClaw dynamic-tool timeout override in milliseconds. Always use 600000 for 8080.ai long-running actions.",
+      }),
     }),
     async execute(
       _id: string,
-      params: { projectId?: string; content: string; MediaPaths?: string[] },
+      params: { projectId?: string; content: string; MediaPaths?: string[]; timeoutMs?: number },
       _signal: AbortSignal | undefined,
       onUpdate: OnUpdate | undefined
     ): Promise<ToolResult> {
@@ -170,43 +194,37 @@ export function createSendMessageTool(deps: {
                 details: { projectId: activeProjectId, action: "build", blocked: true },
               };
             }
-            const [subscription, plans, profile] = await Promise.all([
-              client.getSubscription().catch(() => null),
-              client.getSubscriptionPlans().catch(() => []),
-              client.getProfile().catch(() => null),
-            ]);
-            const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
-            const canBuildForPlan = canUseStartBuilding(subscriptionTier);
-            log.info("start_building selected plan decision", {
-              projectId: activeProjectId,
-              subscriptionTier,
-              canBuildForPlan,
-              plansCount: plans.length,
-            });
-            if (!canBuildForPlan) {
+            const model = await readActiveModel(stateDir);
+            const creditCheck = await precheckStartBuildingCredits(client, activeProjectId, tasksForBuild, model, [], siteUrl);
+            if (!creditCheck.allowed) {
               return {
-                content: [{ type: "text", text: getUpgradeToBuildText(siteUrl) }],
-                details: { projectId: activeProjectId, action: "build", blocked: true, subscriptionTier },
+                content: [{ type: "text", text: creditCheck.message ?? "Add Credits" }],
+                details: { projectId: activeProjectId, action: "build", blocked: true, reason: "insufficient_credits", creditCheck },
               };
             }
-            let taskSummaryText = "";
-            if (canShowStartBuildingTasks(subscriptionTier)) {
-              taskSummaryText = formatStartBuildingTasks(tasksForBuild, activeProjectId, siteUrl);
-              log.info("start_building task list", { projectId: activeProjectId, tier: subscriptionTier, tasks: tasksForBuild, taskSummaryText, shown: Boolean(taskSummaryText) });
-            } else {
-              log.info("start_building task list", { projectId: activeProjectId, tier: subscriptionTier, shown: false, reason: "plan_not_allowed" });
-            }
+            const taskSummaryText = formatStartBuildingTasks(tasksForBuild, activeProjectId, siteUrl);
+            log.info("start_building task list", { projectId: activeProjectId, runnableTaskCount: creditCheck.runnableTaskCount, requiredCredits: creditCheck.requiredCredits, availableCredits: creditCheck.availableCredits, taskSummaryText, shown: Boolean(taskSummaryText) });
 
             accumulatedText =
               `🚀 Triggering **Building Phase** for project \`${activeProjectId}\`...\n\n` +
               (taskSummaryText ? `${taskSummaryText}\n\n` : "");
             await stream(onUpdate, accumulatedText);
-            const model = await readActiveModel(stateDir);
             log.info("start_building selected build api about to call", {
               projectId: activeProjectId,
               activeModel: model,
             });
-            await client.startBuilding(activeProjectId, model);
+            try {
+              await client.startBuilding(activeProjectId, model);
+            } catch (err) {
+              const insufficientCreditsText = getInsufficientCreditsMessageFromError(err, siteUrl);
+              if (insufficientCreditsText) {
+                return {
+                  content: [{ type: "text", text: insufficientCreditsText }],
+                  details: { projectId: activeProjectId, action: "build", blocked: true, reason: "insufficient_credits" },
+                };
+              }
+              throw err;
+            }
             const designPreviewText = await getDesignPreviewText(client, activeProjectId, siteUrl);
             log.info("start_building selected build api completed", {
               projectId: activeProjectId,
@@ -261,7 +279,21 @@ export function createSendMessageTool(deps: {
               messageId,
               isRunPlanAll,
             });
-            await client.triggerAgents(activeProjectId, agents, messageId);
+            try {
+              await client.triggerAgents(activeProjectId, agents, messageId);
+            } catch (err) {
+              const logs = await client.getAgentLogs(activeProjectId).catch(() => []);
+              const hasPlanningActivity = logs.some((entry) => isPlanningActivityLog(entry));
+              log.info("send_message trigger_agents failed; checking whether agents are already running", {
+                projectId: activeProjectId,
+                agents,
+                messageId,
+                isRunPlanAll,
+                error: err instanceof Error ? err.message : String(err),
+                hasPlanningActivity,
+              });
+              if (!hasPlanningActivity) throw err;
+            }
             log.info("send_message trigger_agents completed", {
               projectId: activeProjectId,
               agents,
@@ -274,9 +306,9 @@ export function createSendMessageTool(deps: {
           let hasCompletedAgent = false;
           let pausedForReview = false;
           let lastProjectEvent: Record<string, unknown> | null = null;
-          const eventIdleTimeoutMs = 60_000;
-          const eventProgressTimeoutMs = 45_000;
-          const eventMaxTimeoutMs = 180_000;
+          const eventIdleTimeoutMs = 120_000;
+          const eventProgressTimeoutMs = 300_000;
+          const eventMaxTimeoutMs = 480_000;
           log.info("send_message streamProjectEvents start", {
             projectId: activeProjectId,
             agents,
@@ -285,38 +317,47 @@ export function createSendMessageTool(deps: {
             progressTimeoutMs: eventProgressTimeoutMs,
             maxTimeoutMs: eventMaxTimeoutMs,
           });
-          await client.streamProjectEvents(activeProjectId, {
-            onRaw: (raw) => {
-              try {
-                lastProjectEvent = JSON.parse(raw) as Record<string, unknown>;
-              } catch { }
-            },
-            onAgentLog: (log) => {
-              if (log.action === "completed") {
-                hasCompletedAgent = true;
-              }
-              log.info("send_message event agent_log", {
-                projectId: activeProjectId,
-                action: log.action,
-                agentType: log.agent_type,
-                summary: log.summary,
-              });
-            },
-            onChatMessage: (msg) => {
-              log.info("send_message event chat_message", {
-                projectId: activeProjectId,
-                isPauseForReview: isPauseForReviewText(msg.content),
-              });
-            },
-            onPlanningComplete: (data) => {
-              if (data.status === "paused_for_review") {
-                pausedForReview = true;
-              }
-            },
-            idleTimeoutMs: eventIdleTimeoutMs,
-            progressTimeoutMs: eventProgressTimeoutMs,
-            maxTimeoutMs: eventMaxTimeoutMs,
-          });
+          try {
+            await client.streamProjectEvents(activeProjectId, {
+              onRaw: (raw) => {
+                try {
+                  lastProjectEvent = JSON.parse(raw) as Record<string, unknown>;
+                } catch { }
+              },
+              onAgentLog: (log) => {
+                if (log.action === "completed") {
+                  hasCompletedAgent = true;
+                }
+                log.info("send_message event agent_log", {
+                  projectId: activeProjectId,
+                  action: log.action,
+                  agentType: log.agent_type,
+                  summary: log.summary,
+                });
+              },
+              onChatMessage: (msg) => {
+                log.info("send_message event chat_message", {
+                  projectId: activeProjectId,
+                  isPauseForReview: isPauseForReviewText(msg.content),
+                });
+              },
+              onPlanningComplete: (data) => {
+                if (data.status === "paused_for_review") {
+                  pausedForReview = true;
+                }
+              },
+              idleTimeoutMs: eventIdleTimeoutMs,
+              progressTimeoutMs: eventProgressTimeoutMs,
+              maxTimeoutMs: eventMaxTimeoutMs,
+            });
+          } catch (err) {
+            log.info("send_message event stream failed; continuing with project polling", {
+              projectId: activeProjectId,
+              agents,
+              action,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
           log.info("send_message streamProjectEvents finished", {
             projectId: activeProjectId,
             agents,
@@ -337,10 +378,12 @@ export function createSendMessageTool(deps: {
           // Show suggestions at the end
           let finalAgents: string[] = [];
           let finalMessageId = messageId;
+          let pendingButtons: any[] | undefined = undefined;
 
           if (pausedForReview) {
             const statusAfter = await client.getProjectStatus(activeProjectId);
             const pending = extractPendingSuggestion(statusAfter.pending_suggested_agents);
+            pendingButtons = pending.buttons;
             const backendResumeSuggestions = pending.agents.filter((agent) => agent === "continue" || agent === "review");
             const hasBackendContinue = backendResumeSuggestions.includes("continue");
             const hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(activeProjectId);
@@ -360,6 +403,7 @@ export function createSendMessageTool(deps: {
             const statusAfter = await client.getProjectStatus(activeProjectId);
 
             const pending = extractPendingSuggestion(statusAfter.pending_suggested_agents);
+            pendingButtons = pending.buttons;
             finalAgents = pending.agents;
             if (pending.messageId) finalMessageId = pending.messageId;
 
@@ -404,18 +448,10 @@ export function createSendMessageTool(deps: {
               if (share?.share_url) {
                 readinessText += `🎨 **Design Preview:** [${share.share_url}](${share.share_url})\n`;
               }
-              const [subscription, plans, profile] = await Promise.all([
-                client.getSubscription().catch(() => null),
-                client.getSubscriptionPlans().catch(() => []),
-                client.getProfile().catch(() => null),
-              ]);
-              const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
-              canBuildForPlan = canUseStartBuilding(subscriptionTier);
-              log.info("start_building show plan decision", {
+              canBuildForPlan = true;
+              log.info("start_building show decision", {
                 projectId: activeProjectId,
-                subscriptionTier,
                 canBuildForPlan,
-                plansCount: plans.length,
               });
 
               // Add "Start Building" to the agents if not already there
@@ -437,10 +473,10 @@ export function createSendMessageTool(deps: {
                   canBuildForPlan,
                   willShowStartBuilding: canShowStartBuilding,
                   reason: canShowStartBuilding
-                    ? "paid_plan_tasks_architecture_and_review_build_signal_ready"
+                    ? "tasks_architecture_and_review_build_signal_ready"
                     : !hasReviewBuildPhase
                       ? "waiting_for_review_build_phase_signal"
-                      : "plan_not_allowed",
+                      : "waiting_for_start_building_signal",
                 });
                 if (canShowStartBuilding) {
                   log.info("start_building added", {
@@ -471,9 +507,6 @@ export function createSendMessageTool(deps: {
                   canBuildForPlan,
                 });
               }
-              if (!canBuildForPlan) {
-                readinessText += `\n${getUpgradeToBuildText(siteUrl)}`;
-              }
             }
           } catch (err) {
             log.info("Readiness check error", err);
@@ -502,14 +535,16 @@ export function createSendMessageTool(deps: {
             }) as ToolResult;
           }
           accumulatedText += readinessText;
-          accumulatedText += `\n\n${buildSuggestedAgentsText(activeProjectId, finalGroupedAgents)}`;
-          const presentation = buildSuggestedAgentsPresentation(activeProjectId, finalGroupedAgents);
+          const continueButtonLabel = finalGroupedAgents.includes("continue") ? await determineContinueButtonLabel(client, activeProjectId) : undefined;
+          accumulatedText += `\n\n${buildSuggestedAgentsText(activeProjectId, finalGroupedAgents, "", continueButtonLabel, pendingButtons)}`;
+          const presentation = buildSuggestedAgentsPresentation(activeProjectId, finalGroupedAgents, "", continueButtonLabel, pendingButtons);
 
           // Update saved suggestions for the next selection
           await writeLatestSuggestions(stateDir, sessionId, {
             projectId: activeProjectId,
             agents: finalGroupedAgents,
             messageId: finalMessageId,
+            buttons: pendingButtons,
           });
 
           return {
@@ -618,12 +653,14 @@ export function createSendMessageTool(deps: {
         // ----------------------------------------------------------------
         // Fetch pending agents from project status if none found in stream
         // ----------------------------------------------------------------
+        let finalPendingButtons: any[] | undefined = undefined;
         if ((suggestedAgents.length === 0 || !suggestionMessageId) && !isQuestion && cleanText) {
           try {
             const status = await client.getProjectStatus(activeProjectId);
             const pending = extractPendingSuggestion(status.pending_suggested_agents);
             if (suggestedAgents.length === 0) suggestedAgents = pending.agents;
             if (pending.messageId) suggestionMessageId = pending.messageId;
+            finalPendingButtons = pending.buttons;
           } catch { }
         }
 
@@ -646,10 +683,11 @@ export function createSendMessageTool(deps: {
         }
 
         const groupedAgents = groupAgents(suggestedAgents);
+        const continueButtonLabel = groupedAgents.includes("continue") ? await determineContinueButtonLabel(client, activeProjectId) : undefined;
         const presentation = groupedAgents.length > 0
-          ? buildSuggestedAgentsPresentation(activeProjectId, groupedAgents, cleanText)
+          ? buildSuggestedAgentsPresentation(activeProjectId, groupedAgents, cleanText, continueButtonLabel, finalPendingButtons)
           : undefined;
-        const agentText = groupedAgents.length > 0 ? buildSuggestedAgentsText(activeProjectId, groupedAgents, cleanText) : "";
+        const agentText = groupedAgents.length > 0 ? buildSuggestedAgentsText(activeProjectId, groupedAgents, cleanText, continueButtonLabel, finalPendingButtons) : "";
 
         let finalResponse = cleanText;
         if (!isQuestion && groupedAgents.length > 0) {
@@ -663,6 +701,7 @@ export function createSendMessageTool(deps: {
             projectId: activeProjectId,
             agents: groupedAgents,
             messageId: suggestionMessageId,
+            buttons: finalPendingButtons,
           });
         }
 

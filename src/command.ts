@@ -1,5 +1,5 @@
 import { cleanApiKey, validateApiKey, writeApiKey } from "./api-key.ts";
-import { AuthError, AGENT_DISPLAY_NAMES, type BuildStep, requireAuthenticatedClient, filterStartBuildingAgents, isReviewArchitectureStartBuildingChatMessage } from "./api-client.ts";
+import { AuthError, AGENT_DISPLAY_NAMES, type BuildStep, requireAuthenticatedClient, filterStartBuildingAgents, isReviewArchitectureStartBuildingChatMessage, isPauseForReviewText, determineContinueButtonLabel } from "./api-client.ts";
 import { readActiveProject, writeActiveProject } from "./project-state.ts";
 import {
   buildProjectSelectionJsonl,
@@ -13,10 +13,15 @@ import {
 import { writeLatestSuggestions, readLatestSuggestions } from "./suggestions-state.ts";
 import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
-import { canShowStartBuildingTasks, canUseStartBuilding, detectSubscriptionTier, formatStartBuildingTasks, getUpgradeToBuildText } from "./task-summary.ts";
+import { formatStartBuildingTasks } from "./task-summary.ts";
+import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
 import { log } from "../logger.ts";
 import { buildProjectActivationResult } from "./project-activation.ts";
+
+function normalizeChoiceText(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
 
 const HELP_TEXT = `8080.ai plugin commands:
 
@@ -278,15 +283,23 @@ export function create8080Command(
             // Store project_id in session state
             await writeActiveProject(stateDir, projectId, sessionId);
 
+            let pendingButtons: any[] | undefined = undefined;
             if (suggestedAgents.length === 0 || !suggestionMessageId) {
               try {
                 const status = await client.getProjectStatus(projectId);
                 const pending = extractPendingSuggestion(status.pending_suggested_agents);
                 if (suggestedAgents.length === 0) suggestedAgents.push(...pending.agents);
                 if (pending.messageId) suggestionMessageId = pending.messageId;
+                pendingButtons = pending.buttons;
               } catch (statusErr) {
                 log.info("Failed to fetch project status for command suggestions", statusErr);
               }
+            } else {
+              try {
+                const status = await client.getProjectStatus(projectId);
+                const pending = extractPendingSuggestion(status.pending_suggested_agents);
+                pendingButtons = pending.buttons;
+              } catch {}
             }
 
             if (suggestedAgents.length > 0) {
@@ -299,16 +312,18 @@ export function create8080Command(
                 projectId,
                 agents: groupedAgents,
                 messageId: suggestionMessageId,
+                buttons: pendingButtons,
               });
             }
 
+            const continueButtonLabel = groupedAgents.includes("continue") ? await determineContinueButtonLabel(client, projectId) : undefined;
             const cleanText = stripA2UI(responseText);
             const streamDisplay = cleanText ? `\n\n**Tech Lead:**\n${cleanText}` : "";
             const agentList = groupedAgents.length > 0
-              ? buildSuggestedAgentsText(projectId, groupedAgents, cleanText)
+              ? buildSuggestedAgentsText(projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)
               : "";
             const presentation = groupedAgents.length > 0
-              ? buildSuggestedAgentsPresentation(projectId, groupedAgents, cleanText)
+              ? buildSuggestedAgentsPresentation(projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)
               : undefined;
 
             return {
@@ -572,6 +587,15 @@ export function create8080Command(
               }
             });
 
+            let pendingButtons: any[] | undefined = undefined;
+            try {
+              const status = await client.getProjectStatus(projectId);
+              const pending = extractPendingSuggestion(status.pending_suggested_agents);
+              if (suggestedAgents.length === 0) suggestedAgents = pending.agents;
+              if (!lastMessageId) lastMessageId = pending.messageId;
+              pendingButtons = pending.buttons;
+            } catch {}
+
             if (suggestedAgents.length > 0) {
               suggestedAgents = filterStartBuildingAgents(suggestedAgents, false);
             }
@@ -581,20 +605,22 @@ export function create8080Command(
               await writeLatestSuggestions(stateDir, sessionId, {
                 projectId,
                 agents: groupedAgents,
-                messageId: lastMessageId
+                messageId: lastMessageId,
+                buttons: pendingButtons,
               });
             }
 
+            const continueButtonLabel = groupedAgents.includes("continue") ? await determineContinueButtonLabel(client, projectId) : undefined;
             const cleanText = stripA2UI(responseText);
             const streamDisplay = cleanText ? `\n\n**AI Response:**\n${cleanText}` : "";
             const agentList = groupedAgents.length > 0
-              ? buildSuggestedAgentsText(projectId, groupedAgents, cleanText)
+              ? buildSuggestedAgentsText(projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)
               : "";
 
             const presentation = groupedAgents.length > 0
-              ? buildSuggestedAgentsPresentation(projectId, groupedAgents, cleanText)
+              ? buildSuggestedAgentsPresentation(projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)
               : undefined;
-            const buttonsJsonl = groupedAgents.length > 0 ? `\n\n${buildSuggestedAgentsJsonl(projectId, groupedAgents)}` : "";
+            const buttonsJsonl = groupedAgents.length > 0 ? `\n\n${buildSuggestedAgentsJsonl(projectId, groupedAgents, continueButtonLabel, pendingButtons)}` : "";
 
             return {
               text: `🤖 **Stream connection established**\n${streamDisplay}${agentList}${buttonsJsonl}`,
@@ -624,7 +650,7 @@ export function create8080Command(
             return { text: "No suggested agents found to select from." };
           }
 
-          const normalizedChoice = choice.toLowerCase().replace(/[\s_-]+/g, "_");
+          const normalizedChoice = normalizeChoiceText(choice);
           const num = parseInt(choice, 10);
           let selectedAgent: string | undefined;
           if (!isNaN(num)) {
@@ -634,11 +660,17 @@ export function create8080Command(
             selectedAgent = suggestions.agents[num - 1];
           } else {
             selectedAgent = suggestions.agents.find((agent) => {
-              const normalizedAgent = agent.toLowerCase().replace(/[\s_-]+/g, "_");
+              const normalizedAgent = normalizeChoiceText(agent);
               return normalizedAgent === normalizedChoice;
             });
             if (!selectedAgent && normalizedChoice === "start_building") {
               selectedAgent = suggestions.agents.find((agent) => agent === "start_building" || agent === "start_build");
+            }
+            if (!selectedAgent) {
+              selectedAgent = suggestions.agents.find((agent) => {
+                const normalizedLabel = normalizeChoiceText(AGENT_DISPLAY_NAMES[agent] ?? agent);
+                return normalizedLabel === normalizedChoice;
+              });
             }
             if (!selectedAgent) {
               return { text: `⚠️  "${choice}" is not valid. Pick a number between 1 and ${suggestions.agents.length}, or use an option name like \`start-building\`.` };
@@ -686,47 +718,34 @@ export function create8080Command(
                   text: "Start Building is not available yet. Architecture and tasks must be generated first.",
                 };
               }
-              const [subscription, plans, profile] = await Promise.all([
-                client.getSubscription().catch(() => null),
-                client.getSubscriptionPlans().catch(() => []),
-                client.getProfile().catch(() => null),
-              ]);
-              const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
-              const canBuildForPlan = canUseStartBuilding(subscriptionTier);
-              log.info("start_building selected plan decision", {
-                projectId: suggestions.projectId,
-                subscriptionTier,
-                canBuildForPlan,
-                plansCount: plans.length,
-              });
-              if (!canBuildForPlan) {
+              const creditCheck = await precheckStartBuildingCredits(client, suggestions.projectId, tasksForBuild, activeModel, [], siteUrl);
+              if (!creditCheck.allowed) {
                 return {
-                  text: getUpgradeToBuildText(siteUrl),
+                  text: creditCheck.message ?? "Add Credits",
                 };
               }
-              let taskSummaryText = "";
-              if (canShowStartBuildingTasks(subscriptionTier)) {
-                taskSummaryText = formatStartBuildingTasks(tasksForBuild, suggestions.projectId, siteUrl);
-                log.info("start_building task list 1 in command", {
-                  projectId: suggestions.projectId,
-                  tier: subscriptionTier,
-                  tasks: tasksForBuild,
-                  taskSummaryText,
-                  shown: Boolean(taskSummaryText),
-                });
-              } else {
-                log.info("start_building task list 2 in command ", {
-                  projectId: suggestions.projectId,
-                  tier: subscriptionTier,
-                  shown: false,
-                  reason: "plan_not_allowed",
-                });
-              }
+              const taskSummaryText = formatStartBuildingTasks(tasksForBuild, suggestions.projectId, siteUrl);
+              log.info("start_building task list in command", {
+                projectId: suggestions.projectId,
+                runnableTaskCount: creditCheck.runnableTaskCount,
+                requiredCredits: creditCheck.requiredCredits,
+                availableCredits: creditCheck.availableCredits,
+                taskSummaryText,
+                shown: Boolean(taskSummaryText),
+              });
               log.info("start_building selected build api about to call", {
                 projectId: suggestions.projectId,
                 activeModel,
               });
-              await client.startBuilding(suggestions.projectId, activeModel);
+              try {
+                await client.startBuilding(suggestions.projectId, activeModel);
+              } catch (err) {
+                const insufficientCreditsText = getInsufficientCreditsMessageFromError(err, siteUrl);
+                if (insufficientCreditsText) {
+                  return { text: insufficientCreditsText };
+                }
+                throw err;
+              }
               const designPreviewText = await getDesignPreviewText(client, suggestions.projectId, siteUrl);
               log.info("start_building selected build api completed", {
                 projectId: suggestions.projectId,
@@ -794,7 +813,7 @@ export function create8080Command(
                   }
                 },
                 idleTimeoutMs: 60_000,
-                progressTimeoutMs: 45_000,
+                progressTimeoutMs: 180_000,
                 maxTimeoutMs: 180_000,
               });
               // Check if any of the three endpoints generated data
@@ -864,6 +883,7 @@ export function create8080Command(
                     projectId: suggestions.projectId,
                     agents: [],
                     messageId: pendingAfterPause.messageId || suggestions.messageId || "",
+                    buttons: pendingAfterPause.buttons,
                   });
                   return {
                     text: "",
@@ -873,12 +893,14 @@ export function create8080Command(
                   projectId: suggestions.projectId,
                   agents: reviewAgents,
                   messageId: pendingAfterPause.messageId || suggestions.messageId || "",
+                  buttons: pendingAfterPause.buttons,
                 });
 
+                const continueButtonLabel = reviewAgents.includes("continue") ? await determineContinueButtonLabel(client, suggestions.projectId) : undefined;
                 return {
                   text:
-                    buildSuggestedAgentsText(suggestions.projectId, reviewAgents),
-                  presentation: buildSuggestedAgentsPresentation(suggestions.projectId, reviewAgents),
+                    buildSuggestedAgentsText(suggestions.projectId, reviewAgents, "", continueButtonLabel, pendingAfterPause.buttons),
+                  presentation: buildSuggestedAgentsPresentation(suggestions.projectId, reviewAgents, "", continueButtonLabel, pendingAfterPause.buttons),
                 };
               }
 
@@ -893,18 +915,10 @@ export function create8080Command(
               if (hasTasks && hasArchitecture) {
                 // Create a public design share link
                 let shareUrl = "";
-                const [subscription, plans, profile] = await Promise.all([
-                  client.getSubscription().catch(() => null),
-                  client.getSubscriptionPlans().catch(() => []),
-                  client.getProfile().catch(() => null),
-                ]);
-                const subscriptionTier = detectSubscriptionTier(subscription, profile, plans);
-                const canBuildForPlan = canUseStartBuilding(subscriptionTier);
-                log.info("start_building show plan decision", {
+                const canBuildForPlan = true;
+                log.info("start_building show decision", {
                   projectId: suggestions.projectId,
-                  subscriptionTier,
                   canBuildForPlan,
-                  plansCount: plans.length,
                 });
                 const canShowStartBuilding = canBuildForPlan && eventEndedWithStartBuildingMessage;
                 const statusAfterReadiness = await client.getProjectStatus(suggestions.projectId).catch(() => null);
@@ -924,10 +938,10 @@ export function create8080Command(
                   canBuildForPlan,
                   willShowStartBuilding: canShowStartBuilding,
                   reason: canShowStartBuilding
-                    ? "paid_plan_tasks_architecture_and_review_build_signal_ready"
+                    ? "tasks_architecture_and_review_build_signal_ready"
                     : !eventEndedWithStartBuildingMessage
                       ? "waiting_for_events_review_start_building_message"
-                      : "plan_not_allowed",
+                      : "waiting_for_start_building_signal",
                 });
                 const nextAgents = canShowStartBuilding
                   ? ["start_building"]
@@ -945,7 +959,6 @@ export function create8080Command(
                   hasBackendContinue,
                   hasTasks,
                   hasArchitecture,
-                  subscriptionTier,
                   canBuildForPlan,
                 });
                 if (startBuildingAgents.length > 0) {
@@ -953,9 +966,9 @@ export function create8080Command(
                     projectId: suggestions.projectId,
                     source: "command_continue",
                     reason: canShowStartBuilding
-                      ? "paid_plan_resume_completed_with_architecture_tasks_and_review_build_signal"
+                      ? "resume_completed_with_architecture_tasks_and_review_build_signal"
                       : eventEndedWithStartBuildingMessage
-                        ? "waiting_for_plan_permission"
+                        ? "waiting_for_start_building_signal"
                         : "waiting_for_events_review_start_building_message",
                   });
                   await writeLatestSuggestions(stateDir, sessionId, {
@@ -970,7 +983,7 @@ export function create8080Command(
                     ? eventEndedWithStartBuildingMessage
                       ? `8080.ai is still finishing the latest agent step. I will show Continue only after 8080.ai exposes it.${startBuildingAgents.length > 0 ? `\n\n${buildSuggestedAgentsText(suggestions.projectId, startBuildingAgents)}` : ""}`
                       : `8080.ai has not emitted the final /events review/start-building message yet. I will show Continue only after 8080.ai exposes it.${startBuildingAgents.length > 0 ? `\n\n${buildSuggestedAgentsText(suggestions.projectId, startBuildingAgents)}` : ""}`
-                    : getUpgradeToBuildText(siteUrl);
+                    : `The design, tasks, and architecture are available.`;
                 try {
                   const share = await client.createDesignShare(suggestions.projectId);
                   // Build the public share URL, prioritizing the design-specific format with share_id
@@ -1015,17 +1028,19 @@ export function create8080Command(
                   projectId: suggestions.projectId,
                   agents: hasLatestCompletedAgentLog ? continueAgents : [],
                   messageId: pendingAfterNoOutputs.messageId || suggestions.messageId || "",
+                  buttons: pendingAfterNoOutputs.buttons,
                 });
                 if (!hasLatestCompletedAgentLog) {
                   return {
                     text: "",
                   };
                 }
+                const continueButtonLabel = continueAgents.includes("continue") ? await determineContinueButtonLabel(client, suggestions.projectId) : undefined;
                 return {
                   text:
                     `✅ **Checkpoint reached.**\n${logsText}\n\n` +
-                    buildSuggestedAgentsText(suggestions.projectId, continueAgents),
-                  presentation: buildSuggestedAgentsPresentation(suggestions.projectId, continueAgents),
+                    buildSuggestedAgentsText(suggestions.projectId, continueAgents, "", continueButtonLabel, pendingAfterNoOutputs.buttons),
+                  presentation: buildSuggestedAgentsPresentation(suggestions.projectId, continueAgents, "", continueButtonLabel, pendingAfterNoOutputs.buttons),
                 };
               }
             }
@@ -1059,7 +1074,7 @@ export function create8080Command(
                 }
               },
               idleTimeoutMs: 60_000,
-              progressTimeoutMs: 45_000,
+              progressTimeoutMs: 180_000,
               maxTimeoutMs: 180_000,
             });
 
@@ -1086,6 +1101,7 @@ export function create8080Command(
                   projectId: suggestions.projectId,
                   agents: [],
                   messageId: pendingAfterPause.messageId || suggestions.messageId || "",
+                  buttons: pendingAfterPause.buttons,
                 });
                 return {
                   text: "",
@@ -1095,12 +1111,14 @@ export function create8080Command(
                 projectId: suggestions.projectId,
                 agents: reviewAgents,
                 messageId: pendingAfterPause.messageId || suggestions.messageId || "",
+                buttons: pendingAfterPause.buttons,
               });
 
+              const continueButtonLabel = reviewAgents.includes("continue") ? await determineContinueButtonLabel(client, suggestions.projectId) : undefined;
               return {
                 text:
-                  buildSuggestedAgentsText(suggestions.projectId, reviewAgents),
-                presentation: buildSuggestedAgentsPresentation(suggestions.projectId, reviewAgents),
+                  buildSuggestedAgentsText(suggestions.projectId, reviewAgents, "", continueButtonLabel, pendingAfterPause.buttons),
+                presentation: buildSuggestedAgentsPresentation(suggestions.projectId, reviewAgents, "", continueButtonLabel, pendingAfterPause.buttons),
               };
             }
 
@@ -1119,19 +1137,76 @@ export function create8080Command(
               agentLabel = (AGENT_DISPLAY_NAMES[selectedAgent] ?? selectedAgent);
             }
 
-            // Fetch fresh suggestions from the project detail
-            const projectStatusAfter = await client.getProjectStatus(suggestions.projectId);
-            const pendingSuggestionAfter = extractPendingSuggestion(projectStatusAfter.pending_suggested_agents);
-            const pendingAgentsAfter = pendingSuggestionAfter.agents;
+            // Poll for updated suggestions from backend (the single-fetch was racing
+            // with plan_all still running and returning stale pendingSuggestedAgents).
+            const triggeredAgentSet = new Set(agentsToTrigger);
+            const pollDeadline = Date.now() + (isPlanAll ? 45_000 : 30_000);
+            const pollInterval = 5_000;
+            let projectStatusAfter = await client.getProjectStatus(suggestions.projectId);
+            let pendingSuggestionAfter = extractPendingSuggestion(projectStatusAfter.pending_suggested_agents);
+            let pendingAgentsAfter = pendingSuggestionAfter.agents;
+            let hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(suggestions.projectId);
+
+            // Keep polling while the backend still shows the exact same agents we
+            // just triggered AND the latest agent log hasn't completed yet.
+            const backendStillStale = () => {
+              if (pendingAgentsAfter.length === 0) return false;
+              if (pendingAgentsAfter.includes("continue") || pendingAgentsAfter.includes("review")) return false;
+              // Check if backend agents are exactly what we triggered (stale)
+              return pendingAgentsAfter.every(a => triggeredAgentSet.has(a));
+            };
+
+            while (backendStillStale() && !hasLatestCompletedAgentLog && Date.now() < pollDeadline) {
+              log.info("command trigger polling for updated suggestions", {
+                projectId: suggestions.projectId,
+                currentPending: pendingAgentsAfter,
+                hasLatestCompletedAgentLog,
+                remainingMs: pollDeadline - Date.now(),
+              });
+              await new Promise((resolve) => setTimeout(resolve, pollInterval));
+              projectStatusAfter = await client.getProjectStatus(suggestions.projectId);
+              pendingSuggestionAfter = extractPendingSuggestion(projectStatusAfter.pending_suggested_agents);
+              pendingAgentsAfter = pendingSuggestionAfter.agents;
+              hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(suggestions.projectId);
+            }
+
+            // If the backend exposed "continue" via review checkpoint, show continue/review
+            if (hasLatestCompletedAgentLog && !pendingAgentsAfter.includes("continue")) {
+              // The backend completed but hasn't yet exposed continue —
+              // check if it's a review-ready state and inject continue/review
+              const hasReviewText = (Array.isArray(projectStatusAfter.messages) ? projectStatusAfter.messages : [])
+                .some((m: any) => isPauseForReviewText(m.content));
+              if (hasReviewText || pendingAgentsAfter.length === 0) {
+                pendingAgentsAfter = ["continue", "review"];
+                log.info("command trigger injected continue/review after poll", {
+                  projectId: suggestions.projectId,
+                  reason: "latest_agent_completed_but_backend_stale",
+                  hasReviewText,
+                });
+              }
+            }
+
             let finalAgentsAfter = [...pendingAgentsAfter];
 
             log.info("command trigger backend suggested agents after events", {
               projectId: suggestions.projectId,
               pendingAgents: finalAgentsAfter,
+              hasLatestCompletedAgentLog,
               reason: finalAgentsAfter.includes("continue")
                 ? "backend_exposed_continue"
                 : "backend_has_not_exposed_continue",
             });
+
+            // If after all polling the backend STILL has the same stale agents
+            // we triggered, clear suggestions to avoid showing a misleading button.
+            if (finalAgentsAfter.every(a => triggeredAgentSet.has(a)) && finalAgentsAfter.length > 0 && !hasLatestCompletedAgentLog) {
+              log.info("command trigger clearing stale suggestions", {
+                projectId: suggestions.projectId,
+                staleAgents: finalAgentsAfter,
+                reason: "backend_returned_same_agents_as_triggered",
+              });
+              finalAgentsAfter = [];
+            }
 
             if (finalAgentsAfter.length > 0) {
               log.info("start_building suggestions decision", {
@@ -1147,11 +1222,13 @@ export function create8080Command(
             await writeLatestSuggestions(stateDir, sessionId, {
               projectId: suggestions.projectId,
               agents: groupedAgentsAfter,
-              messageId: pendingSuggestionAfter.messageId || suggestions.messageId || ""
+              messageId: pendingSuggestionAfter.messageId || suggestions.messageId || "",
+              buttons: pendingSuggestionAfter.buttons,
             });
 
+            const continueButtonLabel = groupedAgentsAfter.includes("continue") ? await determineContinueButtonLabel(client, suggestions.projectId) : undefined;
             const agentList = groupedAgentsAfter.length > 0
-              ? buildSuggestedAgentsText(suggestions.projectId, groupedAgentsAfter)
+              ? buildSuggestedAgentsText(suggestions.projectId, groupedAgentsAfter, "", continueButtonLabel, pendingSuggestionAfter.buttons)
               : "";
 
             return {
@@ -1159,7 +1236,7 @@ export function create8080Command(
                 `✅ **${agentLabel}** run completed (using **${activeModel}**).` +
                 `${logsText}${srdText}\n\n${agentList}`,
               presentation: groupedAgentsAfter.length > 0
-                ? buildSuggestedAgentsPresentation(suggestions.projectId, groupedAgentsAfter)
+                ? buildSuggestedAgentsPresentation(suggestions.projectId, groupedAgentsAfter, "", continueButtonLabel, pendingSuggestionAfter.buttons)
                 : undefined,
             };
           } catch (err) {
