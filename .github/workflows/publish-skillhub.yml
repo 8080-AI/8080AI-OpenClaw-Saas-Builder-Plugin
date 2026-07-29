@@ -120,6 +120,10 @@ jobs:
         working-directory: skillhub/ai8080
         run: npx @skill-hub/cli push
 
+      - name: Publish SkillHub skill (dry-run)
+        working-directory: skillhub/ai8080
+        run: npx @skill-hub/cli publish --dry-run
+
       - name: Publish SkillHub skill
         working-directory: skillhub/ai8080
         run: npx @skill-hub/cli publish
