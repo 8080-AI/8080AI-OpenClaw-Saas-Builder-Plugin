@@ -24,8 +24,7 @@
     "openclaw.plugin.json",
     "package.json",
     "README.md",
-    "LICENSE",
-    ".env.example"
+    "LICENSE"
   ],
   "openclaw": {
     "extensions": [
@@ -74,6 +73,7 @@
     "build": "esbuild index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:openclaw",
     "prepack": "npm run build",
     "dev": "tsx watch index.ts",
-    "start": "tsx index.ts"
+    "start": "tsx index.ts",
+    "skillhub:pack": "mkdir -p skillhub-dist && cd skillhub && zip -r ../skillhub-dist/ai8080-skill.zip ai8080"
   }
 }

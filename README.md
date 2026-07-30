@@ -8,7 +8,6 @@ The plugin lets an OpenClaw agent authenticate with [8080.ai](https://8080.ai), 
 
 - Required runtime: Node.js `>=22.19.0`
 - Required env vars: none
-- Optional env template: `.env.example`
 - Network targets:
   - `https://8080.ai/`
   - `https://api.8080.ai/api/v1`
@@ -73,8 +72,6 @@ You can override these values from OpenClaw plugin config:
 }
 ```
 
-If your OpenClaw setup supports env-based config substitution, `.env.example` is included as an optional template. Creating a `.env` file is not required for normal installation.
-
 ## Authentication
 
 Use the login command:
@@ -124,6 +121,20 @@ If your API key expires:
 2. Delete the expired key.
 3. Generate a new key by following the steps in **Generate an OpenClaw API key** above.
 4. Save the new key by following the steps in **Save the key in OpenClaw** above.
+
+## Security & Privacy
+
+- This plugin communicates only with the configured 8080.ai endpoints.
+- Default network targets are `https://8080.ai/` and `https://api.8080.ai/api/v1`.
+- API keys are handled only by `ai8080_login` and `/ai8080 set api-key`.
+- API keys are validated locally before saving and are stored in local OpenClaw plugin state.
+- The plugin does not log full API keys, authorization headers, or credential payloads.
+- The plugin does not execute shell commands, spawn processes, or read arbitrary workspace files.
+- Project requirements and follow-up messages are sent to 8080.ai only when the user starts or updates a project.
+
+## Audit Notes
+
+The published package contains only the built OpenClaw entrypoint, native manifest, bundled skill, README, package metadata, and license. It does not include `.env` files, local development scripts, source tests, generated SkillHub artifacts, or bundled credentials. Credential handling is limited to local OpenClaw plugin state and outbound requests to the configured 8080.ai API endpoint.
 
 ## Commands
 

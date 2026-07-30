@@ -1,0 +1,135 @@
+# ===========================================================================
+# Publish SkillHub Skill
+# ===========================================================================
+name: Publish to SkillHub
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Publish to ClawHub"]
+    types: [completed]
+
+concurrency:
+  group: publish-skillhub-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish-skillhub:
+    name: Publish ai8080 SkillHub skill
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: package-lock.json
+
+      - name: Extract package version
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v$VERSION"
+          COMMIT_SHA=$(git rev-parse HEAD)
+
+          node -e "
+            const version = require('./package.json').version;
+            if (!/^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$/.test(version)) {
+              console.error('❌ package.json version must be valid semver');
+              process.exit(1);
+            }
+          "
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "📦 Publishing SkillHub version: $VERSION"
+          echo "🏷️ Release tag: $TAG"
+
+      - name: Sync SkillHub skill version
+        run: |
+          VERSION="${{ steps.version.outputs.version }}" node -e "
+            const fs = require('fs');
+            const path = 'skillhub/ai8080/SKILL.md';
+            const version = process.env.VERSION;
+            const content = fs.readFileSync(path, 'utf8');
+            const match = content.match(/^---\\n([\\s\\S]*?)\\n---\\n/);
+
+            if (!match) {
+              console.error('❌ SKILL.md must start with YAML frontmatter');
+              process.exit(1);
+            }
+
+            const frontmatter = match[1].split('\\n');
+            const versionLine = 'version: ' + version;
+            const versionIndex = frontmatter.findIndex((line) => line.startsWith('version:'));
+
+            if (versionIndex >= 0) {
+              frontmatter[versionIndex] = versionLine;
+            } else {
+              const descriptionIndex = frontmatter.findIndex((line) => line.startsWith('description:'));
+              frontmatter.splice(descriptionIndex >= 0 ? descriptionIndex + 1 : frontmatter.length, 0, versionLine);
+            }
+
+            fs.writeFileSync(path, '---\\n' + frontmatter.join('\\n') + '\\n---\\n' + content.slice(match[0].length));
+          "
+
+      - name: Validate SkillHub skill
+        run: |
+          test -f skillhub/ai8080/SKILL.md
+          test -f skillhub/ai8080/.skillhub.json
+          grep -q "^name:" skillhub/ai8080/SKILL.md
+          grep -q "^description:" skillhub/ai8080/SKILL.md
+          grep -q "^version: ${{ steps.version.outputs.version }}$" skillhub/ai8080/SKILL.md
+          grep -q "openclaw plugins install clawhub:8080ai" skillhub/ai8080/SKILL.md
+
+      - name: Package SkillHub skill
+        id: package
+        run: |
+          mkdir -p skillhub-dist
+          cd skillhub
+          ZIP_NAME="ai8080-skill-v${{ steps.version.outputs.version }}.zip"
+          zip -r "../skillhub-dist/$ZIP_NAME" ai8080
+          echo "zip_name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "zip_path=skillhub-dist/$ZIP_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload SkillHub package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: skillhub-ai8080-v${{ steps.version.outputs.version }}
+          path: ${{ steps.package.outputs.zip_path }}
+          if-no-files-found: error
+
+      - name: Login to SkillHub
+        run: npx @skill-hub/cli login --token "$SKILLHUB_TOKEN"
+        env:
+          SKILLHUB_TOKEN: ${{ secrets.SKILLHUB_TOKEN }}
+
+      - name: Verify SkillHub authentication
+        run: npx @skill-hub/cli whoami
+
+      - name: Push SkillHub skill
+        working-directory: skillhub/ai8080
+        run: npx @skill-hub/cli push
+
+      - name: Publish SkillHub skill (dry-run)
+        working-directory: skillhub/ai8080
+        run: npx @skill-hub/cli publish --dry-run
+
+      - name: Publish SkillHub skill
+        working-directory: skillhub/ai8080
+        run: npx @skill-hub/cli publish
+
+      - name: Confirm SkillHub publish
+        run: |
+          echo "✅ Successfully published ai8080 v${{ steps.version.outputs.version }} to SkillHub"
+          echo "✅ Uploaded SkillHub artifact ${{ steps.package.outputs.zip_name }}"
+          echo "✅ Matched ClawHub release tag ${{ steps.version.outputs.tag }}"

@@ -430,6 +430,8 @@ type ClientOpts = {
 };
 
 function authHeaders(opts: ClientOpts): Record<string, string> {
+  // Security: attach the saved OpenClaw API key only as an outbound auth header.
+  // Logs record header presence and key length, never the credential value.
   log.info("api_client auth_headers", {
     openClawApiKeyHeader: "X-OpenClaw-API-Key",
     apiKeyLength: opts.apiKey.length,
@@ -510,12 +512,16 @@ async function apiFetch(
   if (path.match(/^\/projects\/[^/]+$/) && path !== "/projects/") {
     const project = (data?.project ?? data) as Record<string, unknown> | undefined;
     const messages = Array.isArray(data?.messages) ? data.messages : [];
+    const pendingSuggestedAgents = data?.pending_suggested_agents as Record<string, unknown> | null | undefined;
     log.info("Project detail response", {
       projectId: project?.id,
       status: project?.status,
       updatedAt: project?.updated_at,
       messagesCount: messages.length,
-      pendingSuggestedAgents: data?.pending_suggested_agents ?? null,
+      hasPendingSuggestedAgents: Boolean(pendingSuggestedAgents),
+      pendingSuggestedAgentsCount: Array.isArray(pendingSuggestedAgents?.agents)
+        ? pendingSuggestedAgents.agents.length
+        : 0,
     });
   }
   return data;
@@ -560,6 +566,8 @@ export function createApiClient(opts: ClientOpts) {
     apiFetch(opts, "POST", path, body);
   const fetchWithAuth = async (url: string, init: RequestInit): Promise<Response> => {
     const headers = new Headers(init.headers);
+    // Security: streaming requests use the same scoped OpenClaw API-key header
+    // and never include the key value in logs.
     headers.set("X-OpenClaw-API-Key", opts.apiKey);
     log.info("api_client fetch_with_auth request", {
       method: init.method ?? "GET",
