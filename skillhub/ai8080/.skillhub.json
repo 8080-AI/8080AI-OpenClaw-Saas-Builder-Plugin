@@ -1,0 +1,12 @@
+{
+  "name": "ai8080",
+  "description": "Manage 8080.ai projects from OpenClaw.",
+  "category": "Coding",
+  "tags": [
+    "openclaw",
+    "8080.ai",
+    "ai",
+    "software-development"
+  ],
+  "visibility": "private"
+}
