@@ -132,7 +132,7 @@ jobs:
 
       - name: Push SkillHub skill
         working-directory: skillhub/ai8080
-        run: npx -y @skill-hub/cli push --create
+        run: yes | npx -y @skill-hub/cli push --create
 
       - name: Publish SkillHub skill
         working-directory: skillhub/ai8080
