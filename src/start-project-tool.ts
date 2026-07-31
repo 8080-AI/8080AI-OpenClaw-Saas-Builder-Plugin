@@ -43,7 +43,8 @@ export function createStartProjectTool(deps: {
       "The primary tool for building software projects using 8080.ai. " +
       "Use this whenever the user wants to create, build, or scaffold a new application. " +
       "It connects to the 8080.ai platform which handles architecture, coding, and deployment. " +
-      "Shows live agent activity from the platform as it works.",
+      "Shows live agent activity from the platform as it works. " +
+      "For long-running 8080.ai actions, always pass timeoutMs=600000 so OpenClaw allows the tool call to wait for agent completion.",
     parameters: Type.Object({
       user_raw_prompt: Type.String({
         description:
@@ -54,11 +55,17 @@ export function createStartProjectTool(deps: {
       MediaPaths: Type.Optional(Type.Array(Type.String(), {
         description: "Absolute paths to any media files (images, documents) attached by the user. Handled automatically by OpenClaw.",
       })),
+      timeoutMs: Type.Number({
+        default: 600000,
+        minimum: 1,
+        maximum: 600000,
+        description: "Required OpenClaw dynamic-tool timeout override in milliseconds. Always use 600000 for 8080.ai long-running actions.",
+      }),
     }),
 
     async execute(
       _id: string,
-      params: { user_raw_prompt: string; MediaPaths?: string[] },
+      params: { user_raw_prompt: string; MediaPaths?: string[]; timeoutMs?: number },
       _signal: AbortSignal | undefined,
       onUpdate: OnUpdate | undefined
     ): Promise<ToolResult> {

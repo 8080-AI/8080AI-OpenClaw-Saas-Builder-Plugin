@@ -36,7 +36,7 @@ export default definePluginEntry({
 
   register(api) {
     configureLogger(api.logger);
-    log.info("Registering plugin", { pluginId: api.pluginId });
+    log.info("🚀 [LOCAL DEV] Registering plugin from LOCAL source", { pluginId: api.pluginId });
     registerExactResponseHooks(api);
     const config = (api.pluginConfig ?? {}) as PluginConfig;
     const siteUrl = resolveStringConfig(config.siteUrl, DEFAULT_SITE_URL).replace(/\/$/, "");

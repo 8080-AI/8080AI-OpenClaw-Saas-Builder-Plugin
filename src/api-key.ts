@@ -45,6 +45,8 @@ function apiKeyPath(stateDir: string): string {
   return path.join(stateDir, ...API_KEY_FILE);
 }
 
+// Security: log only API-key metadata such as lengths, timestamps, and expiry state.
+// Never log the full key, decoded key material, or stored credential payload.
 export function cleanApiKey(value: string | undefined): string {
   const cleaned = value
     ?.trim()
@@ -265,6 +267,7 @@ export async function writeApiKey(
   const filePath = apiKeyPath(stateDir);
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   const data: StoredApiKey = { apiKey, ...meta, storedAt: Date.now() };
+  // Security: persist the credential only in local OpenClaw plugin state with owner-only file permissions.
   await fs.writeFile(filePath, JSON.stringify(data, null, 2), { mode: 0o600 });
   log.info("api_key saved", {
     uid: meta.uid,

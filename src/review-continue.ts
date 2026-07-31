@@ -71,25 +71,104 @@ export function buildProjectSelectionPresentation(projects: Project[]): any {
   };
 }
 
-export function buildSuggestedAgentsJsonl(projectId: string, agents: string[]): string {
-  const buttons = agents.map(agent => {
-    let label = "";
-    if (agent.startsWith("GROUP:")) {
-      const subAgents = agent.slice(6).split('|');
-      const subLabels = subAgents.map(a => {
-        const rawLabel = AGENT_DISPLAY_NAMES[a] ?? a;
-        // Strip emojis/icons for the label
-        return rawLabel.includes(" ") ? rawLabel.split(" ").slice(1).join(" ") : rawLabel;
-      });
-      label = `🚀 Run ${subLabels.join(", ")}`;
+export type BackendButton = {
+  key: string;
+  kind: string;
+  label: string;
+  action: string;
+  payload?: any;
+};
+
+export function getLabelForAgent(
+  agent: string,
+  continueButtonLabel?: string | boolean,
+  backendButtons?: BackendButton[]
+): string {
+  if (backendButtons && backendButtons.length > 0) {
+    if (
+      agent === "continue" ||
+      agent === "generate_first_page" ||
+      agent === "generate_all_pages" ||
+      agent === "generate_architecture"
+    ) {
+      const btn = backendButtons.find(b =>
+        b.action === "continue" ||
+        b.action === "resume_design" ||
+        b.key === "run_agents" ||
+        (b.payload && b.payload.agents && (
+          b.payload.agents.includes("continue") ||
+          b.payload.agents.includes("generate_first_page") ||
+          b.payload.agents.includes("generate_all_pages") ||
+          b.payload.agents.includes("generate_architecture")
+        ))
+      );
+      if (btn) return btn.label;
+    } else if (agent === "review") {
+      const btn = backendButtons.find(b =>
+        b.action === "review" ||
+        b.key === "review" ||
+        b.key === "review_document" ||
+        b.label.toLowerCase().includes("review")
+      );
+      if (btn) return btn.label;
     } else {
-      label = agent === "continue" ? "Continue" : agent === "review" ? "Review" : AGENT_DISPLAY_NAMES[agent] ?? agent;
+      const btn = backendButtons.find(b =>
+        b.payload && b.payload.agents &&
+        (b.payload.agents.includes(agent) ||
+         (agent.startsWith("GROUP:") && agent.slice(6).split('|').every((a: string) => b.payload.agents.includes(a))))
+      );
+      if (btn) return btn.label;
     }
+  }
+
+  // Fallback to default labels
+  if (agent.startsWith("GROUP:")) {
+    const subAgents = agent.slice(6).split('|');
+    const subLabels = subAgents.map(a => {
+      const rawLabel = AGENT_DISPLAY_NAMES[a] ?? a;
+      return rawLabel.includes(" ") ? rawLabel.split(" ").slice(1).join(" ") : rawLabel;
+    });
+    return `🚀 Run ${subLabels.join(", ")}`;
+  }
+
+  if (
+    agent === "continue" ||
+    agent === "generate_first_page" ||
+    agent === "generate_all_pages" ||
+    agent === "generate_architecture"
+  ) {
+    if (typeof continueButtonLabel === "string") {
+      return continueButtonLabel;
+    }
+    if (agent === "generate_first_page") return "Generate First Page";
+    if (agent === "generate_all_pages") return "Generate All Pages";
+    if (agent === "generate_architecture") return "Generate Architecture";
+    return continueButtonLabel ? "Generate First Page" : "Continue";
+  }
+  if (agent === "review") {
+    return "Review";
+  }
+  return AGENT_DISPLAY_NAMES[agent] ?? agent;
+}
+
+export function buildSuggestedAgentsJsonl(
+  projectId: string,
+  agents: string[],
+  continueButtonLabel?: string | boolean,
+  backendButtons?: any[]
+): string {
+  const buttons = agents.map(agent => {
+    const label = getLabelForAgent(agent, continueButtonLabel, backendButtons);
 
     let value = "";
     if (agent === "review") {
       value = `8080_review_${projectId}`;
-    } else if (agent === "continue") {
+    } else if (
+      agent === "continue" ||
+      agent === "generate_first_page" ||
+      agent === "generate_all_pages" ||
+      agent === "generate_architecture"
+    ) {
       value = `8080_continue_${projectId}`;
     } else {
       const agentsList = agent.startsWith("GROUP:") ? agent.slice(6).split('|') : [agent];
@@ -99,7 +178,14 @@ export function buildSuggestedAgentsJsonl(projectId: string, agents: string[]): 
     return {
       label,
       value,
-      style: (agent === "plan_all" || agent.includes("plan_all") || agent === "continue") ? "primary" : "secondary"
+      style: (
+        agent === "plan_all" ||
+        agent.includes("plan_all") ||
+        agent === "continue" ||
+        agent === "generate_first_page" ||
+        agent === "generate_all_pages" ||
+        agent === "generate_architecture"
+      ) ? "primary" : "secondary"
     };
   });
 
@@ -116,27 +202,24 @@ export function buildSuggestedAgentsJsonl(projectId: string, agents: string[]): 
 export function buildSuggestedAgentsPresentation(
   projectId: string,
   agents: string[],
-  responseText: string = ""
+  responseText: string = "",
+  continueButtonLabel?: string | boolean,
+  backendButtons?: any[]
 ): any {
   if (responseText.trim().endsWith("?")) return null;
 
   const buttons = agents.map(agent => {
-    let label = "";
-    if (agent.startsWith("GROUP:")) {
-      const subAgents = agent.slice(6).split('|');
-      const subLabels = subAgents.map(a => {
-        const rawLabel = AGENT_DISPLAY_NAMES[a] ?? a;
-        return rawLabel.includes(" ") ? rawLabel.split(" ").slice(1).join(" ") : rawLabel;
-      });
-      label = `🚀 Run ${subLabels.join(", ")}`;
-    } else {
-      label = agent === "continue" ? "Continue" : agent === "review" ? "Review" : AGENT_DISPLAY_NAMES[agent] ?? agent;
-    }
+    const label = getLabelForAgent(agent, continueButtonLabel, backendButtons);
 
     let value = "";
     if (agent === "review") {
       value = `8080_review_${projectId}`;
-    } else if (agent === "continue") {
+    } else if (
+      agent === "continue" ||
+      agent === "generate_first_page" ||
+      agent === "generate_all_pages" ||
+      agent === "generate_architecture"
+    ) {
       value = `8080_continue_${projectId}`;
     } else {
       const agentsList = agent.startsWith("GROUP:") ? agent.slice(6).split('|') : [agent];
@@ -146,7 +229,14 @@ export function buildSuggestedAgentsPresentation(
     return {
       label,
       value,
-      style: (agent === "plan_all" || agent.includes("plan_all") || agent === "continue") ? "primary" : "secondary"
+      style: (
+        agent === "plan_all" ||
+        agent.includes("plan_all") ||
+        agent === "continue" ||
+        agent === "generate_first_page" ||
+        agent === "generate_all_pages" ||
+        agent === "generate_architecture"
+      ) ? "primary" : "secondary"
     };
   });
 
@@ -200,25 +290,16 @@ export function parseButtonValue(
 export function buildSuggestedAgentsText(
   projectId: string,
   agents: string[],
-  responseText: string = ""
+  responseText: string = "",
+  continueButtonLabel?: string | boolean,
+  backendButtons?: any[]
 ): string {
   if (responseText.trim().endsWith("?")) {
     return "";
   }
 
   const lines = agents.map((agent, i) => {
-    let label = "";
-    if (agent.startsWith("GROUP:")) {
-      const subAgents = agent.slice(6).split('|');
-      const subLabels = subAgents.map(a => {
-        const rawLabel = AGENT_DISPLAY_NAMES[a] ?? a;
-        // Strip emojis/icons (anything before the first space) for the combined list
-        return rawLabel.includes(" ") ? rawLabel.split(" ").slice(1).join(" ") : rawLabel;
-      });
-      label = `🚀 Run ${subLabels.join(", ")}`;
-    } else {
-      label = agent === "continue" ? "Continue" : agent === "review" ? "Review" : AGENT_DISPLAY_NAMES[agent] ?? agent;
-    }
+    const label = getLabelForAgent(agent, continueButtonLabel, backendButtons);
     return `${i + 1}. ${label}`;
   });
 

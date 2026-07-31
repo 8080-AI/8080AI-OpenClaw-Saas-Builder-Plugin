@@ -1,4 +1,4 @@
-import { type ChatMessage } from "./api-client.ts";
+import { type ChatMessage, checkGenerateFirstPageCondition, determineContinueButtonLabel } from "./api-client.ts";
 import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
 import { writeLatestSuggestions } from "./suggestions-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
@@ -16,6 +16,7 @@ type ActivationClient = {
   getProjectChatMessages(projectId: string, chatSessionId: string): Promise<ChatMessage[]>;
   getTasks(projectId: string): Promise<unknown>;
   getArchitecture(projectId: string): Promise<unknown>;
+  getAgentLogs(projectId: string): Promise<any[]>;
 };
 
 type ActivationResult = {
@@ -190,13 +191,15 @@ export async function buildProjectActivationResult(params: {
     projectId,
     agents,
     messageId,
+    buttons: pending.buttons,
   });
 
+  const continueButtonLabel = agents.includes("continue") ? await determineContinueButtonLabel(client, projectId) : undefined;
   const latestMessageText = message
     ? `\n\n### Latest Message\n\n**${messageLabel(message.author)}:** ${message.content}`
     : "";
   const suggestionText = agents.length > 0
-    ? `\n\n${buildSuggestedAgentsText(projectId, agents)}` +
+    ? `\n\n${buildSuggestedAgentsText(projectId, agents, "", continueButtonLabel, pending.buttons)}` +
       `\nType \`/ai8080 select-button <number>\` to proceed.`
     : "";
   const text =
@@ -217,7 +220,7 @@ export async function buildProjectActivationResult(params: {
     agents,
     messageId,
     presentation: agents.length > 0
-      ? buildSuggestedAgentsPresentation(projectId, agents)
+      ? buildSuggestedAgentsPresentation(projectId, agents, "", continueButtonLabel, pending.buttons)
       : undefined,
   };
 }
