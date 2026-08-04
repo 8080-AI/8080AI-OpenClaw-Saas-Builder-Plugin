@@ -5,7 +5,7 @@
 
   on:
     pull_request:
-      branches: [main]
+      branches: [develop, main]
 
   # Cancel previous runs for the same PR when new commits are pushed
   concurrency:
@@ -25,7 +25,11 @@
             fetch-depth: 0
 
         # ── 2. Validate package version ──────────────────────────────────
-        - name: Validate package version is unreleased
+        - name: Validate package version policy
+          env:
+            BASE_SHA: ${{ github.event.pull_request.base.sha }}
+            HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+            TARGET_BRANCH: ${{ github.base_ref }}
           run: |
             VERSION=$(node -p "require('./package.json').version")
             TAG="v$VERSION"
@@ -39,6 +43,22 @@
                 process.exit(1);
               }
             "
+
+            CHANGED_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+            NON_WORKFLOW_FILES=$(printf '%s\n' "$CHANGED_FILES" | sed '/^\.github\//d' | sed '/^$/d')
+
+            echo "Changed files:"
+            printf '%s\n' "$CHANGED_FILES" | sed 's/^/  /'
+
+            if [ -z "$NON_WORKFLOW_FILES" ]; then
+              echo "✅ Workflow-only change detected; existing release version $VERSION is allowed."
+              exit 0
+            fi
+
+            if [ "$TARGET_BRANCH" != "main" ]; then
+              echo "✅ Package version is valid; release uniqueness is enforced when develop is promoted to main."
+              exit 0
+            fi
 
             git fetch --tags
 
