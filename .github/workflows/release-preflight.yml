@@ -1,0 +1,361 @@
+name: Release Preflight
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Branch or commit to validate
+        required: true
+        default: main
+      recovery_mode:
+        description: Allow an existing tag that points to the selected release commit
+        required: true
+        type: boolean
+        default: false
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: release-preflight-${{ github.event.pull_request.merge_commit_sha || inputs.release_ref || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Validate Release Candidate
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'develop')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout release candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_ref || github.event.pull_request.merge_commit_sha }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Validate build output
+        run: |
+          test -f dist/index.js || { echo "❌ dist/index.js is missing"; exit 1; }
+
+          node -e "
+            const fs = require('fs');
+            const pkg = require('./package.json');
+            const missing = (pkg.files || []).filter((entry) => !fs.existsSync(entry));
+
+            if (missing.length > 0) {
+              console.error('❌ Missing package files:', missing.join(', '));
+              process.exit(1);
+            }
+          "
+
+      - name: Extract release identity
+        id: release
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          TAG="v$VERSION"
+          COMMIT_SHA=$(git rev-parse HEAD)
+
+          VERSION="$VERSION" node -e "
+            if (!/^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/.test(process.env.VERSION)) {
+              console.error('❌ package.json version must be valid semver');
+              process.exit(1);
+            }
+          "
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Check Git tag
+        id: tag
+        env:
+          RECOVERY_MODE: ${{ inputs.recovery_mode }}
+        run: |
+          git fetch --tags
+
+          if git rev-parse "${{ steps.release.outputs.tag }}" >/dev/null 2>&1; then
+            TAG_COMMIT=$(git rev-list -n 1 "${{ steps.release.outputs.tag }}")
+
+            if [ "$RECOVERY_MODE" != "true" ]; then
+              echo "❌ Git tag ${{ steps.release.outputs.tag }} already exists. Enable recovery mode only for an incomplete release."
+              exit 1
+            fi
+
+            if [ "$TAG_COMMIT" != "${{ steps.release.outputs.commit_sha }}" ]; then
+              echo "❌ Existing tag ${{ steps.release.outputs.tag }} points to $TAG_COMMIT, not the selected release commit."
+              exit 1
+            fi
+
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Recovery mode accepted existing tag ${{ steps.release.outputs.tag }} at $TAG_COMMIT."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Git tag ${{ steps.release.outputs.tag }} is available."
+          fi
+
+      - name: Create ClawHub package
+        id: clawhub-package
+        run: |
+          mkdir -p package
+          TARBALL=$(npm pack --pack-destination package | tail -n 1)
+          TARBALL_PATH="$GITHUB_WORKSPACE/package/$TARBALL"
+
+          test -f "$TARBALL_PATH" || { echo "❌ ClawHub tarball was not created"; exit 1; }
+
+          echo "name=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "path=$TARBALL_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Sync SkillHub semantic version
+        run: |
+          VERSION="${{ steps.release.outputs.version }}" node -e "
+            const fs = require('fs');
+            const skillPath = 'skillhub/ai8080/SKILL.md';
+            const content = fs.readFileSync(skillPath, 'utf8');
+            const match = content.match(/^---\n([\s\S]*?)\n---\n/);
+
+            if (!match) {
+              console.error('❌ SKILL.md must start with YAML frontmatter');
+              process.exit(1);
+            }
+
+            const lines = match[1].split('\n');
+            const versionLine = 'version: ' + process.env.VERSION;
+            const versionIndex = lines.findIndex((line) => line.startsWith('version:'));
+
+            if (versionIndex >= 0) {
+              lines[versionIndex] = versionLine;
+            } else {
+              const descriptionIndex = lines.findIndex((line) => line.startsWith('description:'));
+              lines.splice(descriptionIndex >= 0 ? descriptionIndex + 1 : lines.length, 0, versionLine);
+            }
+
+            fs.writeFileSync(skillPath, '---\n' + lines.join('\n') + '\n---\n' + content.slice(match[0].length));
+          "
+
+      - name: Validate SkillHub package
+        run: |
+          test -f skillhub/ai8080/SKILL.md
+          test -f skillhub/ai8080/.skillhub.json
+          grep -q "^name:" skillhub/ai8080/SKILL.md
+          grep -q "^description:" skillhub/ai8080/SKILL.md
+          grep -q "^version: ${{ steps.release.outputs.version }}$" skillhub/ai8080/SKILL.md
+          grep -q "openclaw plugins install clawhub:8080ai" skillhub/ai8080/SKILL.md
+
+      - name: Create SkillHub package
+        id: skillhub-package
+        run: |
+          mkdir -p skillhub-dist
+          cd skillhub
+          ZIP_NAME="ai8080-skill-v${{ steps.release.outputs.version }}.zip"
+          zip -qr "../skillhub-dist/$ZIP_NAME" ai8080
+          ZIP_PATH="$GITHUB_WORKSPACE/skillhub-dist/$ZIP_NAME"
+
+          test -f "$ZIP_PATH" || { echo "❌ SkillHub package was not created"; exit 1; }
+
+          echo "name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
+          echo "path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Install ClawHub CLI
+        run: npm install -g clawhub
+
+      - name: Authenticate to ClawHub
+        run: clawhub login --token "$CLAWHUB_TOKEN" --no-browser
+        env:
+          CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
+
+      - name: Verify ClawHub authentication
+        run: clawhub whoami
+
+      - name: Check ClawHub version
+        id: clawhub-version
+        run: |
+          LOOKUP_OUTPUT=$(mktemp)
+
+          if clawhub package inspect 8080ai --version "${{ steps.release.outputs.version }}" --json > "$LOOKUP_OUTPUT" 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ ClawHub version ${{ steps.release.outputs.version }} already exists and will be skipped during publish."
+          elif grep -q "Version not found" "$LOOKUP_OUTPUT"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "✅ ClawHub version ${{ steps.release.outputs.version }} is available."
+          else
+            cat "$LOOKUP_OUTPUT"
+            echo "❌ Unable to determine ClawHub version status."
+            exit 1
+          fi
+
+      - name: Validate ClawHub publish request
+        if: steps.clawhub-version.outputs.exists != 'true'
+        run: |
+          clawhub package publish "${{ steps.clawhub-package.outputs.path }}" \
+            --family code-plugin \
+            --version "${{ steps.release.outputs.version }}" \
+            --source-repo "${{ github.repository }}" \
+            --source-commit "${{ steps.release.outputs.commit_sha }}" \
+            --source-ref "${{ steps.release.outputs.tag }}" \
+            --dry-run
+
+      - name: Configure SkillHub token
+        run: |
+          mkdir -p "$HOME/.skillhub"
+          node -e "
+            const fs = require('fs');
+            const authPath = process.env.HOME + '/.skillhub/auth.json';
+            fs.writeFileSync(authPath, JSON.stringify({
+              accessToken: process.env.SKILLHUB_TOKEN,
+              user: { username: 'github-actions', email: '', tier: 'standard' }
+            }, null, 2), { mode: 0o600 });
+          "
+        env:
+          SKILLHUB_TOKEN: ${{ secrets.SKILLHUB_TOKEN }}
+
+      - name: Verify SkillHub authentication
+        run: npx -y @skill-hub/cli whoami
+
+      - name: Check SkillHub semantic version
+        env:
+          SKILLHUB_TOKEN: ${{ secrets.SKILLHUB_TOKEN }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          node --input-type=module <<'NODE'
+            import fs from 'node:fs';
+
+            const apiRoot = 'https://www.skillhub.club/api';
+            const config = JSON.parse(fs.readFileSync('skillhub/ai8080/.skillhub.json', 'utf8'));
+            const localContent = fs.readFileSync('skillhub/ai8080/SKILL.md', 'utf8');
+            const releaseVersion = process.env.RELEASE_VERSION;
+
+            const getVersion = (content) => {
+              const frontmatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
+              const versionLine = frontmatter?.[1]
+                .split(/\r?\n/)
+                .find((line) => line.startsWith('version:'));
+              return versionLine?.slice('version:'.length).trim() ?? null;
+            };
+            const normalize = (content) => content.replace(/\r\n/g, '\n').trimEnd();
+
+            if (getVersion(localContent) !== releaseVersion) {
+              throw new Error(`Local SKILL.md version does not match ${releaseVersion}.`);
+            }
+
+            const request = async (endpoint) => {
+              const response = await fetch(apiRoot + endpoint, {
+                headers: { Authorization: `Bearer ${process.env.SKILLHUB_TOKEN}` }
+              });
+
+              if (!response.ok) {
+                throw new Error(`SkillHub ${endpoint} returned HTTP ${response.status}.`);
+              }
+
+              return response.json();
+            };
+
+            const { skills = [] } = await request('/user/skills');
+            const expectedName = config.name.toLowerCase();
+            const matches = skills.filter((skill) => (
+              skill.name?.toLowerCase() === expectedName ||
+              skill.slug?.toLowerCase() === expectedName ||
+              (config.slug && skill.slug?.toLowerCase() === config.slug.toLowerCase())
+            ));
+
+            if (matches.length > 1) {
+              throw new Error(`Multiple SkillHub skills match "${config.name}".`);
+            }
+
+            if (matches.length === 0) {
+              console.log(`No existing SkillHub skill named "${config.name}"; ${releaseVersion} is available.`);
+              process.exit(0);
+            }
+
+            const skill = matches[0];
+            const { versions = [] } = await request(`/user/skills/${encodeURIComponent(skill.id)}/versions`);
+            let existingContent = null;
+            let existingInternalVersion = null;
+
+            for (const remoteVersion of versions) {
+              const pulled = await request(
+                `/user/skills/${encodeURIComponent(skill.id)}/pull?version=${encodeURIComponent(remoteVersion.version)}`
+              );
+              const skillFile = pulled.files?.find((file) => file.filepath === 'SKILL.md');
+
+              if (skillFile && getVersion(skillFile.content) === releaseVersion) {
+                existingContent = skillFile.content;
+                existingInternalVersion = remoteVersion.version;
+                break;
+              }
+            }
+
+            if (existingContent) {
+              if (normalize(existingContent) !== normalize(localContent)) {
+                throw new Error(
+                  `SkillHub semantic version ${releaseVersion} already exists with different content.`
+                );
+              }
+
+              console.log(
+                `SkillHub semantic version ${releaseVersion} already exists as internal version ${existingInternalVersion} ` +
+                `with matching content; publish recovery is allowed.`
+              );
+              process.exit(0);
+            }
+
+            console.log(`SkillHub semantic version ${releaseVersion} is available for ${skill.slug}.`);
+          NODE
+
+      - name: Assemble immutable release candidate
+        run: |
+          mkdir -p release-candidate
+          cp "${{ steps.clawhub-package.outputs.path }}" release-candidate/
+          cp "${{ steps.skillhub-package.outputs.path }}" release-candidate/
+
+          VERSION="${{ steps.release.outputs.version }}" \
+          TAG="${{ steps.release.outputs.tag }}" \
+          COMMIT_SHA="${{ steps.release.outputs.commit_sha }}" \
+          CLAWHUB_PACKAGE="${{ steps.clawhub-package.outputs.name }}" \
+          SKILLHUB_PACKAGE="${{ steps.skillhub-package.outputs.name }}" \
+          node -e "
+            const fs = require('fs');
+            fs.writeFileSync('release-candidate/manifest.json', JSON.stringify({
+              version: process.env.VERSION,
+              tag: process.env.TAG,
+              commit_sha: process.env.COMMIT_SHA,
+              clawhub_package: process.env.CLAWHUB_PACKAGE,
+              skillhub_package: process.env.SKILLHUB_PACKAGE
+            }, null, 2));
+          "
+
+          cd release-candidate
+          sha256sum "${{ steps.clawhub-package.outputs.name }}" "${{ steps.skillhub-package.outputs.name }}" > SHA256SUMS
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate
+          path: release-candidate
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Confirm preflight
+        run: |
+          echo "✅ Release candidate ${{ steps.release.outputs.tag }} passed ClawHub and SkillHub checks."
+          echo "✅ No registry publication, Git tag, or GitHub Release was created by preflight."
