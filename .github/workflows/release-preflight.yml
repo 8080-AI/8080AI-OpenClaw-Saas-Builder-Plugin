@@ -7,11 +7,6 @@ on:
         description: Branch or commit to validate
         required: true
         default: main
-      recovery_mode:
-        description: Allow an existing tag that points to the selected release commit
-        required: true
-        type: boolean
-        default: false
   pull_request:
     branches: [main]
     types: [closed]
@@ -101,33 +96,36 @@ jobs:
 
       # ── 8. Check Git tag ──────────────────────────────────────────────
       - name: Check Git tag
-        id: tag
-        env:
-          RECOVERY_MODE: ${{ inputs.recovery_mode }}
         run: |
           git fetch --tags
 
-          if git rev-parse "${{ steps.release.outputs.tag }}" >/dev/null 2>&1; then
+          if git rev-parse "refs/tags/${{ steps.release.outputs.tag }}" >/dev/null 2>&1; then
             TAG_COMMIT=$(git rev-list -n 1 "${{ steps.release.outputs.tag }}")
-
-            if [ "$RECOVERY_MODE" != "true" ]; then
-              echo "❌ Git tag ${{ steps.release.outputs.tag }} already exists. Enable recovery mode only for an incomplete release."
-              exit 1
-            fi
-
-            if [ "$TAG_COMMIT" != "${{ steps.release.outputs.commit_sha }}" ]; then
-              echo "❌ Existing tag ${{ steps.release.outputs.tag }} points to $TAG_COMMIT, not the selected release commit."
-              exit 1
-            fi
-
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "✅ Recovery mode accepted existing tag ${{ steps.release.outputs.tag }} at $TAG_COMMIT."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "✅ Git tag ${{ steps.release.outputs.tag }} is available."
+            echo "::error::Git tag ${{ steps.release.outputs.tag }} already exists at $TAG_COMMIT. Increment package.json version before releasing."
+            exit 1
           fi
 
-      # ── 9. Create ClawHub package ─────────────────────────────────────
+          echo "✅ Git tag ${{ steps.release.outputs.tag }} is available."
+
+      # ── 9. Check GitHub release ───────────────────────────────────────
+      - name: Check GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LOOKUP_OUTPUT=$(mktemp)
+
+          if gh release view "${{ steps.release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" > "$LOOKUP_OUTPUT" 2>&1; then
+            echo "::error::GitHub Release ${{ steps.release.outputs.tag }} already exists. Increment package.json version before releasing."
+            exit 1
+          elif grep -qi "release not found" "$LOOKUP_OUTPUT"; then
+            echo "✅ GitHub Release ${{ steps.release.outputs.tag }} is available."
+          else
+            cat "$LOOKUP_OUTPUT"
+            echo "::error::Unable to determine GitHub Release status for ${{ steps.release.outputs.tag }}."
+            exit 1
+          fi
+
+      # ── 10. Create ClawHub package ────────────────────────────────────
       - name: Create ClawHub package
         id: clawhub-package
         run: |
@@ -141,7 +139,7 @@ jobs:
           echo "path=$TARBALL_PATH" >> "$GITHUB_OUTPUT"
           echo "✅ ClawHub tarball created successfully: $TARBALL_PATH"
 
-      # ── 10. Sync SkillHub semantic version ────────────────────────────
+      # ── 11. Sync SkillHub semantic version ────────────────────────────
       - name: Sync SkillHub semantic version
         run: |
           VERSION="${{ steps.release.outputs.version }}" node -e "
@@ -169,7 +167,7 @@ jobs:
             fs.writeFileSync(skillPath, '---\n' + lines.join('\n') + '\n---\n' + content.slice(match[0].length));
           "
 
-      # ── 11. Validate SkillHub package ─────────────────────────────────
+      # ── 12. Validate SkillHub package ─────────────────────────────────
       - name: Validate SkillHub package
         run: |
           test -f skillhub/ai8080/SKILL.md || { echo "::error::SkillHub package is missing SKILL.md."; exit 1; }
@@ -180,7 +178,7 @@ jobs:
           grep -q "openclaw plugins install clawhub:8080ai" skillhub/ai8080/SKILL.md || { echo "::error::SKILL.md is missing the required ClawHub installation command."; exit 1; }
           echo "✅ SkillHub package metadata verified successfully."
 
-      # ── 12. Create SkillHub package ───────────────────────────────────
+      # ── 13. Create SkillHub package ───────────────────────────────────
       - name: Create SkillHub package
         id: skillhub-package
         run: |
@@ -196,11 +194,11 @@ jobs:
           echo "path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
           echo "✅ SkillHub package created successfully: $ZIP_PATH"
 
-      # ── 13. Install ClawHub CLI ───────────────────────────────────────
+      # ── 14. Install ClawHub CLI ───────────────────────────────────────
       - name: Install ClawHub CLI
         run: npm install -g clawhub
 
-      # ── 14. Authenticate to ClawHub ───────────────────────────────────
+      # ── 15. Authenticate to ClawHub ───────────────────────────────────
       - name: Authenticate to ClawHub
         run: |
           test -n "$CLAWHUB_TOKEN" || { echo "::error::CLAWHUB_TOKEN secret is not configured."; exit 1; }
@@ -209,11 +207,11 @@ jobs:
         env:
           CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
 
-      # ── 15. Verify ClawHub authentication ─────────────────────────────
+      # ── 16. Verify ClawHub authentication ─────────────────────────────
       - name: Verify ClawHub authentication
         run: clawhub whoami
 
-      # ── 16. Check ClawHub version ─────────────────────────────────────
+      # ── 17. Check ClawHub version ─────────────────────────────────────
       - name: Check ClawHub version
         id: clawhub-version
         run: |
@@ -231,7 +229,7 @@ jobs:
             exit 1
           fi
 
-      # ── 17. Validate ClawHub publish request ──────────────────────────
+      # ── 18. Validate ClawHub publish request ──────────────────────────
       - name: Validate ClawHub publish request
         if: steps.clawhub-version.outputs.exists != 'true'
         run: |
@@ -243,7 +241,7 @@ jobs:
             --source-ref "${{ steps.release.outputs.tag }}" \
             --dry-run
 
-      # ── 18. Configure SkillHub token ──────────────────────────────────
+      # ── 19. Configure SkillHub token ──────────────────────────────────
       - name: Configure SkillHub token
         run: |
           test -n "$SKILLHUB_TOKEN" || { echo "::error::SKILLHUB_TOKEN secret is not configured."; exit 1; }
@@ -260,11 +258,11 @@ jobs:
         env:
           SKILLHUB_TOKEN: ${{ secrets.SKILLHUB_TOKEN }}
 
-      # ── 19. Verify SkillHub authentication ────────────────────────────
+      # ── 20. Verify SkillHub authentication ────────────────────────────
       - name: Verify SkillHub authentication
         run: npx -y @skill-hub/cli whoami
 
-      # ── 20. Check SkillHub semantic version ───────────────────────────
+      # ── 21. Check SkillHub semantic version ───────────────────────────
       - name: Check SkillHub semantic version
         env:
           SKILLHUB_TOKEN: ${{ secrets.SKILLHUB_TOKEN }}
@@ -355,7 +353,7 @@ jobs:
             console.log(`SkillHub semantic version ${releaseVersion} is available for ${skill.slug}.`);
           NODE
 
-      # ── 21. Assemble immutable release candidate ──────────────────────
+      # ── 22. Assemble immutable release candidate ──────────────────────
       - name: Assemble immutable release candidate
         run: |
           mkdir -p release-candidate
@@ -386,7 +384,7 @@ jobs:
           test -s SHA256SUMS || { echo "::error::Release candidate checksum file is empty."; exit 1; }
           echo "✅ Immutable release candidate assembled with manifest and checksums."
 
-      # ── 22. Upload release candidate ──────────────────────────────────
+      # ── 23. Upload release candidate ──────────────────────────────────
       - name: Upload release candidate
         uses: actions/upload-artifact@v4
         with:
@@ -395,7 +393,7 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
-      # ── 23. Report preflight failure ──────────────────────────────────
+      # ── 24. Report preflight failure ──────────────────────────────────
       - name: Report preflight failure
         if: failure()
         run: |
@@ -405,7 +403,7 @@ jobs:
           echo "Release ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_ref || github.event.pull_request.merge_commit_sha }}"
           echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-      # ── 24. Confirm preflight ─────────────────────────────────────────
+      # ── 25. Confirm preflight ─────────────────────────────────────────
       - name: Confirm preflight
         run: |
           echo "✅ Release candidate ${{ steps.release.outputs.tag }} passed ClawHub and SkillHub checks."

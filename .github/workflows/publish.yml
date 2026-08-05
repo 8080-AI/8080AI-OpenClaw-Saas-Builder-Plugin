@@ -79,7 +79,6 @@ jobs:
 
       # ── 5. Validate candidate identity ────────────────────────────────
       - name: Validate candidate identity
-        id: tag
         run: |
           ACTUAL_COMMIT=$(git rev-parse HEAD)
           ACTUAL_VERSION=$(node -p "require('./package.json').version")
@@ -93,34 +92,25 @@ jobs:
           echo "✅ Candidate identity matches commit $EXPECTED_COMMIT and version $EXPECTED_VERSION."
 
           git fetch --tags
-          if git rev-parse "${{ steps.release.outputs.tag }}" >/dev/null 2>&1; then
+          if git rev-parse "refs/tags/${{ steps.release.outputs.tag }}" >/dev/null 2>&1; then
             TAG_COMMIT=$(git rev-list -n 1 "${{ steps.release.outputs.tag }}")
-
-            if [ "$TAG_COMMIT" != "${{ steps.release.outputs.commit_sha }}" ]; then
-              echo "❌ Git tag ${{ steps.release.outputs.tag }} points to $TAG_COMMIT, not the verified release commit."
-              exit 1
-            fi
-
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "✅ Existing tag ${{ steps.release.outputs.tag }} matches the verified release commit."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "✅ Git tag ${{ steps.release.outputs.tag }} is available."
+            echo "::error::Git tag ${{ steps.release.outputs.tag }} already exists at $TAG_COMMIT. Publishing is stopped; increment package.json version."
+            exit 1
           fi
+
+          echo "✅ Git tag ${{ steps.release.outputs.tag }} is available."
 
       # ── 6. Check GitHub release ───────────────────────────────────────
       - name: Check GitHub release
-        id: github-release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           LOOKUP_OUTPUT=$(mktemp)
 
           if gh release view "${{ steps.release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" > "$LOOKUP_OUTPUT" 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "✅ GitHub Release ${{ steps.release.outputs.tag }} already exists and will be skipped."
+            echo "::error::GitHub Release ${{ steps.release.outputs.tag }} already exists. Publishing is stopped; increment package.json version."
+            exit 1
           elif grep -qi "release not found" "$LOOKUP_OUTPUT"; then
-            echo "exists=false" >> "$GITHUB_OUTPUT"
             echo "✅ GitHub Release ${{ steps.release.outputs.tag }} is available."
           else
             cat "$LOOKUP_OUTPUT"
@@ -424,7 +414,6 @@ jobs:
 
       # ── 21. Create git tag ────────────────────────────────────────────
       - name: Create git tag
-        if: steps.tag.outputs.exists != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -434,7 +423,6 @@ jobs:
 
       # ── 22. Create GitHub release ─────────────────────────────────────
       - name: Create GitHub release
-        if: steps.github-release.outputs.exists != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.release.outputs.tag }}
