@@ -35,12 +35,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # ── 1. Checkout release candidate ─────────────────────────────────
       - name: Checkout release candidate
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_ref || github.event.pull_request.merge_commit_sha }}
           fetch-depth: 0
 
+      # ── 2. Setup Node.js ──────────────────────────────────────────────
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -48,16 +50,23 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
+      # ── 3. Install dependencies ───────────────────────────────────────
       - name: Install dependencies
         run: npm ci
 
+      # ── 4. Build plugin ───────────────────────────────────────────────
       - name: Build plugin
         run: npm run build
 
-      - name: Validate build output
+      # ── 5. Validate compiled build output ─────────────────────────────
+      - name: Validate compiled build output
         run: |
           test -f dist/index.js || { echo "❌ dist/index.js is missing"; exit 1; }
+          echo "✅ Compiled build output verified successfully."
 
+      # ── 6. Validate package manifest files ────────────────────────────
+      - name: Validate package files
+        run: |
           node -e "
             const fs = require('fs');
             const pkg = require('./package.json');
@@ -69,6 +78,9 @@ jobs:
             }
           "
 
+          echo "✅ Package files verified successfully."
+
+      # ── 7. Extract release identity ───────────────────────────────────
       - name: Extract release identity
         id: release
         run: |
@@ -87,6 +99,7 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
 
+      # ── 8. Check Git tag ──────────────────────────────────────────────
       - name: Check Git tag
         id: tag
         env:
@@ -114,6 +127,7 @@ jobs:
             echo "✅ Git tag ${{ steps.release.outputs.tag }} is available."
           fi
 
+      # ── 9. Create ClawHub package ─────────────────────────────────────
       - name: Create ClawHub package
         id: clawhub-package
         run: |
@@ -125,7 +139,9 @@ jobs:
 
           echo "name=$TARBALL" >> "$GITHUB_OUTPUT"
           echo "path=$TARBALL_PATH" >> "$GITHUB_OUTPUT"
+          echo "✅ ClawHub tarball created successfully: $TARBALL_PATH"
 
+      # ── 10. Sync SkillHub semantic version ────────────────────────────
       - name: Sync SkillHub semantic version
         run: |
           VERSION="${{ steps.release.outputs.version }}" node -e "
@@ -153,15 +169,18 @@ jobs:
             fs.writeFileSync(skillPath, '---\n' + lines.join('\n') + '\n---\n' + content.slice(match[0].length));
           "
 
+      # ── 11. Validate SkillHub package ─────────────────────────────────
       - name: Validate SkillHub package
         run: |
-          test -f skillhub/ai8080/SKILL.md
-          test -f skillhub/ai8080/.skillhub.json
-          grep -q "^name:" skillhub/ai8080/SKILL.md
-          grep -q "^description:" skillhub/ai8080/SKILL.md
-          grep -q "^version: ${{ steps.release.outputs.version }}$" skillhub/ai8080/SKILL.md
-          grep -q "openclaw plugins install clawhub:8080ai" skillhub/ai8080/SKILL.md
+          test -f skillhub/ai8080/SKILL.md || { echo "::error::SkillHub package is missing SKILL.md."; exit 1; }
+          test -f skillhub/ai8080/.skillhub.json || { echo "::error::SkillHub package is missing .skillhub.json."; exit 1; }
+          grep -q "^name:" skillhub/ai8080/SKILL.md || { echo "::error::SKILL.md frontmatter is missing the name field."; exit 1; }
+          grep -q "^description:" skillhub/ai8080/SKILL.md || { echo "::error::SKILL.md frontmatter is missing the description field."; exit 1; }
+          grep -q "^version: ${{ steps.release.outputs.version }}$" skillhub/ai8080/SKILL.md || { echo "::error::SKILL.md version does not match ${{ steps.release.outputs.version }}."; exit 1; }
+          grep -q "openclaw plugins install clawhub:8080ai" skillhub/ai8080/SKILL.md || { echo "::error::SKILL.md is missing the required ClawHub installation command."; exit 1; }
+          echo "✅ SkillHub package metadata verified successfully."
 
+      # ── 12. Create SkillHub package ───────────────────────────────────
       - name: Create SkillHub package
         id: skillhub-package
         run: |
@@ -175,18 +194,26 @@ jobs:
 
           echo "name=$ZIP_NAME" >> "$GITHUB_OUTPUT"
           echo "path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+          echo "✅ SkillHub package created successfully: $ZIP_PATH"
 
+      # ── 13. Install ClawHub CLI ───────────────────────────────────────
       - name: Install ClawHub CLI
         run: npm install -g clawhub
 
+      # ── 14. Authenticate to ClawHub ───────────────────────────────────
       - name: Authenticate to ClawHub
-        run: clawhub login --token "$CLAWHUB_TOKEN" --no-browser
+        run: |
+          test -n "$CLAWHUB_TOKEN" || { echo "::error::CLAWHUB_TOKEN secret is not configured."; exit 1; }
+          clawhub login --token "$CLAWHUB_TOKEN" --no-browser
+          echo "✅ ClawHub login completed successfully."
         env:
           CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
 
+      # ── 15. Verify ClawHub authentication ─────────────────────────────
       - name: Verify ClawHub authentication
         run: clawhub whoami
 
+      # ── 16. Check ClawHub version ─────────────────────────────────────
       - name: Check ClawHub version
         id: clawhub-version
         run: |
@@ -204,6 +231,7 @@ jobs:
             exit 1
           fi
 
+      # ── 17. Validate ClawHub publish request ──────────────────────────
       - name: Validate ClawHub publish request
         if: steps.clawhub-version.outputs.exists != 'true'
         run: |
@@ -215,8 +243,10 @@ jobs:
             --source-ref "${{ steps.release.outputs.tag }}" \
             --dry-run
 
+      # ── 18. Configure SkillHub token ──────────────────────────────────
       - name: Configure SkillHub token
         run: |
+          test -n "$SKILLHUB_TOKEN" || { echo "::error::SKILLHUB_TOKEN secret is not configured."; exit 1; }
           mkdir -p "$HOME/.skillhub"
           node -e "
             const fs = require('fs');
@@ -226,12 +256,15 @@ jobs:
               user: { username: 'github-actions', email: '', tier: 'standard' }
             }, null, 2), { mode: 0o600 });
           "
+          echo "✅ SkillHub authentication file configured securely."
         env:
           SKILLHUB_TOKEN: ${{ secrets.SKILLHUB_TOKEN }}
 
+      # ── 19. Verify SkillHub authentication ────────────────────────────
       - name: Verify SkillHub authentication
         run: npx -y @skill-hub/cli whoami
 
+      # ── 20. Check SkillHub semantic version ───────────────────────────
       - name: Check SkillHub semantic version
         env:
           SKILLHUB_TOKEN: ${{ secrets.SKILLHUB_TOKEN }}
@@ -322,11 +355,14 @@ jobs:
             console.log(`SkillHub semantic version ${releaseVersion} is available for ${skill.slug}.`);
           NODE
 
+      # ── 21. Assemble immutable release candidate ──────────────────────
       - name: Assemble immutable release candidate
         run: |
           mkdir -p release-candidate
-          cp "${{ steps.clawhub-package.outputs.path }}" release-candidate/
-          cp "${{ steps.skillhub-package.outputs.path }}" release-candidate/
+          test -f "${{ steps.clawhub-package.outputs.path }}" || { echo "::error::Validated ClawHub package is missing before candidate assembly."; exit 1; }
+          test -f "${{ steps.skillhub-package.outputs.path }}" || { echo "::error::Validated SkillHub package is missing before candidate assembly."; exit 1; }
+          cp "${{ steps.clawhub-package.outputs.path }}" release-candidate/ || { echo "::error::Failed to copy the ClawHub package into the release candidate."; exit 1; }
+          cp "${{ steps.skillhub-package.outputs.path }}" release-candidate/ || { echo "::error::Failed to copy the SkillHub package into the release candidate."; exit 1; }
 
           VERSION="${{ steps.release.outputs.version }}" \
           TAG="${{ steps.release.outputs.tag }}" \
@@ -345,8 +381,12 @@ jobs:
           "
 
           cd release-candidate
-          sha256sum "${{ steps.clawhub-package.outputs.name }}" "${{ steps.skillhub-package.outputs.name }}" > SHA256SUMS
+          sha256sum "${{ steps.clawhub-package.outputs.name }}" "${{ steps.skillhub-package.outputs.name }}" > SHA256SUMS || { echo "::error::Failed to generate release candidate checksums."; exit 1; }
+          test -f manifest.json || { echo "::error::Release candidate manifest was not created."; exit 1; }
+          test -s SHA256SUMS || { echo "::error::Release candidate checksum file is empty."; exit 1; }
+          echo "✅ Immutable release candidate assembled with manifest and checksums."
 
+      # ── 22. Upload release candidate ──────────────────────────────────
       - name: Upload release candidate
         uses: actions/upload-artifact@v4
         with:
@@ -355,6 +395,17 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
+      # ── 23. Report preflight failure ──────────────────────────────────
+      - name: Report preflight failure
+        if: failure()
+        run: |
+          echo "::error title=Release Preflight failed::Review the first failed step above for the specific validation or command error."
+          echo "Event: ${{ github.event_name }}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Release ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_ref || github.event.pull_request.merge_commit_sha }}"
+          echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      # ── 24. Confirm preflight ─────────────────────────────────────────
       - name: Confirm preflight
         run: |
           echo "✅ Release candidate ${{ steps.release.outputs.tag }} passed ClawHub and SkillHub checks."
