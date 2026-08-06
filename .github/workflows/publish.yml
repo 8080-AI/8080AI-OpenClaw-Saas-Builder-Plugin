@@ -4,6 +4,12 @@
 name: Publish to ClawHub
 
 on:
+  workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Branch, tag, or commit to publish
+        required: true
+        default: main
   pull_request:
     branches: [main]
     types: [closed]
@@ -21,8 +27,9 @@ jobs:
   publish:
     name: Build & Publish to ClawHub
     if: >
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.head.ref == 'develop'
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'develop')
     runs-on: ubuntu-latest
   
     steps:
@@ -30,7 +37,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_ref || 'main' }}
           fetch-depth: 0
 
       # ── 2. Setup Node.js ──────────────────────────────────────────────
@@ -97,16 +104,25 @@ jobs:
           echo "🏷️ Release tag: $TAG"
 
       # ── 7. Ensure version tag is available ───────────────────────────
-      - name: Ensure version tag does not already exist
+      - name: Validate version tag
+        id: tag
         run: |
           git fetch --tags
 
           if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-            echo "❌ Tag ${{ steps.version.outputs.tag }} already exists. This version was already released."
-            exit 1
-          fi
+            TAG_COMMIT=$(git rev-list -n 1 "${{ steps.version.outputs.tag }}")
 
-          echo "✅ Tag ${{ steps.version.outputs.tag }} is available"
+            if [ "$TAG_COMMIT" != "${{ steps.version.outputs.commit_sha }}" ]; then
+              echo "❌ Tag ${{ steps.version.outputs.tag }} points to $TAG_COMMIT, not ${{ steps.version.outputs.commit_sha }}."
+              exit 1
+            fi
+
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "✅ Tag ${{ steps.version.outputs.tag }} already points to the selected release commit"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "✅ Tag ${{ steps.version.outputs.tag }} is available"
+          fi
 
       # ── 8. Create package tarball ────────────────────────────────────
       - name: Create package tarball
@@ -144,8 +160,26 @@ jobs:
       - name: Verify ClawHub authentication
         run: clawhub whoami
 
+      - name: Check ClawHub release
+        id: clawhub-release
+        run: |
+          LOOKUP_OUTPUT=$(mktemp)
+
+          if clawhub package inspect 8080ai --version "${{ steps.version.outputs.version }}" --json > "$LOOKUP_OUTPUT" 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "✅ ClawHub version ${{ steps.version.outputs.version }} already exists"
+          elif grep -q "Version not found" "$LOOKUP_OUTPUT"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ ClawHub version ${{ steps.version.outputs.version }} is not published yet"
+          else
+            cat "$LOOKUP_OUTPUT"
+            echo "❌ Unable to determine ClawHub release status"
+            exit 1
+          fi
+
       # ── 13. Publish to ClawHub (dry-run first) ───────────────────────
       - name: Publish to ClawHub (dry-run)
+        if: steps.clawhub-release.outputs.exists != 'true'
         run: |
           clawhub package publish "${{ steps.package.outputs.tarball_path }}" \
             --family code-plugin \
@@ -157,6 +191,7 @@ jobs:
 
       # ── 14. Publish to ClawHub (actual) ──────────────────────────────
       - name: Publish to ClawHub
+        if: steps.clawhub-release.outputs.exists != 'true'
         run: |
           clawhub package publish "${{ steps.package.outputs.tarball_path }}" \
             --family code-plugin \
@@ -165,8 +200,24 @@ jobs:
             --source-commit "${{ steps.version.outputs.commit_sha }}" \
             --source-ref "${{ steps.version.outputs.tag }}"
 
+      - name: Verify ClawHub release
+        run: |
+          for ATTEMPT in 1 2 3 4 5 6; do
+            if clawhub package inspect 8080ai --version "${{ steps.version.outputs.version }}" --json >/dev/null 2>&1; then
+              echo "✅ Verified ClawHub version ${{ steps.version.outputs.version }}"
+              exit 0
+            fi
+
+            echo "Waiting for ClawHub version ${{ steps.version.outputs.version }} (attempt $ATTEMPT/6)"
+            sleep 10
+          done
+
+          echo "❌ ClawHub version ${{ steps.version.outputs.version }} was not found after publishing"
+          exit 1
+
       # ── 15. Create git tag ───────────────────────────────────────────
       - name: Create git tag
+        if: steps.tag.outputs.exists != 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -186,9 +237,9 @@ jobs:
       # ── 17. Confirm publish ──────────────────────────────────────────
       - name: Confirm publish
         run: |
-          echo "✅ Successfully published 8080ai v${{ steps.version.outputs.version }} to ClawHub"
+          echo "✅ ClawHub contains 8080ai v${{ steps.version.outputs.version }}"
           echo "✅ Created package tarball ${{ steps.package.outputs.tarball }}"
-          echo "✅ Created GitHub release ${{ steps.version.outputs.tag }}"
+          echo "✅ GitHub release ${{ steps.version.outputs.tag }} is available"
           echo ""
           echo "Users can now install with:"
           echo "  openclaw plugins install clawhub:8080ai"

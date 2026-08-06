@@ -130,9 +130,59 @@ jobs:
       - name: Verify SkillHub authentication
         run: npx -y @skill-hub/cli whoami
 
+      - name: Link existing SkillHub skill
+        working-directory: skillhub/ai8080
+        env:
+          SKILLHUB_TOKEN: ${{ secrets.SKILLHUB_TOKEN }}
+        run: |
+          node --input-type=module <<'NODE'
+            import fs from 'node:fs';
+
+            const configPath = '.skillhub.json';
+            const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+
+            if (config.skill_id) {
+              console.log(`Already linked to SkillHub skill ${config.skill_id}`);
+              process.exit(0);
+            }
+
+            const response = await fetch('https://www.skillhub.club/api/user/skills', {
+              headers: {
+                Authorization: `Bearer ${process.env.SKILLHUB_TOKEN}`
+              }
+            });
+
+            if (!response.ok) {
+              throw new Error(`Unable to list SkillHub skills: HTTP ${response.status}`);
+            }
+
+            const { skills = [] } = await response.json();
+            const matches = skills.filter((skill) => (
+              skill.name?.toLowerCase() === config.name.toLowerCase() ||
+              skill.slug?.toLowerCase() === config.name.toLowerCase()
+            ));
+
+            if (matches.length > 1) {
+              throw new Error(`Multiple SkillHub skills match "${config.name}"; add skill_id to .skillhub.json explicitly.`);
+            }
+
+            if (matches.length === 0) {
+              console.log(`No existing SkillHub skill named "${config.name}"; push will create it.`);
+              process.exit(0);
+            }
+
+            const skill = matches[0];
+            fs.writeFileSync(configPath, JSON.stringify({
+              ...config,
+              skill_id: skill.id,
+              slug: skill.slug
+            }, null, 2));
+            console.log(`Linked existing SkillHub skill ${skill.slug} (${skill.id}).`);
+          NODE
+
       - name: Push SkillHub skill
         working-directory: skillhub/ai8080
-        run: yes | npx -y @skill-hub/cli push --create
+        run: npx -y @skill-hub/cli push --create --force
 
       - name: Publish SkillHub skill
         working-directory: skillhub/ai8080
