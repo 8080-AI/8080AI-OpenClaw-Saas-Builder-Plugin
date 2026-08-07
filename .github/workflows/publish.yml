@@ -1,194 +1,451 @@
-# ===========================================================================
-# Publish — Runs after develop is merged into main
-# ===========================================================================
-name: Publish to ClawHub
+name: Publish Release
 
 on:
-  pull_request:
-    branches: [main]
-    types: [closed]
+  workflow_dispatch:
+    inputs:
+      preflight_run_id:
+        description: Successful Release Preflight run ID
+        required: true
+  workflow_run:
+    workflows: ["Release Preflight"]
+    types: [completed]
 
 permissions:
+  actions: read
   contents: write
-  pull-requests: read
 
-# Only one publish at a time
 concurrency:
-  group: publish-main
+  group: publish-release
   cancel-in-progress: false
 
 jobs:
   publish:
-    name: Build & Publish to ClawHub
-    if: >
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.head.ref == 'develop'
+    name: Publish Verified Release
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
-  
+
     steps:
-      # ── 1. Checkout code ──────────────────────────────────────────────
-      - name: Checkout repository
+      # ── 1. Download verified release candidate ────────────────────────
+      - name: Download verified release candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: release-candidate
+          path: ${{ runner.temp }}/release-candidate
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.preflight_run_id }}
+
+      # ── 2. Read and verify release candidate ──────────────────────────
+      - name: Read and verify release candidate
+        id: release
+        run: |
+          CANDIDATE_DIR="$RUNNER_TEMP/release-candidate"
+          test -d "$CANDIDATE_DIR" || { echo "::error::Downloaded release-candidate directory is missing."; exit 1; }
+          cd "$CANDIDATE_DIR"
+          test -f SHA256SUMS || { echo "::error::Release candidate is missing SHA256SUMS."; exit 1; }
+          test -f manifest.json || { echo "::error::Release candidate is missing manifest.json."; exit 1; }
+          sha256sum -c SHA256SUMS || { echo "::error::Release candidate checksum verification failed; an artifact is missing or modified."; exit 1; }
+
+          node -e "
+            const fs = require('fs');
+            const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+            const required = ['version', 'tag', 'commit_sha', 'clawhub_package', 'skillhub_package'];
+
+            if (required.some((key) => !manifest[key])) {
+              console.error('❌ Release candidate manifest is incomplete');
+              process.exit(1);
+            }
+
+            for (const [key, value] of Object.entries(manifest)) {
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, key + '=' + value + '\n');
+            }
+          "
+          echo "✅ Release candidate manifest and checksums verified successfully."
+
+      # ── 3. Checkout verified commit ───────────────────────────────────
+      - name: Checkout verified commit
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ steps.release.outputs.commit_sha }}
           fetch-depth: 0
 
-      # ── 2. Setup Node.js ──────────────────────────────────────────────
+      # ── 4. Setup Node.js ──────────────────────────────────────────────
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
-          cache: 'npm'
+          node-version: "22"
+          cache: npm
           cache-dependency-path: package-lock.json
 
-      # ── 3. Install dependencies ───────────────────────────────────────
-      - name: Install dependencies
-        run: npm ci
-
-      # ── 4. Build plugin ──────────────────────────────────────────────
-      - name: Build plugin
-        run: npm run build
-
-      # ── 5. Validate build output ─────────────────────────────────────
-      - name: Validate build output
+      # ── 5. Validate candidate identity ────────────────────────────────
+      - name: Validate candidate identity
         run: |
-          test -f dist/index.js || { echo "❌ Build failed — dist/index.js missing"; exit 1; }
-          echo "✅ Build output verified"
+          ACTUAL_COMMIT=$(git rev-parse HEAD)
+          ACTUAL_VERSION=$(node -p "require('./package.json').version")
+          EXPECTED_COMMIT="${{ steps.release.outputs.commit_sha }}"
+          EXPECTED_VERSION="${{ steps.release.outputs.version }}"
+          EXPECTED_TAG="v$EXPECTED_VERSION"
 
-      # ── 5b. Validate package files array ─────────────────────────────
-      - name: Validate package files
-        run: |
-          node -e "
-            const fs = require('fs');
-            const pkg = require('./package.json');
-            const files = pkg.files || [];
-            let missing = [];
-            for (const f of files) {
-              if (!fs.existsSync(f)) missing.push(f);
-            }
-            if (missing.length > 0) {
-              console.error('❌ Missing files listed in package.json files array:');
-              missing.forEach(f => console.error('   -', f));
-              process.exit(1);
-            }
-            console.log('✅ All package files verified for publish');
-          "
+          test "$ACTUAL_COMMIT" = "$EXPECTED_COMMIT" || { echo "::error::Checked-out commit $ACTUAL_COMMIT does not match verified commit $EXPECTED_COMMIT."; exit 1; }
+          test "$ACTUAL_VERSION" = "$EXPECTED_VERSION" || { echo "::error::package.json version $ACTUAL_VERSION does not match verified version $EXPECTED_VERSION."; exit 1; }
+          test "${{ steps.release.outputs.tag }}" = "$EXPECTED_TAG" || { echo "::error::Release tag ${{ steps.release.outputs.tag }} does not match expected tag $EXPECTED_TAG."; exit 1; }
+          echo "✅ Candidate identity matches commit $EXPECTED_COMMIT and version $EXPECTED_VERSION."
 
-      # ── 6. Extract package version ───────────────────────────────────
-      - name: Extract package version
-        id: version
-        run: |
-          VERSION=$(node -p "require('./package.json').version")
-          TAG="v$VERSION"
-          COMMIT_SHA=$(git rev-parse HEAD)
-
-          node -e "
-            const version = require('./package.json').version;
-            if (!/^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$/.test(version)) {
-              console.error('❌ package.json version must be valid semver');
-              process.exit(1);
-            }
-          "
-
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
-          echo "📦 Publishing version: $VERSION"
-          echo "🏷️ Release tag: $TAG"
-
-      # ── 7. Ensure version tag is available ───────────────────────────
-      - name: Ensure version tag does not already exist
-        run: |
           git fetch --tags
-
-          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-            echo "❌ Tag ${{ steps.version.outputs.tag }} already exists. This version was already released."
+          if git rev-parse "refs/tags/${{ steps.release.outputs.tag }}" >/dev/null 2>&1; then
+            TAG_COMMIT=$(git rev-list -n 1 "${{ steps.release.outputs.tag }}")
+            echo "::error::Git tag ${{ steps.release.outputs.tag }} already exists at $TAG_COMMIT. Publishing is stopped; increment package.json version."
             exit 1
           fi
 
-          echo "✅ Tag ${{ steps.version.outputs.tag }} is available"
+          echo "✅ Git tag ${{ steps.release.outputs.tag }} is available."
 
-      # ── 8. Create package tarball ────────────────────────────────────
-      - name: Create package tarball
-        id: package
+      # ── 6. Check GitHub release ───────────────────────────────────────
+      - name: Check GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p package
-          TARBALL=$(npm pack --pack-destination package | tail -n 1)
-          TARBALL_PATH="$(pwd)/package/$TARBALL"
+          LOOKUP_OUTPUT=$(mktemp)
 
-          test -f "$TARBALL_PATH" || { echo "❌ Tarball was not created"; exit 1; }
+          if gh release view "${{ steps.release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" > "$LOOKUP_OUTPUT" 2>&1; then
+            echo "::error::GitHub Release ${{ steps.release.outputs.tag }} already exists. Publishing is stopped; increment package.json version."
+            exit 1
+          elif grep -qi "release not found" "$LOOKUP_OUTPUT"; then
+            echo "✅ GitHub Release ${{ steps.release.outputs.tag }} is available."
+          else
+            cat "$LOOKUP_OUTPUT"
+            echo "❌ Unable to determine GitHub Release status."
+            exit 1
+          fi
 
-          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
-          echo "tarball_path=$TARBALL_PATH" >> "$GITHUB_OUTPUT"
-          echo "✅ Created tarball: $TARBALL_PATH"
-
-      # ── 9. Upload package tarball artifact ───────────────────────────
-      - name: Upload package tarball
-        uses: actions/upload-artifact@v4
-        with:
-          name: package-tarball
-          path: ${{ steps.package.outputs.tarball_path }}
-          if-no-files-found: error
-
-      # ── 10. Install ClawHub CLI ───────────────────────────────────────
+      # ── 7. Install ClawHub CLI ────────────────────────────────────────
       - name: Install ClawHub CLI
         run: npm install -g clawhub
 
-      # ── 11. Authenticate to ClawHub ───────────────────────────────────
+      # ── 8. Authenticate to ClawHub ────────────────────────────────────
       - name: Authenticate to ClawHub
-        run: clawhub login --token "${{ secrets.CLAWHUB_TOKEN }}" --no-browser
+        run: |
+          test -n "$CLAWHUB_TOKEN" || { echo "::error::CLAWHUB_TOKEN secret is not configured."; exit 1; }
+          clawhub login --token "$CLAWHUB_TOKEN" --no-browser
+          echo "✅ ClawHub login completed successfully."
         env:
           CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
 
-      # ── 12. Verify authentication ────────────────────────────────────
+      # ── 9. Verify ClawHub authentication ──────────────────────────────
       - name: Verify ClawHub authentication
         run: clawhub whoami
 
-      # ── 13. Publish to ClawHub (dry-run first) ───────────────────────
-      - name: Publish to ClawHub (dry-run)
+      # ── 10. Recheck ClawHub version ───────────────────────────────────
+      - name: Recheck ClawHub version
+        id: clawhub-version
         run: |
-          clawhub package publish "${{ steps.package.outputs.tarball_path }}" \
+          LOOKUP_OUTPUT=$(mktemp)
+
+          if clawhub package inspect 8080ai --version "${{ steps.release.outputs.version }}" --json > "$LOOKUP_OUTPUT" 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "ℹ️ ClawHub version ${{ steps.release.outputs.version }} already exists; publish is skipped."
+          elif grep -q "Version not found" "$LOOKUP_OUTPUT"; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "✅ ClawHub version ${{ steps.release.outputs.version }} remains available."
+          else
+            cat "$LOOKUP_OUTPUT"
+            echo "❌ Unable to determine ClawHub version status."
+            exit 1
+          fi
+
+      # ── 11. Publish to ClawHub dry run ────────────────────────────────
+      - name: Publish to ClawHub dry run
+        if: steps.clawhub-version.outputs.exists != 'true'
+        run: |
+          clawhub package publish "$RUNNER_TEMP/release-candidate/${{ steps.release.outputs.clawhub_package }}" \
             --family code-plugin \
-            --version "${{ steps.version.outputs.version }}" \
+            --version "${{ steps.release.outputs.version }}" \
             --source-repo "${{ github.repository }}" \
-            --source-commit "${{ steps.version.outputs.commit_sha }}" \
-            --source-ref "${{ steps.version.outputs.tag }}" \
+            --source-commit "${{ steps.release.outputs.commit_sha }}" \
+            --source-ref "${{ steps.release.outputs.tag }}" \
             --dry-run
 
-      # ── 14. Publish to ClawHub (actual) ──────────────────────────────
+      # ── 12. Publish to ClawHub ────────────────────────────────────────
       - name: Publish to ClawHub
+        if: steps.clawhub-version.outputs.exists != 'true'
         run: |
-          clawhub package publish "${{ steps.package.outputs.tarball_path }}" \
+          clawhub package publish "$RUNNER_TEMP/release-candidate/${{ steps.release.outputs.clawhub_package }}" \
             --family code-plugin \
-            --version "${{ steps.version.outputs.version }}" \
+            --version "${{ steps.release.outputs.version }}" \
             --source-repo "${{ github.repository }}" \
-            --source-commit "${{ steps.version.outputs.commit_sha }}" \
-            --source-ref "${{ steps.version.outputs.tag }}"
+            --source-commit "${{ steps.release.outputs.commit_sha }}" \
+            --source-ref "${{ steps.release.outputs.tag }}"
 
-      # ── 15. Create git tag ───────────────────────────────────────────
+      # ── 13. Verify ClawHub release ────────────────────────────────────
+      - name: Verify ClawHub release
+        run: |
+          for ATTEMPT in 1 2 3 4 5 6; do
+            if clawhub package inspect 8080ai --version "${{ steps.release.outputs.version }}" --json >/dev/null 2>&1; then
+              echo "✅ Verified ClawHub version ${{ steps.release.outputs.version }}."
+              exit 0
+            fi
+
+            echo "Waiting for ClawHub version ${{ steps.release.outputs.version }} (attempt $ATTEMPT/6)"
+            sleep 10
+          done
+
+          echo "❌ ClawHub version ${{ steps.release.outputs.version }} was not found after publishing."
+          exit 1
+
+      # ── 14. Extract verified SkillHub package ─────────────────────────
+      - name: Extract verified SkillHub package
+        run: |
+          SKILLHUB_ARCHIVE="$RUNNER_TEMP/release-candidate/${{ steps.release.outputs.skillhub_package }}"
+          test -f "$SKILLHUB_ARCHIVE" || { echo "::error::Verified SkillHub archive $SKILLHUB_ARCHIVE is missing."; exit 1; }
+          mkdir -p release-skillhub
+          unzip -q "$SKILLHUB_ARCHIVE" -d release-skillhub || { echo "::error::Failed to extract the verified SkillHub archive."; exit 1; }
+          test -f release-skillhub/ai8080/SKILL.md || { echo "::error::Extracted SkillHub package is missing SKILL.md."; exit 1; }
+          test -f release-skillhub/ai8080/.skillhub.json || { echo "::error::Extracted SkillHub package is missing .skillhub.json."; exit 1; }
+          echo "✅ Verified SkillHub package extracted successfully."
+
+      # ── 15. Configure SkillHub token ──────────────────────────────────
+      - name: Configure SkillHub token
+        run: |
+          test -n "$SKILLHUB_TOKEN" || { echo "::error::SKILLHUB_TOKEN secret is not configured."; exit 1; }
+          mkdir -p "$HOME/.skillhub"
+          node -e "
+            const fs = require('fs');
+            const authPath = process.env.HOME + '/.skillhub/auth.json';
+            fs.writeFileSync(authPath, JSON.stringify({
+              accessToken: process.env.SKILLHUB_TOKEN,
+              user: { username: 'github-actions', email: '', tier: 'standard' }
+            }, null, 2), { mode: 0o600 });
+          "
+          echo "✅ SkillHub authentication file configured securely."
+        env:
+          SKILLHUB_TOKEN: ${{ secrets.SKILLHUB_TOKEN }}
+
+      # ── 16. Verify SkillHub authentication ────────────────────────────
+      - name: Verify SkillHub authentication
+        run: npx -y @skill-hub/cli whoami
+
+      # ── 17. Recheck SkillHub semantic version ─────────────────────────
+      - name: Recheck SkillHub semantic version
+        id: skillhub-version
+        env:
+          SKILLHUB_TOKEN: ${{ secrets.SKILLHUB_TOKEN }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          node --input-type=module <<'NODE'
+            import fs from 'node:fs';
+
+            const apiRoot = 'https://www.skillhub.club/api';
+            const configPath = 'release-skillhub/ai8080/.skillhub.json';
+            const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+            const localContent = fs.readFileSync('release-skillhub/ai8080/SKILL.md', 'utf8');
+            const releaseVersion = process.env.RELEASE_VERSION;
+
+            const getVersion = (content) => {
+              const frontmatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
+              const versionLine = frontmatter?.[1]
+                .split(/\r?\n/)
+                .find((line) => line.startsWith('version:'));
+              return versionLine?.slice('version:'.length).trim() ?? null;
+            };
+            const normalize = (content) => content.replace(/\r\n/g, '\n').trimEnd();
+
+            if (getVersion(localContent) !== releaseVersion) {
+              throw new Error(`Packaged SKILL.md version does not match ${releaseVersion}.`);
+            }
+
+            const request = async (endpoint) => {
+              const response = await fetch(apiRoot + endpoint, {
+                headers: { Authorization: `Bearer ${process.env.SKILLHUB_TOKEN}` }
+              });
+
+              if (!response.ok) {
+                throw new Error(`SkillHub ${endpoint} returned HTTP ${response.status}.`);
+              }
+
+              return response.json();
+            };
+
+            const { skills = [] } = await request('/user/skills');
+            const expectedName = config.name.toLowerCase();
+            const matches = skills.filter((skill) => (
+              skill.name?.toLowerCase() === expectedName ||
+              skill.slug?.toLowerCase() === expectedName ||
+              (config.slug && skill.slug?.toLowerCase() === config.slug.toLowerCase())
+            ));
+
+            if (matches.length > 1) {
+              throw new Error(`Multiple SkillHub skills match "${config.name}".`);
+            }
+
+            if (matches.length === 0) {
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, 'exists=false\n');
+              console.log(`No existing SkillHub skill named "${config.name}"; push will create it.`);
+              process.exit(0);
+            }
+
+            const skill = matches[0];
+            const { versions = [] } = await request(`/user/skills/${encodeURIComponent(skill.id)}/versions`);
+            let existingContent = null;
+            let existingInternalVersion = null;
+
+            for (const remoteVersion of versions) {
+              const pulled = await request(
+                `/user/skills/${encodeURIComponent(skill.id)}/pull?version=${encodeURIComponent(remoteVersion.version)}`
+              );
+              const skillFile = pulled.files?.find((file) => file.filepath === 'SKILL.md');
+
+              if (skillFile && getVersion(skillFile.content) === releaseVersion) {
+                existingContent = skillFile.content;
+                existingInternalVersion = remoteVersion.version;
+                break;
+              }
+            }
+
+            fs.writeFileSync(configPath, JSON.stringify({
+              ...config,
+              skill_id: skill.id,
+              slug: skill.slug
+            }, null, 2));
+
+            if (existingContent) {
+              if (normalize(existingContent) !== normalize(localContent)) {
+                throw new Error(
+                  `SkillHub semantic version ${releaseVersion} already exists with different content.`
+                );
+              }
+
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, 'exists=true\n');
+              console.log(
+                `SkillHub semantic version ${releaseVersion} already exists as internal version ${existingInternalVersion} ` +
+                `with matching content; push is skipped and publishing resumes.`
+              );
+              process.exit(0);
+            }
+
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'exists=false\n');
+            console.log(`Linked existing SkillHub skill ${skill.slug}; ${releaseVersion} remains available.`);
+          NODE
+
+      # ── 18. Push SkillHub skill ───────────────────────────────────────
+      - name: Push SkillHub skill
+        if: steps.skillhub-version.outputs.exists != 'true'
+        working-directory: release-skillhub/ai8080
+        run: npx -y @skill-hub/cli push --create --force
+
+      # ── 19. Publish SkillHub skill ────────────────────────────────────
+      - name: Publish SkillHub skill
+        working-directory: release-skillhub/ai8080
+        run: npx -y @skill-hub/cli publish -y
+
+      # ── 20. Verify SkillHub release ───────────────────────────────────
+      - name: Verify SkillHub release
+        env:
+          SKILLHUB_TOKEN: ${{ secrets.SKILLHUB_TOKEN }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          node --input-type=module <<'NODE'
+            import fs from 'node:fs';
+
+            const apiRoot = 'https://www.skillhub.club/api';
+            const config = JSON.parse(fs.readFileSync('release-skillhub/ai8080/.skillhub.json', 'utf8'));
+            const localContent = fs.readFileSync('release-skillhub/ai8080/SKILL.md', 'utf8');
+            const releaseVersion = process.env.RELEASE_VERSION;
+
+            const getVersion = (content) => {
+              const frontmatter = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n/);
+              const versionLine = frontmatter?.[1]
+                .split(/\r?\n/)
+                .find((line) => line.startsWith('version:'));
+              return versionLine?.slice('version:'.length).trim() ?? null;
+            };
+            const normalize = (content) => content.replace(/\r\n/g, '\n').trimEnd();
+            const request = async (endpoint) => {
+              const response = await fetch(apiRoot + endpoint, {
+                headers: { Authorization: `Bearer ${process.env.SKILLHUB_TOKEN}` }
+              });
+
+              if (!response.ok) {
+                throw new Error(`SkillHub ${endpoint} returned HTTP ${response.status}.`);
+              }
+
+              return response.json();
+            };
+
+            const { skills = [] } = await request('/user/skills');
+            const skill = skills.find((entry) => (
+              entry.id === config.skill_id ||
+              entry.name?.toLowerCase() === config.name.toLowerCase() ||
+              entry.slug?.toLowerCase() === config.name.toLowerCase()
+            ));
+
+            if (!skill) {
+              throw new Error(`SkillHub skill "${config.name}" was not found after publishing.`);
+            }
+
+            const { versions = [] } = await request(`/user/skills/${encodeURIComponent(skill.id)}/versions`);
+            let publishedContent = null;
+
+            for (const remoteVersion of versions) {
+              const pulled = await request(
+                `/user/skills/${encodeURIComponent(skill.id)}/pull?version=${encodeURIComponent(remoteVersion.version)}`
+              );
+              const skillFile = pulled.files?.find((file) => file.filepath === 'SKILL.md');
+
+              if (skillFile && getVersion(skillFile.content) === releaseVersion) {
+                publishedContent = skillFile.content;
+                break;
+              }
+            }
+
+            if (!publishedContent) {
+              throw new Error(`SkillHub semantic version ${releaseVersion} was not found after publishing.`);
+            }
+
+            if (normalize(publishedContent) !== normalize(localContent)) {
+              throw new Error(`SkillHub semantic version ${releaseVersion} does not match the release candidate.`);
+            }
+
+            if (skill.status !== 'published') {
+              throw new Error(`SkillHub skill ${skill.slug} is ${skill.status}, not published.`);
+            }
+
+            console.log(`Verified SkillHub ${skill.slug} semantic version ${releaseVersion}.`);
+          NODE
+
+      # ── 21. Create git tag ────────────────────────────────────────────
       - name: Create git tag
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.release.outputs.tag }}" "${{ steps.release.outputs.commit_sha }}" || { echo "::error::Failed to create Git tag ${{ steps.release.outputs.tag }}."; exit 1; }
+          git push origin "${{ steps.release.outputs.tag }}" || { echo "::error::Failed to push Git tag ${{ steps.release.outputs.tag }} to origin."; exit 1; }
+          echo "✅ Git tag ${{ steps.release.outputs.tag }} created and pushed successfully."
 
-          git tag "${{ steps.version.outputs.tag }}" "${{ steps.version.outputs.commit_sha }}"
-          git push origin "${{ steps.version.outputs.tag }}"
-
-      # ── 16. Create GitHub release ────────────────────────────────────
+      # ── 22. Create GitHub release ─────────────────────────────────────
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: ${{ steps.version.outputs.tag }}
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: ${{ steps.release.outputs.tag }}
           generate_release_notes: true
-          files: ${{ steps.package.outputs.tarball_path }}
+          files: |
+            ${{ runner.temp }}/release-candidate/${{ steps.release.outputs.clawhub_package }}
+            ${{ runner.temp }}/release-candidate/${{ steps.release.outputs.skillhub_package }}
 
-      # ── 17. Confirm publish ──────────────────────────────────────────
-      - name: Confirm publish
+      # ── 23. Report publish failure ────────────────────────────────────
+      - name: Report publish failure
+        if: failure()
         run: |
-          echo "✅ Successfully published 8080ai v${{ steps.version.outputs.version }} to ClawHub"
-          echo "✅ Created package tarball ${{ steps.package.outputs.tarball }}"
-          echo "✅ Created GitHub release ${{ steps.version.outputs.tag }}"
-          echo ""
-          echo "Users can now install with:"
-          echo "  openclaw plugins install clawhub:8080ai"
+          echo "::error title=Publish Release failed::Review the first failed step above for the specific registry, validation, tag, or GitHub Release error."
+          echo "Repository: ${{ github.repository }}"
+          echo "Release tag: ${{ steps.release.outputs.tag }}"
+          echo "Verified commit: ${{ steps.release.outputs.commit_sha }}"
+          echo "Preflight run: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.preflight_run_id }}"
+          echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      # ── 24. Confirm release ───────────────────────────────────────────
+      - name: Confirm release
+        run: |
+          echo "✅ ClawHub contains 8080ai ${{ steps.release.outputs.version }}."
+          echo "✅ SkillHub contains ai8080 ${{ steps.release.outputs.version }}."
+          echo "✅ Git tag and GitHub Release ${{ steps.release.outputs.tag }} are available."
