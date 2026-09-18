@@ -84,6 +84,13 @@ export function getLabelForAgent(
   continueButtonLabel?: string | boolean,
   backendButtons?: BackendButton[]
 ): string {
+  // Keep the plan-all action name concise regardless of the legacy label
+  // returned by the backend.
+  if (
+    agent === "plan_all" ||
+    (agent.startsWith("GROUP:") && agent.slice(6).split("|").includes("plan_all"))
+  ) return "Start";
+
   if (backendButtons && backendButtons.length > 0) {
     if (
       agent === "continue" ||

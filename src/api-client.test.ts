@@ -337,7 +337,7 @@ test("getLabelForAgent", (t) => {
     assert.strictEqual(getLabelForAgent("continue", false), "Continue");
     assert.strictEqual(getLabelForAgent("continue", true), "Generate First Page");
     assert.strictEqual(getLabelForAgent("review"), "Review");
-    assert.strictEqual(getLabelForAgent("plan_all"), "🚀 Run Plan All");
+    assert.strictEqual(getLabelForAgent("plan_all"), "Start");
     assert.strictEqual(getLabelForAgent("GROUP:agent_a|agent_b"), "🚀 Run agent_a, agent_b");
   });
 
@@ -360,7 +360,23 @@ test("getLabelForAgent", (t) => {
     const buttons: BackendButton[] = [
       { key: "run_agents", kind: "agent", label: "Run Plan All", action: "trigger_agents", payload: { agents: ["plan_all"] } },
     ];
-    assert.strictEqual(getLabelForAgent("plan_all", false, buttons), "Run Plan All");
+    assert.strictEqual(getLabelForAgent("plan_all", false, buttons), "Start");
+  });
+
+  t.test("should use Start for a grouped plan-all action", () => {
+    const buttons: BackendButton[] = [
+      {
+        key: "run_agents",
+        kind: "agent",
+        label: "Run Plan All",
+        action: "trigger_agents",
+        payload: { agents: ["System Requirements Agent", "plan_all"] },
+      },
+    ];
+    assert.strictEqual(
+      getLabelForAgent("GROUP:System Requirements Agent|plan_all", false, buttons),
+      "Start"
+    );
   });
 
   t.test("should match group agents based on payload contents", () => {

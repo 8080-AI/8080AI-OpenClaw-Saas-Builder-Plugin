@@ -360,7 +360,7 @@ export const AGENT_DISPLAY_NAMES: Record<string, string> = {
   'System Architect': '🏗️ Architecture',
   'User Flow Planner Agent': '🔀 User Flows',
   'User Flow Planner': '🔀 User Flows',
-  'plan_all': '🚀 Run Plan All',
+  'plan_all': 'Start',
   'start_build': '🛠️ Start Building',
   'start_building': '🛠️ Start Building',
   'continue': '▶️ Continue',

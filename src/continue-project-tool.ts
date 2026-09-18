@@ -20,7 +20,7 @@ export function createContinueProjectTool(deps: {
     description:
       "Signal 8080.ai to resume design/planning after a requirement-review checkpoint. " +
       "Use only when the user chooses Continue, Resume, Proceed with planning, or Approve requirements. " +
-      "Do not use for Run Plan All or Start Building; those must trigger the suggested agents or build action. " +
+      "Do not use for Start or Start Building; those must trigger the suggested agents or build action. " +
       "If this tool returns no visible content, do not summarize, announce, or confirm the action; remain silent until the plugin returns visible next-step actions. " +
       "For long-running 8080.ai actions, always pass timeoutMs=600000 so OpenClaw allows the tool call to wait for agent completion.",
     parameters: Type.Object({
@@ -126,7 +126,7 @@ export function createContinueProjectTool(deps: {
               presentation,
             };
           }
-          log.info("continue_project received plan_all suggestion; showing Run Plan All instead of auto-triggering", {
+          log.info("continue_project received plan_all suggestion; showing Start instead of auto-triggering", {
             projectId: activeProjectId,
             source: "continue_project_tool",
             suggestions: suggestedAgents,

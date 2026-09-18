@@ -57,7 +57,7 @@ export function createSendMessageTool(deps: {
       "Use when the user wants to add new requirements, make changes, or ask questions about the project. " +
       "IMPORTANT: Pass the user's EXACT message. Do not expand or rewrite it. " +
       "The AI will return a response. You MUST output this response EXACTLY word-for-word to the user without summarizing. " +
-      "For Run Plan All or Continue selections, if the tool returns no visible content, do not summarize, announce, or confirm the action; remain silent until visible Continue/Review actions are returned. " +
+      "For Start or Continue selections, if the tool returns no visible content, do not summarize, announce, or confirm the action; remain silent until visible Continue/Review actions are returned. " +
       "For long-running 8080.ai actions, always pass timeoutMs=600000 so OpenClaw allows the tool call to wait for agent completion.",
     parameters: Type.Object({
       projectId: Type.Optional(Type.String({
@@ -91,7 +91,7 @@ export function createSendMessageTool(deps: {
       });
       // Detect button-style selections that should trigger actions directly.
       const trimmedContent = params.content.trim().toLowerCase();
-      const isRunPlanAll = /run\s+plan\s+all/i.test(trimmedContent);
+      const isRunPlanAll = trimmedContent === "start" || /run\s+plan\s+all/i.test(trimmedContent);
       const numericSelection = trimmedContent.match(/^(?:select\s+)?(\d+)$/);
       const isStartBuildingSelection = /^(?:start[\s_-]*building|start[\s_-]*build)$/i.test(trimmedContent);
 
