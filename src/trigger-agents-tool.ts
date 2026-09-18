@@ -102,7 +102,7 @@ export function createTriggerAgentsTool(deps: {
     description:
       "Trigger specific AI agents on 8080.ai. " +
       "If the user sends a raw button payload like '8080_trigger_agents_<projectId>_<agentsJsonArray>', you MUST use this tool. Extract the projectId and parse the JSON array of agents to pass as arguments. This starts the suggested agents working on the project. " +
-      "After Run Plan All is triggered, do not summarize, announce, or confirm that agents started. If this tool returns no visible content, remain silent. Only show the user the returned Continue/Review actions when the tool returns visible content. " +
+      "After Start is triggered for the plan-all action, do not summarize, announce, or confirm that agents started. If this tool returns no visible content, remain silent. Only show the user the returned Continue/Review actions when the tool returns visible content. " +
       "For long-running 8080.ai actions, always pass timeoutMs=600000 so OpenClaw allows the tool call to wait for agent completion.",
     parameters: Type.Object({
       projectId: Type.String({

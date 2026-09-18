@@ -194,7 +194,7 @@ export function createStartProjectTool(deps: {
 
         let finalResponse = cleanText;
         if (!isQuestion && suggestedAgents.length > 0) {
-          finalResponse += `\n\n▶️ Type **"Run Plan All"** to proceed.`;
+          finalResponse += `\n\n▶️ Type **"Start"** to proceed.`;
         }
         if (!finalResponse.trim()) {
           finalResponse =

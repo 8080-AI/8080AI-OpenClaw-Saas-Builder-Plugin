@@ -85,7 +85,9 @@ function groupPlanningAgents(agents: string[]): string[] {
 
 function checkpointAgentsFromMessage(content: string): string[] {
   const agents: string[] = [];
-  if (/run\s+plan\s+all/i.test(content)) agents.push("plan_all");
+  if (/run\s+plan\s+all/i.test(content) || /(?:click|type)\s+(?:\*\*)?["']?start\b/i.test(content)) {
+    agents.push("plan_all");
+  }
   if (/\bcontinue\b/i.test(content)) agents.push("continue");
   if (/\breview\b/i.test(content) && !/click\s+\*\*continue\*\*/i.test(content)) agents.push("review");
   return agents.length > 0 ? agents : ["continue"];
