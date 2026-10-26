@@ -4,6 +4,8 @@ import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { writeLatestSuggestions } from "./suggestions-state.ts";
 import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
 import { log } from "../logger.ts";
+import { getBuildTasksReadiness } from "./build-readiness.ts";
+import { readActiveModel } from "./model-state.ts";
 
 export function createProjectStatusTool(deps: {
   stateDir: () => string;
@@ -96,6 +98,27 @@ export function createProjectStatusTool(deps: {
         const pending = extractPendingSuggestion(status.pending_suggested_agents);
         let agents = pending.agents;
         let presentation: unknown;
+
+        const activeModel = await readActiveModel(stateDir);
+        const buildReadiness = await getBuildTasksReadiness(
+          client,
+          projectId,
+          activeModel
+        ).catch((err) => {
+          log.info("project_status build execution-state check failed", {
+            projectId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return null;
+        });
+        if (buildReadiness?.canStart) {
+          agents = ["start_building", "review"];
+          log.info("project_status replaced planning suggestions with Build Tasks", {
+            projectId,
+            phaseId: buildReadiness.phaseId,
+            runnableTaskCount: buildReadiness.state.runnable_tasks?.length ?? 0,
+          });
+        }
 
         if (agents.length === 0) {
           try {

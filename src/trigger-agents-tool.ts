@@ -6,9 +6,10 @@ import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion, type PendingSuggestion } from "./suggested-agents.ts";
 import { readLatestSuggestionsForProject, writeLatestSuggestions } from "./suggestions-state.ts";
 import { silentToolResult } from "./exact-response.ts";
-import { formatStartBuildingTasks } from "./task-summary.ts";
+import { formatProjectTasks, formatStartBuildingTasks } from "./task-summary.ts";
 import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
+import { buildTasksUnavailableMessage, getBuildTasksReadiness } from "./build-readiness.ts";
 import { log } from "../logger.ts";
 
 function statusHasReviewCheckpoint(status: ProjectStatus): boolean {
@@ -38,6 +39,28 @@ function isPlanningActivityLog(entry: { action?: string | null; agent_type?: str
     summary.includes("designing screen flows") ||
     summary.includes("generated")
   );
+}
+
+async function getTaskListForResponse(
+  client: Awaited<ReturnType<typeof requireAuthenticatedClient>>,
+  projectId: string
+): Promise<string> {
+  try {
+    const tasksResponse = await client.getTasks(projectId);
+    const formattedTasks = formatProjectTasks(projectId, tasksResponse);
+    log.info("trigger_agents tasks attached to checkpoint response", {
+      projectId,
+      totalTasks: formattedTasks.totalTasks,
+      statusCounts: formattedTasks.statusCounts,
+    });
+    return formattedTasks.text;
+  } catch (taskErr) {
+    log.info("trigger_agents task fetch failed; returning checkpoint without tasks", {
+      projectId,
+      error: taskErr instanceof Error ? taskErr.message : String(taskErr),
+    });
+    return "";
+  }
 }
 
 async function waitForReviewCheckpoint(
@@ -132,27 +155,27 @@ export function createTriggerAgentsTool(deps: {
       try {
         const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
         const activeModel = await readActiveModel(stateDir);
-        if (params.agents.includes("start_building")) {
+        if (params.agents.some((agent) => agent === "start_building" || agent === "start_build")) {
           log.info("trigger_agents received start_building", {
             projectId: params.projectId,
             agents: params.agents,
             activeModel,
           });
-          const [tasksForBuild, archForBuild] = await Promise.all([
+          const [tasksForBuild, buildReadiness] = await Promise.all([
             client.getTasks(params.projectId).catch(() => null),
-            client.getArchitecture(params.projectId).catch(() => null),
+            getBuildTasksReadiness(client, params.projectId, activeModel),
           ]);
-          const canStartBuilding = hasGeneratedData(tasksForBuild) && hasGeneratedData(archForBuild);
           log.info("start_building selected readiness decision", {
             projectId: params.projectId,
-            hasTasks: hasGeneratedData(tasksForBuild),
-            hasArchitecture: hasGeneratedData(archForBuild),
-            canStartBuilding,
+            canStartBuilding: buildReadiness.canStart,
+            phaseId: buildReadiness.phaseId,
+            blockingReason: buildReadiness.state.blocking_reason,
+            runnableTaskCount: buildReadiness.state.runnable_tasks?.length ?? 0,
           });
-          if (!canStartBuilding) {
+          if (!buildReadiness.canStart) {
             return {
-              content: [{ type: "text", text: "Start Building is not available yet. Architecture and tasks must be generated first." }],
-              details: { projectId: params.projectId, action: "build", blocked: true },
+              content: [{ type: "text", text: buildTasksUnavailableMessage(buildReadiness) }],
+              details: { projectId: params.projectId, action: "build", blocked: true, reason: buildReadiness.state.blocking_reason },
             };
           }
           const creditCheck = await precheckStartBuildingCredits(client, params.projectId, tasksForBuild, activeModel);
@@ -185,7 +208,7 @@ export function createTriggerAgentsTool(deps: {
             activeModel,
           });
           try {
-            await client.startBuilding(params.projectId, activeModel);
+            await client.startBuilding(params.projectId, activeModel, buildReadiness.phaseId);
           } catch (err) {
             const insufficientCreditsText = getInsufficientCreditsMessageFromError(err);
             if (insufficientCreditsText) {
@@ -342,17 +365,82 @@ export function createTriggerAgentsTool(deps: {
           });
         }
 
+        const buildReadinessAfterRun = await getBuildTasksReadiness(
+          client,
+          params.projectId,
+          activeModel,
+          2
+        ).catch((err) => {
+          log.info("trigger_agents build execution-state check failed", {
+            projectId: params.projectId,
+            agents: params.agents,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return null;
+        });
+
+        if (buildReadinessAfterRun?.canStart) {
+          const statusForBuild = await client.getProjectStatus(params.projectId).catch(() => null);
+          const pendingForBuild = extractPendingSuggestion(statusForBuild?.pending_suggested_agents);
+          const buildAgents = ["start_building", "review"];
+          const buildMessageId = pendingForBuild.messageId || suggestedAgentsMessageId || messageId;
+          await writeLatestSuggestions(stateDir, sessionId, {
+            projectId: params.projectId,
+            agents: buildAgents,
+            messageId: buildMessageId,
+            buttons: pendingForBuild.buttons,
+          });
+          const taskListText = await getTaskListForResponse(client, params.projectId);
+          const suggestedAgentsText = buildSuggestedAgentsText(
+            params.projectId,
+            buildAgents,
+            "",
+            undefined,
+            pendingForBuild.buttons
+          );
+          const text = taskListText
+            ? `${taskListText}\n\n${suggestedAgentsText}`
+            : suggestedAgentsText;
+          const presentation = buildSuggestedAgentsPresentation(
+            params.projectId,
+            buildAgents,
+            "",
+            undefined,
+            pendingForBuild.buttons
+          );
+          log.info("trigger_agents showing Build Tasks from authoritative execution state", {
+            projectId: params.projectId,
+            phaseId: buildReadinessAfterRun.phaseId,
+            runnableTaskCount: buildReadinessAfterRun.state.runnable_tasks?.length ?? 0,
+          });
+          onUpdate?.({ content: [{ type: "text", text }], details: null, presentation });
+          return {
+            content: [{ type: "text", text }],
+            details: {
+              status: "ready_to_build",
+              suggestions: buildAgents,
+              phaseId: buildReadinessAfterRun.phaseId,
+            },
+            presentation,
+          };
+        }
+
         if (
           suggestedAgentsFromEvents.length > 0 &&
           !hasSameAgents(suggestedAgentsFromEvents, params.agents)
         ) {
           const eventAgents = groupAgents(suggestedAgentsFromEvents);
           const eventMessageId = suggestedAgentsMessageId || messageId;
+          const statusButtons = await client.getProjectStatus(params.projectId)
+            .then((status) => extractPendingSuggestion(status.pending_suggested_agents).buttons)
+            .catch(() => undefined);
+          const autoRunButtons = (statusButtons ?? []).filter((button) => button?.kind === "auto_run");
+          const eventButtons = [...(suggestedAgentsButtons ?? []), ...autoRunButtons];
           await writeLatestSuggestions(stateDir, sessionId, {
             projectId: params.projectId,
             agents: eventAgents,
             messageId: eventMessageId,
-            buttons: suggestedAgentsButtons,
+            buttons: eventButtons,
           });
           log.info("trigger_agents showing event suggested agents", {
             projectId: params.projectId,
@@ -369,8 +457,18 @@ export function createTriggerAgentsTool(deps: {
           )
             ? await determineContinueButtonLabel(client, params.projectId)
             : undefined;
-          const text = buildSuggestedAgentsText(params.projectId, eventAgents, "", continueButtonLabel, suggestedAgentsButtons);
-          const presentation = buildSuggestedAgentsPresentation(params.projectId, eventAgents, "", continueButtonLabel, suggestedAgentsButtons);
+          const taskListText = await getTaskListForResponse(client, params.projectId);
+          const suggestedAgentsText = buildSuggestedAgentsText(
+            params.projectId,
+            eventAgents,
+            "",
+            continueButtonLabel,
+            eventButtons
+          );
+          const text = taskListText
+            ? `${taskListText}\n\n${suggestedAgentsText}`
+            : suggestedAgentsText;
+          const presentation = buildSuggestedAgentsPresentation(params.projectId, eventAgents, "", continueButtonLabel, eventButtons);
           onUpdate?.({ content: [{ type: "text", text }], details: null, presentation });
           return {
             content: [{ type: "text", text }],
@@ -445,7 +543,17 @@ export function createTriggerAgentsTool(deps: {
           buttons: pending.buttons,
         });
         const continueButtonLabel = reviewAgents.includes("continue") ? await determineContinueButtonLabel(client, params.projectId) : undefined;
-        const reviewText = buildSuggestedAgentsText(params.projectId, reviewAgents, "", continueButtonLabel, pending.buttons);
+        const taskListText = await getTaskListForResponse(client, params.projectId);
+        const suggestedAgentsText = buildSuggestedAgentsText(
+          params.projectId,
+          reviewAgents,
+          "",
+          continueButtonLabel,
+          pending.buttons
+        );
+        const reviewText = taskListText
+          ? `${taskListText}\n\n${suggestedAgentsText}`
+          : suggestedAgentsText;
         const presentation = buildSuggestedAgentsPresentation(params.projectId, reviewAgents, "", continueButtonLabel, pending.buttons);
         onUpdate?.({ content: [{ type: "text", text: reviewText }], details: null, presentation });
         return {

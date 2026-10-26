@@ -7,11 +7,17 @@ import { writeActiveProject } from "./project-state.ts";
 import { writeLatestSuggestions } from "./suggestions-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { exactToolResult } from "./exact-response.ts";
+import { formatProjectTasks } from "./task-summary.ts";
 import { log } from "../logger.ts";
 
 // AgentToolResult shape required by the OpenClaw SDK's onUpdate callback.
 type ToolContent = { type: "text"; text: string };
-type ToolResult<T = unknown> = { content: ToolContent[]; details: T; presentation?: any };
+type ToolResult<T = unknown> = {
+  content: ToolContent[];
+  details: T;
+  presentation?: any;
+  terminate?: boolean;
+};
 type OnUpdate = (partial: { content: ToolContent[]; details: any; presentation?: any }) => void;
 type StatusMessage = { id?: string; author?: string; content?: string };
 
@@ -36,6 +42,8 @@ export function createStartProjectTool(deps: {
   apiBaseUrl: string;
   pollingTimeoutMs: number;
   sessionId: string;
+  terminateAfterResponse?: boolean;
+  publishTerminalResponse?: (text: string) => void;
 }) {
   return {
     name: "ai8080_start_project",
@@ -163,12 +171,14 @@ export function createStartProjectTool(deps: {
         // stream. Instead, they're available via the project status
         // endpoint's `pending_suggested_agents` field after stream ends.
         // ----------------------------------------------------------------
-        if ((suggestedAgents.length === 0 || !suggestionMessageId) && projectId) {
+        let pendingButtons: any[] | undefined;
+        if (projectId) {
           try {
             const status = await client.getProjectStatus(projectId);
             const pending = extractPendingSuggestion(status.pending_suggested_agents);
             if (suggestedAgents.length === 0) suggestedAgents.push(...pending.agents);
             if (pending.messageId) suggestionMessageId = pending.messageId;
+            pendingButtons = pending.buttons;
             log.info("Fetched pending agents from status", suggestedAgents);
           } catch (statusErr) {
             log.info("Failed to fetch project status for agents", statusErr);
@@ -186,25 +196,60 @@ export function createStartProjectTool(deps: {
             projectId,
             agents: groupedAgents,
             messageId: suggestionMessageId,
+            buttons: pendingButtons,
           });
         }
 
         const cleanText = stripA2UI(accumulatedText);
         const isQuestion = cleanText.trim().endsWith("?");
 
-        let finalResponse = cleanText;
-        if (!isQuestion && suggestedAgents.length > 0) {
-          finalResponse += `\n\n▶️ Type **"Start"** to proceed.`;
+        let taskListText = "";
+        try {
+          const tasksResponse = await client.getTasks(projectId);
+          const formattedTasks = formatProjectTasks(projectId, tasksResponse);
+          taskListText = formattedTasks.text;
+          log.info("start_project tasks attached to Tech Lead response", {
+            projectId,
+            totalTasks: formattedTasks.totalTasks,
+            statusCounts: formattedTasks.statusCounts,
+          });
+        } catch (taskErr) {
+          log.info("start_project task fetch failed; returning Tech Lead response without tasks", {
+            projectId,
+            error: taskErr instanceof Error ? taskErr.message : String(taskErr),
+          });
         }
+
+        let finalResponse = cleanText;
         if (!finalResponse.trim()) {
           finalResponse =
             `Project \`${projectId}\` was created, but 8080.ai did not return an assistant response from /stream-trigger yet. ` +
             `Open or refresh the project on 8080.ai to check whether the Tech Lead response is still pending.`;
         }
+        if (taskListText) {
+          finalResponse += `${finalResponse.trim() ? "\n\n" : ""}${taskListText}`;
+        }
+        const suggestionText = !isQuestion && groupedAgents.length > 0
+          ? buildSuggestedAgentsText(projectId, groupedAgents, "", undefined, pendingButtons)
+          : "";
+        if (suggestionText) finalResponse += `\n\n${suggestionText}`;
+        const presentation = !isQuestion && groupedAgents.length > 0
+          ? buildSuggestedAgentsPresentation(projectId, groupedAgents, "", undefined, pendingButtons)
+          : undefined;
         log.info("Final response ready", { isQuestion, suggestedAgents });
-        void stream(onUpdate, `🤖 **AI Response:**\n\n${finalResponse}`);
+        void stream(onUpdate, `🤖 **AI Response:**\n\n${finalResponse}`, presentation);
         log.info("Initial response streamed.");
-        return exactToolResult(finalResponse, { projectId, phase: "started" }) as ToolResult;
+        // Webchat tool updates live inside the collapsible Activity card, so a
+        // terminal result must also be injected as a normal assistant message.
+        // The publisher queues that write until the active run releases its
+        // session lock; terminate then unlocks the composer immediately.
+        if (deps.terminateAfterResponse) deps.publishTerminalResponse?.(finalResponse);
+        return exactToolResult(
+          finalResponse,
+          { projectId, phase: "started" },
+          presentation,
+          { terminate: deps.terminateAfterResponse === true }
+        ) as ToolResult;
       } catch (err) {
         if (err instanceof AuthError) {
           return { content: [{ type: "text", text: (err as Error).message }], details: null };

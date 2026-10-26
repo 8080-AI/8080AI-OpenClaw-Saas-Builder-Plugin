@@ -26,6 +26,7 @@ The plugin lets an OpenClaw agent authenticate with [8080.ai](https://8080.ai), 
 ## Capabilities
 
 - Start a new [8080.ai](https://8080.ai) project from an OpenClaw prompt.
+- Show the current `/tasks` result alongside Tech Lead responses throughout the project workflow.
 - List and select existing [8080.ai](https://8080.ai) projects.
 - Review requirements, design, architecture, and task checkpoints.
 - Continue planning agents and start building when the project is ready.
@@ -160,7 +161,7 @@ These requests are handled through the registered OpenClaw tools:
 | review my [8080.ai](https://8080.ai) project requirements | `ai8080_open_project_requirements` |
 | continue my [8080.ai](https://8080.ai) project | `ai8080_continue_project` |
 | run the [8080.ai](https://8080.ai) planning agents | `ai8080_trigger_agents` |
-| `start building this project` | `ai8080_select_button` or `ai8080_send_message` |
+| `build tasks` or `start building this project` | `ai8080_select_button` or `ai8080_send_message` |
 
 ## Registered Tools
 
@@ -176,7 +177,8 @@ These requests are handled through the registered OpenClaw tools:
 | `ai8080_trigger_agents` | Runs selected planning or build agents for a project. |
 | `ai8080_list_projects` | Lists available projects and shows project-selection UI. |
 | `ai8080_select_project` | Sets an existing project as the active project for the session. |
-| `ai8080_select_button` | Resolves numbered suggested actions such as Continue, Review, or Start Building. |
+| `ai8080_select_button` | Resolves numbered suggested actions such as Continue, Review, or Build Tasks. |
+| `ai8080_wait_auto_run` | Cancels a scheduled automatic action so its adjacent action button can be triggered manually. |
 | `ai8080_task_list` | Fetches and summarizes the task list for the active project. |
 
 ## Notes

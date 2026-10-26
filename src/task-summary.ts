@@ -11,14 +11,17 @@ type TaskLike = {
   status?: unknown;
   priority?: unknown;
   effort_days?: unknown;
+  role?: unknown;
 };
 
 export function getTaskArray(data: unknown): TaskLike[] {
-  if (Array.isArray(data)) return data as TaskLike[];
+  if (Array.isArray(data)) {
+    return data.filter((item): item is TaskLike => Boolean(item) && typeof item === "object");
+  }
   if (data && typeof data === "object") {
     const record = data as Record<string, unknown>;
-    if (Array.isArray(record.tasks)) return record.tasks as TaskLike[];
-    if (Array.isArray(record.data)) return record.data as TaskLike[];
+    if (Array.isArray(record.tasks)) return getTaskArray(record.tasks);
+    if (Array.isArray(record.data)) return getTaskArray(record.data);
   }
   return [];
 }
@@ -31,6 +34,41 @@ function cleanValue(value: unknown, fallback: string): string {
 
 function normalizeStatus(value: unknown): string {
   return cleanValue(value, "unknown").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+export function formatProjectTasks(
+  projectId: string,
+  data: unknown
+): { text: string; statusCounts: Record<string, number>; totalTasks: number } {
+  const tasks = getTaskArray(data).filter((task) => normalizeStatus(task.status) === "todo");
+  const statusCounts = tasks.length > 0 ? { todo: tasks.length } : {};
+
+  if (tasks.length === 0) {
+    return {
+      text: `### Task List\n\nProject: \`${projectId}\`\n\nNo todo tasks are available.`,
+      statusCounts,
+      totalTasks: 0,
+    };
+  }
+
+  const lines = tasks.map((task, index) => {
+    const taskNumber = typeof task.task_number === "number" || typeof task.task_number === "string"
+      ? String(task.task_number)
+      : String(index + 1);
+    const title = cleanValue(task.title, `Task ${taskNumber}`);
+    return `${index + 1}. #${taskNumber} ${title}`;
+  });
+
+  return {
+    text:
+      `### Task List\n\n` +
+      `Project: \`${projectId}\`\n` +
+      `Total todo tasks: ${tasks.length}\n\n` +
+      `#### Todo (${tasks.length})\n\n` +
+      lines.join("\n"),
+    statusCounts,
+    totalTasks: tasks.length,
+  };
 }
 
 

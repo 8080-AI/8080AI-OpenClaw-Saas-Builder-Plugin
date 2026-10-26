@@ -5,19 +5,21 @@ import {
   buildProjectSelectionJsonl,
   buildRequirementsUrl,
   buildReviewContinueJsonl,
+  buildSuggestedAgentChoices,
   buildSuggestedAgentsJsonl,
   buildSuggestedAgentsPresentation,
   buildSuggestedAgentsText,
   parseButtonValue,
 } from "./review-continue.ts";
-import { writeLatestSuggestions, readLatestSuggestions } from "./suggestions-state.ts";
+import { consumeAutoRunSuggestion, writeLatestSuggestions, readLatestSuggestions } from "./suggestions-state.ts";
 import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
-import { formatStartBuildingTasks } from "./task-summary.ts";
+import { formatProjectTasks, formatStartBuildingTasks } from "./task-summary.ts";
 import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
 import { log } from "../logger.ts";
 import { buildProjectActivationResult } from "./project-activation.ts";
+import { buildTasksUnavailableMessage, getBuildTasksReadiness } from "./build-readiness.ts";
 
 function normalizeChoiceText(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
@@ -95,123 +97,9 @@ export function hasGeneratedData(data: unknown): boolean {
   return false;
 }
 
-type TaskRecord = Record<string, unknown>;
-
-const TASK_STATUS_ORDER = [
-  "backlog",
-  "todo",
-  "queued",
-  "ai_in_progress",
-  "human_in_progress",
-  "blocked",
-  "manual_review",
-  "done",
-  "cancelled",
-  "invalid",
-  "error",
-];
-
-function extractTaskArray(data: unknown): TaskRecord[] {
-  if (Array.isArray(data)) return data.filter((item): item is TaskRecord => Boolean(item) && typeof item === "object");
-  if (data && typeof data === "object") {
-    const record = data as Record<string, unknown>;
-    if (Array.isArray(record.tasks)) return extractTaskArray(record.tasks);
-    if (Array.isArray(record.data)) return extractTaskArray(record.data);
-  }
-  return [];
-}
-
-function taskString(task: TaskRecord, key: string): string | undefined {
-  const value = task[key];
-  if (typeof value !== "string") return undefined;
-  const trimmed = value.trim();
-  return trimmed || undefined;
-}
-
-function taskNumber(task: TaskRecord, key: string): number | undefined {
-  const value = task[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function formatTaskStatus(status: string): string {
-  const normalized = status.replace(/_/g, " ");
-  return normalized.replace(/\b\w/g, (char) => char.toUpperCase());
-}
-
-function formatTaskDescription(text: string): string {
-  return text
-    .trim()
-    .split(/\r?\n/)
-    .map((line) => `   ${line.trim()}`)
-    .join("\n");
-}
-
-export function formatTaskList(projectId: string, rawTasks: unknown): { text: string; statusCounts: Record<string, number>; totalTasks: number } {
-  const tasks = extractTaskArray(rawTasks);
-  const grouped = new Map<string, TaskRecord[]>();
-
-  for (const task of tasks) {
-    const status = taskString(task, "status") ?? "unknown";
-    const normalizedStatus = status.toLowerCase();
-    const bucket = grouped.get(normalizedStatus) ?? [];
-    bucket.push(task);
-    grouped.set(normalizedStatus, bucket);
-  }
-
-  const statusOrder = [
-    ...TASK_STATUS_ORDER.filter((status) => grouped.has(status)),
-    ...[...grouped.keys()].filter((status) => !TASK_STATUS_ORDER.includes(status)).sort(),
-  ];
-
-  const statusCounts: Record<string, number> = {};
-  for (const [status, statusTasks] of grouped.entries()) {
-    statusCounts[status] = statusTasks.length;
-  }
-
-  if (tasks.length === 0) {
-    return {
-      text: `### Task List\n\nProject: \`${projectId}\`\n\nNo tasks found for this project.`,
-      statusCounts,
-      totalTasks: 0,
-    };
-  }
-
-  const sections = statusOrder.map((status) => {
-    const statusTasks = grouped.get(status) ?? [];
-    const lines = statusTasks.map((task, index) => {
-      const taskNo = taskNumber(task, "task_number") ?? index + 1;
-      const title = taskString(task, "title") ?? `Task ${taskNo}`;
-      const role = taskString(task, "role");
-      const priority = taskString(task, "priority");
-      const effort = taskNumber(task, "effort_days");
-      const description = taskString(task, "description");
-
-      const meta = [
-        role ? `Role: ${role}` : undefined,
-        priority ? `Priority: ${priority}` : undefined,
-        effort !== undefined ? `Effort: ${effort}d` : undefined,
-      ].filter(Boolean).join(" | ");
-
-      return [
-        `${index + 1}. #${taskNo} ${title}`,
-        meta ? `   ${meta}` : undefined,
-        description ? formatTaskDescription(description) : undefined,
-      ].filter(Boolean).join("\n");
-    });
-
-    return `#### ${formatTaskStatus(status)} (${statusTasks.length})\n\n${lines.join("\n\n")}`;
-  });
-
-  return {
-    text:
-      `### Task List\n\n` +
-      `Project: \`${projectId}\`\n` +
-      `Total tasks: ${tasks.length}\n\n` +
-      sections.join("\n\n"),
-    statusCounts,
-    totalTasks: tasks.length,
-  };
-}
+// Kept as a compatibility export for callers that imported the formatter from
+// command.ts before task rendering was shared with Tech Lead responses.
+export const formatTaskList = formatProjectTasks;
 
 export function create8080Command(
   api: {
@@ -319,8 +207,24 @@ export function create8080Command(
             const continueButtonLabel = groupedAgents.includes("continue") ? await determineContinueButtonLabel(client, projectId) : undefined;
             const cleanText = stripA2UI(responseText);
             const streamDisplay = cleanText ? `\n\n**Tech Lead:**\n${cleanText}` : "";
+            let taskListText = "";
+            try {
+              const tasksResponse = await client.getTasks(projectId);
+              const formattedTasks = formatProjectTasks(projectId, tasksResponse);
+              taskListText = `\n\n${formattedTasks.text}`;
+              log.info("command start tasks attached to Tech Lead response", {
+                projectId,
+                totalTasks: formattedTasks.totalTasks,
+                statusCounts: formattedTasks.statusCounts,
+              });
+            } catch (taskErr) {
+              log.info("command start task fetch failed; returning Tech Lead response without tasks", {
+                projectId,
+                error: taskErr instanceof Error ? taskErr.message : String(taskErr),
+              });
+            }
             const agentList = groupedAgents.length > 0
-              ? buildSuggestedAgentsText(projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)
+              ? `\n\n${buildSuggestedAgentsText(projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)}`
               : "";
             const presentation = groupedAgents.length > 0
               ? buildSuggestedAgentsPresentation(projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)
@@ -329,9 +233,9 @@ export function create8080Command(
             return {
               text:
                 `✅ **Stream connection established**\n` +
-                `🚀 Project created on 8080.ai!${streamDisplay}\n\n` +
+                `🚀 Project created on 8080.ai!${streamDisplay}${taskListText}\n\n` +
                 `**Project ID:** ${projectId}\n\n` +
-                `The project has been set as active for this session. ${agentList}`,
+                `The project has been set as active for this session.${agentList}`,
               presentation,
             };
           } catch (err) {
@@ -613,8 +517,24 @@ export function create8080Command(
             const continueButtonLabel = groupedAgents.includes("continue") ? await determineContinueButtonLabel(client, projectId) : undefined;
             const cleanText = stripA2UI(responseText);
             const streamDisplay = cleanText ? `\n\n**AI Response:**\n${cleanText}` : "";
+            let taskListText = "";
+            try {
+              const tasksResponse = await client.getTasks(projectId);
+              const formattedTasks = formatProjectTasks(projectId, tasksResponse);
+              taskListText = `\n\n${formattedTasks.text}`;
+              log.info("command message tasks attached to Tech Lead response", {
+                projectId,
+                totalTasks: formattedTasks.totalTasks,
+                statusCounts: formattedTasks.statusCounts,
+              });
+            } catch (taskErr) {
+              log.info("command message task fetch failed; returning Tech Lead response without tasks", {
+                projectId,
+                error: taskErr instanceof Error ? taskErr.message : String(taskErr),
+              });
+            }
             const agentList = groupedAgents.length > 0
-              ? buildSuggestedAgentsText(projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)
+              ? `\n\n${buildSuggestedAgentsText(projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)}`
               : "";
 
             const presentation = groupedAgents.length > 0
@@ -623,7 +543,7 @@ export function create8080Command(
             const buttonsJsonl = groupedAgents.length > 0 ? `\n\n${buildSuggestedAgentsJsonl(projectId, groupedAgents, continueButtonLabel, pendingButtons)}` : "";
 
             return {
-              text: `🤖 **Stream connection established**\n${streamDisplay}${agentList}${buttonsJsonl}`,
+              text: `🤖 **Stream connection established**\n${streamDisplay}${taskListText}${agentList}${buttonsJsonl}`,
               presentation,
             };
           } catch (err) {
@@ -650,16 +570,31 @@ export function create8080Command(
             return { text: "No suggested agents found to select from." };
           }
 
+          const displayedChoices = buildSuggestedAgentChoices(
+            suggestions.projectId,
+            suggestions.agents,
+            undefined,
+            suggestions.buttons
+          );
           const normalizedChoice = normalizeChoiceText(choice);
           const num = parseInt(choice, 10);
           let selectedAgent: string | undefined;
+          let selectedValue: string | undefined;
           if (!isNaN(num)) {
-            if (num < 1 || num > suggestions.agents.length) {
-              return { text: `⚠️  "${choice}" is not valid. Pick a number between 1 and ${suggestions.agents.length}.` };
+            if (num < 1 || num > displayedChoices.length) {
+              return { text: `⚠️  "${choice}" is not valid. Pick a number between 1 and ${displayedChoices.length}.` };
             }
-            selectedAgent = suggestions.agents[num - 1];
+            const selected = displayedChoices[num - 1];
+            selectedAgent = selected?.agent;
+            selectedValue = selected?.value;
           } else {
-            selectedAgent = suggestions.agents.find((agent) => {
+            const displayedChoice = displayedChoices.find((candidate) =>
+              normalizeChoiceText(candidate.label) === normalizedChoice
+            );
+            selectedAgent = displayedChoice?.agent;
+            selectedValue = displayedChoice?.value;
+
+            selectedAgent ??= suggestions.agents.find((agent) => {
               const normalizedAgent = normalizeChoiceText(agent);
               return normalizedAgent === normalizedChoice;
             });
@@ -673,18 +608,51 @@ export function create8080Command(
               });
             }
             if (!selectedAgent) {
-              return { text: `⚠️  "${choice}" is not valid. Pick a number between 1 and ${suggestions.agents.length}, or use an option name like \`start-building\`.` };
+              const parsedDisplayedChoice = selectedValue ? parseButtonValue(selectedValue) : null;
+              if (parsedDisplayedChoice?.action !== "wait") {
+                return { text: `⚠️  "${choice}" is not valid. Pick a number between 1 and ${displayedChoices.length}, or use an option name like \`wait\` or \`start-building\`.` };
+              }
             }
           }
 
           log.info("select-button resolved selection", {
             choice,
             selectedAgent,
+            selectedValue,
             suggestions: suggestions.agents,
           });
 
           try {
             const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
+            const parsedSelection = selectedValue ? parseButtonValue(selectedValue) : null;
+
+            if (parsedSelection?.action === "wait" && parsedSelection.entryId) {
+              // Cancel first: an extra status request here would consume part
+              // of the short auto-run countdown for no functional benefit.
+              const result = await client.waitForAutoRun(parsedSelection.projectId, parsedSelection.entryId);
+              await consumeAutoRunSuggestion(
+                stateDir,
+                sessionId,
+                parsedSelection.projectId,
+                parsedSelection.entryId
+              );
+              if (result.status === "cancelled") {
+                const label = parsedSelection.label || "the action";
+                return {
+                  text:
+                    `Automatic ${label} was cancelled. Choose ${label} when you are ready to trigger it manually.` +
+                    `\n\n### Suggested Next Steps:\n1. ${label}`,
+                };
+              }
+              return {
+                text: "That automatic action is no longer scheduled; it may already be running or completed.",
+              };
+            }
+
+            if (!selectedAgent) {
+              return { text: `⚠️  "${choice}" is not a valid action.` };
+            }
+
             const activeModel = await readActiveModel(stateDir);
 
             if (selectedAgent === 'review') {
@@ -701,21 +669,21 @@ export function create8080Command(
               };
             }
 
-            if (selectedAgent === 'start_building') {
-              const [tasksForBuild, archForBuild] = await Promise.all([
+            if (selectedAgent === 'start_building' || selectedAgent === 'start_build') {
+              const [tasksForBuild, buildReadiness] = await Promise.all([
                 client.getTasks(suggestions.projectId).catch(() => null),
-                client.getArchitecture(suggestions.projectId).catch(() => null),
+                getBuildTasksReadiness(client, suggestions.projectId, activeModel),
               ]);
-              const canStartBuilding = hasGeneratedData(tasksForBuild) && hasGeneratedData(archForBuild);
               log.info("start_building selected readiness decision", {
                 projectId: suggestions.projectId,
-                hasTasks: hasGeneratedData(tasksForBuild),
-                hasArchitecture: hasGeneratedData(archForBuild),
-                canStartBuilding,
+                canStartBuilding: buildReadiness.canStart,
+                phaseId: buildReadiness.phaseId,
+                blockingReason: buildReadiness.state.blocking_reason,
+                runnableTaskCount: buildReadiness.state.runnable_tasks?.length ?? 0,
               });
-              if (!canStartBuilding) {
+              if (!buildReadiness.canStart) {
                 return {
-                  text: "Start Building is not available yet. Architecture and tasks must be generated first.",
+                  text: buildTasksUnavailableMessage(buildReadiness),
                 };
               }
               const creditCheck = await precheckStartBuildingCredits(client, suggestions.projectId, tasksForBuild, activeModel, [], siteUrl);
@@ -738,7 +706,7 @@ export function create8080Command(
                 activeModel,
               });
               try {
-                await client.startBuilding(suggestions.projectId, activeModel);
+                await client.startBuilding(suggestions.projectId, activeModel, buildReadiness.phaseId);
               } catch (err) {
                 const insufficientCreditsText = getInsufficientCreditsMessageFromError(err, siteUrl);
                 if (insufficientCreditsText) {
@@ -856,6 +824,54 @@ export function create8080Command(
               });
               const logsText = "";
 
+              const buildReadiness = await getBuildTasksReadiness(
+                client,
+                suggestions.projectId,
+                activeModel,
+                2
+              ).catch((err) => {
+                log.info("build tasks execution-state check failed", {
+                  projectId: suggestions.projectId,
+                  source: "command_continue",
+                  error: err instanceof Error ? err.message : String(err),
+                });
+                return null;
+              });
+
+              if (buildReadiness?.canStart) {
+                const statusForBuild = await client.getProjectStatus(suggestions.projectId).catch(() => null);
+                const pendingForBuild = extractPendingSuggestion(statusForBuild?.pending_suggested_agents);
+                const buildAgents = ["start_building", "review"];
+                await writeLatestSuggestions(stateDir, sessionId, {
+                  projectId: suggestions.projectId,
+                  agents: buildAgents,
+                  messageId: pendingForBuild.messageId || suggestions.messageId || "",
+                  buttons: pendingForBuild.buttons,
+                });
+                log.info("build tasks shown from authoritative execution state", {
+                  projectId: suggestions.projectId,
+                  source: "command_continue",
+                  phaseId: buildReadiness.phaseId,
+                  runnableTaskCount: buildReadiness.state.runnable_tasks?.length ?? 0,
+                });
+                return {
+                  text: buildSuggestedAgentsText(
+                    suggestions.projectId,
+                    buildAgents,
+                    "",
+                    undefined,
+                    pendingForBuild.buttons
+                  ),
+                  presentation: buildSuggestedAgentsPresentation(
+                    suggestions.projectId,
+                    buildAgents,
+                    "",
+                    undefined,
+                    pendingForBuild.buttons
+                  ),
+                };
+              }
+
               if (pausedForReview) {
                 log.info("start_building readiness decision 1 in command", {
                   projectId: suggestions.projectId,
@@ -920,7 +936,7 @@ export function create8080Command(
                   projectId: suggestions.projectId,
                   canBuildForPlan,
                 });
-                const canShowStartBuilding = canBuildForPlan && eventEndedWithStartBuildingMessage;
+                const canShowStartBuilding = buildReadiness?.canStart === true;
                 const statusAfterReadiness = await client.getProjectStatus(suggestions.projectId).catch(() => null);
                 const pendingAfterReadiness = extractPendingSuggestion(statusAfterReadiness?.pending_suggested_agents);
                 const backendResumeSuggestions = pendingAfterReadiness.agents.filter((agent) =>
@@ -1077,6 +1093,52 @@ export function create8080Command(
               progressTimeoutMs: 180_000,
               maxTimeoutMs: 180_000,
             });
+
+            const buildReadinessAfterRun = await getBuildTasksReadiness(
+              client,
+              suggestions.projectId,
+              activeModel,
+              2
+            ).catch((err) => {
+              log.info("command trigger build execution-state check failed", {
+                projectId: suggestions.projectId,
+                selectedAgent,
+                error: err instanceof Error ? err.message : String(err),
+              });
+              return null;
+            });
+            if (buildReadinessAfterRun?.canStart) {
+              const statusForBuild = await client.getProjectStatus(suggestions.projectId).catch(() => null);
+              const pendingForBuild = extractPendingSuggestion(statusForBuild?.pending_suggested_agents);
+              const buildAgents = ["start_building", "review"];
+              await writeLatestSuggestions(stateDir, sessionId, {
+                projectId: suggestions.projectId,
+                agents: buildAgents,
+                messageId: pendingForBuild.messageId || suggestions.messageId || "",
+                buttons: pendingForBuild.buttons,
+              });
+              log.info("command trigger showing Build Tasks from authoritative execution state", {
+                projectId: suggestions.projectId,
+                phaseId: buildReadinessAfterRun.phaseId,
+                runnableTaskCount: buildReadinessAfterRun.state.runnable_tasks?.length ?? 0,
+              });
+              return {
+                text: buildSuggestedAgentsText(
+                  suggestions.projectId,
+                  buildAgents,
+                  "",
+                  undefined,
+                  pendingForBuild.buttons
+                ),
+                presentation: buildSuggestedAgentsPresentation(
+                  suggestions.projectId,
+                  buildAgents,
+                  "",
+                  undefined,
+                  pendingForBuild.buttons
+                ),
+              };
+            }
 
             if (pausedForReview) {
               const logsText = "";

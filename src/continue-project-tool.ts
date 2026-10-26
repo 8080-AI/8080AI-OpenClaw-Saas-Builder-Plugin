@@ -5,10 +5,11 @@ import { readLatestSuggestionsForProject, writeLatestSuggestions } from "./sugge
 import { silentToolResult } from "./exact-response.ts";
 import { log } from "../logger.ts";
 import { readActiveModel } from "./model-state.ts";
-import { formatStartBuildingTasks } from "./task-summary.ts";
+import { formatProjectTasks, formatStartBuildingTasks } from "./task-summary.ts";
 import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
-import { extractPendingSuggestion } from "./suggested-agents.ts";
+import { extractPendingSuggestion, mergeSuggestedButtons } from "./suggested-agents.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
+import { buildTasksUnavailableMessage, getBuildTasksReadiness } from "./build-readiness.ts";
 
 export function createContinueProjectTool(deps: {
   stateDir: () => string;
@@ -20,7 +21,7 @@ export function createContinueProjectTool(deps: {
     description:
       "Signal 8080.ai to resume design/planning after a requirement-review checkpoint. " +
       "Use only when the user chooses Continue, Resume, Proceed with planning, or Approve requirements. " +
-      "Do not use for Start or Start Building; those must trigger the suggested agents or build action. " +
+      "Do not use for Start or Build Tasks; those must trigger the suggested agents or build action. " +
       "If this tool returns no visible content, do not summarize, announce, or confirm the action; remain silent until the plugin returns visible next-step actions. " +
       "For long-running 8080.ai actions, always pass timeoutMs=600000 so OpenClaw allows the tool call to wait for agent completion.",
     parameters: Type.Object({
@@ -67,26 +68,26 @@ export function createContinueProjectTool(deps: {
 
         const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
         latestSuggestions = await readLatestSuggestionsForProject(stateDir, sessionId, activeProjectId);
-        if (!latestSuggestions || !latestSuggestions.messageId) {
-          try {
-            const status = await client.getProjectStatus(activeProjectId);
-            const pending = extractPendingSuggestion(status.pending_suggested_agents);
-            if (pending.agents.length > 0) {
-              latestSuggestions = {
-                projectId: activeProjectId,
-                agents: pending.agents,
-                messageId: pending.messageId,
-              };
-              await writeLatestSuggestions(stateDir, sessionId, latestSuggestions);
-              log.info("continue_project hydrated suggestions from project status", {
-                projectId: activeProjectId,
-                agents: pending.agents,
-                messageId: pending.messageId,
-              });
-            }
-          } catch (err) {
-            log.info("continue_project failed to hydrate suggestions from project status", err);
+        try {
+          const status = await client.getProjectStatus(activeProjectId);
+          const pending = extractPendingSuggestion(status.pending_suggested_agents);
+          if (pending.agents.length > 0 || latestSuggestions) {
+            latestSuggestions = {
+              projectId: activeProjectId,
+              agents: pending.agents.length > 0 ? pending.agents : latestSuggestions?.agents ?? [],
+              messageId: pending.messageId || latestSuggestions?.messageId || "",
+              buttons: pending.buttons ?? latestSuggestions?.buttons,
+            };
+            await writeLatestSuggestions(stateDir, sessionId, latestSuggestions);
+            log.info("continue_project refreshed suggestions from project status", {
+              projectId: activeProjectId,
+              agents: latestSuggestions.agents,
+              messageId: latestSuggestions.messageId,
+              hasButtons: Boolean(latestSuggestions.buttons?.length),
+            });
           }
+        } catch (err) {
+          log.info("continue_project failed to hydrate suggestions from project status", err);
         }
         const suggestedAgents = latestSuggestions?.agents ?? [];
         const hasContinueSuggestion = suggestedAgents.includes("continue");
@@ -307,9 +308,9 @@ export function createContinueProjectTool(deps: {
 
         if (shouldStartBuilding) {
           const activeModel = await readActiveModel(stateDir);
-          const [tasksForBuild, archForBuild] = await Promise.all([
+          const [tasksForBuild, buildReadiness] = await Promise.all([
             client.getTasks(activeProjectId).catch(() => null),
-            client.getArchitecture(activeProjectId).catch(() => null),
+            getBuildTasksReadiness(client, activeProjectId, activeModel),
           ]);
 
           function hasGeneratedData(data: unknown): boolean {
@@ -321,18 +322,18 @@ export function createContinueProjectTool(deps: {
             return false;
           }
 
-          const canStartBuilding = hasGeneratedData(tasksForBuild) && hasGeneratedData(archForBuild);
           log.info("start_building selected via continue_project fallback", {
             projectId: activeProjectId,
             source: "continue_project_tool",
             suggestions: latestSuggestions.agents,
-            hasTasks: hasGeneratedData(tasksForBuild),
-            hasArchitecture: hasGeneratedData(archForBuild),
-            canStartBuilding,
+            canStartBuilding: buildReadiness.canStart,
+            phaseId: buildReadiness.phaseId,
+            blockingReason: buildReadiness.state.blocking_reason,
+            runnableTaskCount: buildReadiness.state.runnable_tasks?.length ?? 0,
           });
-          if (!canStartBuilding) {
+          if (!buildReadiness.canStart) {
             return {
-              content: [{ type: "text", text: "Start Building is not available yet. Architecture and tasks must be generated first." }],
+              content: [{ type: "text", text: buildTasksUnavailableMessage(buildReadiness) }],
             };
           }
 
@@ -358,7 +359,7 @@ export function createContinueProjectTool(deps: {
             activeModel,
           });
           try {
-            await client.startBuilding(activeProjectId, activeModel);
+            await client.startBuilding(activeProjectId, activeModel, buildReadiness.phaseId);
           } catch (err) {
             const insufficientCreditsText = getInsufficientCreditsMessageFromError(err);
             if (insufficientCreditsText) {
@@ -668,6 +669,7 @@ export function createContinueProjectTool(deps: {
         const hasTasks = hasGeneratedData(tasks);
         const hasArchitecture = hasGeneratedData(arch);
         const hasDesignPages = hasGeneratedData(designPages);
+        const taskListText = hasTasks ? formatProjectTasks(activeProjectId, tasks).text : "";
         log.info("start_building condition-check 2 in continue_project_tool", {
           projectId: activeProjectId,
           source: "continue_project_tool",
@@ -681,6 +683,59 @@ export function createContinueProjectTool(deps: {
         });
         const logsText = "";
 
+        const activeModelForReadiness = await readActiveModel(stateDir);
+        const buildReadiness = await getBuildTasksReadiness(
+          client,
+          activeProjectId,
+          activeModelForReadiness,
+          2
+        ).catch((err) => {
+          log.info("build tasks execution-state check failed", {
+            projectId: activeProjectId,
+            source: "continue_project_tool",
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return null;
+        });
+
+        if (buildReadiness?.canStart) {
+          const statusForBuild = await client.getProjectStatus(activeProjectId).catch(() => null);
+          const pendingForBuild = extractPendingSuggestion(statusForBuild?.pending_suggested_agents);
+          const suggestions = ["start_building", "review"];
+          await writeLatestSuggestions(stateDir, sessionId, {
+            projectId: activeProjectId,
+            agents: suggestions,
+            messageId: pendingForBuild.messageId || suggestedAgentsMessageId || latestSuggestions?.messageId || "",
+            buttons: pendingForBuild.buttons,
+          });
+          const finalResult =
+            (taskListText ? `${taskListText}\n\n` : "") +
+            buildSuggestedAgentsText(activeProjectId, suggestions, "", undefined, pendingForBuild.buttons);
+          const presentation = buildSuggestedAgentsPresentation(
+            activeProjectId,
+            suggestions,
+            "",
+            undefined,
+            pendingForBuild.buttons
+          );
+          log.info("build tasks shown from authoritative execution state", {
+            projectId: activeProjectId,
+            source: "continue_project_tool",
+            phaseId: buildReadiness.phaseId,
+            runnableTaskCount: buildReadiness.state.runnable_tasks?.length ?? 0,
+          });
+          onUpdate?.({ content: [{ type: "text", text: finalResult }], details: null, presentation });
+          return {
+            content: [{ type: "text", text: finalResult }],
+            details: {
+              status: "ready_to_build",
+              suggestions,
+              phaseId: buildReadiness.phaseId,
+            },
+            presentation,
+          };
+        }
+
         if (pausedForReview) {
           const statusAfterPause = await client.getProjectStatus(activeProjectId).catch(() => null);
           const pendingAfterPause = extractPendingSuggestion(statusAfterPause?.pending_suggested_agents);
@@ -689,9 +744,10 @@ export function createContinueProjectTool(deps: {
             ? suggestedAgentsFromEvents
             : pendingAfterPause.agents;
             
-          let rawButtons = suggestedAgentsButtons !== undefined
-            ? suggestedAgentsButtons
-            : pendingAfterPause.buttons;
+          const rawButtons = mergeSuggestedButtons(
+            suggestedAgentsButtons,
+            pendingAfterPause.buttons
+          );
 
           let rawMessageId = suggestedAgentsMessageId || pendingAfterPause.messageId || latestSuggestions?.messageId || "";
 
@@ -731,7 +787,9 @@ export function createContinueProjectTool(deps: {
               buttons: rawButtons,
             });
             const continueButtonLabel = suggestions.includes("continue") ? await determineContinueButtonLabel(client, activeProjectId) : undefined;
-            const finalResult = buildSuggestedAgentsText(activeProjectId, suggestions, "", continueButtonLabel, rawButtons);
+            const finalResult =
+              (taskListText ? `${taskListText}\n\n` : "") +
+              buildSuggestedAgentsText(activeProjectId, suggestions, "", continueButtonLabel, rawButtons);
             const presentation = buildSuggestedAgentsPresentation(activeProjectId, suggestions, "", continueButtonLabel, rawButtons);
             onUpdate?.({ content: [{ type: "text", text: finalResult }] });
             return {
@@ -783,6 +841,7 @@ export function createContinueProjectTool(deps: {
             const continueButtonLabel = suggestions.includes("continue") ? await determineContinueButtonLabel(client, activeProjectId) : undefined;
             const finalResult =
               "8080.ai has generated the design, tasks, and architecture, but the final review/start-building event has not appeared in `/events` yet.\n\n" +
+              (taskListText ? `${taskListText}\n\n` : "") +
               buildSuggestedAgentsText(activeProjectId, suggestions, "", continueButtonLabel, pendingAfterReadiness.buttons);
             const presentation = buildSuggestedAgentsPresentation(activeProjectId, suggestions, "", continueButtonLabel, pendingAfterReadiness.buttons);
             onUpdate?.({ content: [{ type: "text", text: finalResult }] });
@@ -805,7 +864,7 @@ export function createContinueProjectTool(deps: {
             source: "continue_project_tool",
             canBuildForPlan,
           });
-          const canShowStartBuilding = canBuildForPlan && eventEndedWithStartBuildingMessage;
+          const canShowStartBuilding = buildReadiness?.canStart === true;
           const statusAfterReadiness = await client.getProjectStatus(activeProjectId).catch(() => null);
           const pendingAfterReadiness = extractPendingSuggestion(statusAfterReadiness?.pending_suggested_agents);
           const backendResumeSuggestions = pendingAfterReadiness.agents.filter((agent) =>
@@ -870,6 +929,7 @@ export function createContinueProjectTool(deps: {
           const continueButtonLabel = suggestions.includes("continue") ? await determineContinueButtonLabel(client, activeProjectId) : undefined;
           const finalResult =
             `✅ **Generation complete!**${logsText}\n\n` +
+            (taskListText ? `${taskListText}\n\n` : "") +
             (canShowStartBuilding
               ? `Review the design and architecture and start building.\n\n${buildSuggestedAgentsText(activeProjectId, suggestions, "", continueButtonLabel, pendingAfterReadiness.buttons)}`
               : canBuildForPlan
@@ -1024,9 +1084,10 @@ export function createContinueProjectTool(deps: {
 
           const suggestions = backendSuggestions.length > 0 ? backendSuggestions : ["continue", "review"];
             
-          let finalButtons = suggestedAgentsButtons !== undefined
-            ? suggestedAgentsButtons
-            : pending.buttons;
+          const finalButtons = mergeSuggestedButtons(
+            suggestedAgentsButtons,
+            pending.buttons
+          );
 
           let finalMessageId = suggestedAgentsMessageId || pending.messageId || latestSuggestions?.messageId || "";
 

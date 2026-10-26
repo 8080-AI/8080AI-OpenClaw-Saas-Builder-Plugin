@@ -46,22 +46,23 @@
         "ai8080_list_projects",
         "ai8080_select_project",
         "ai8080_select_button",
+        "ai8080_wait_auto_run",
         "ai8080_task_list"
       ]
     },
     "compat": {
-      "pluginApi": ">=2026.5.7",
-      "minGatewayVersion": "2026.5.7"
+      "pluginApi": ">=2026.10.5",
+      "minGatewayVersion": "2026.10.5"
     },
     "build": {
-      "openclawVersion": "2026.6.10",
-      "pluginSdkVersion": "2026.6.10"
+      "openclawVersion": "2026.10.5",
+      "pluginSdkVersion": "2026.10.5"
     }
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0",
     "eventsource-parser": "^3.0.8",
-    "openclaw": "^2026.6.9"
+    "openclaw": "^2026.10.5"
   },
   "devDependencies": {
     "@types/node": "^25.7.0",

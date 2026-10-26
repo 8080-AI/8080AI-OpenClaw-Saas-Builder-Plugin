@@ -390,6 +390,7 @@ test("getLabelForAgent", (t) => {
 import fs from "node:fs";
 import path from "node:path";
 import { createSelectButtonTool } from "./select-button-tool.ts";
+import { create8080Command } from "./command.ts";
 import { writeLatestSuggestions } from "./suggestions-state.ts";
 import { writeApiKey } from "./api-key.ts";
 
@@ -414,6 +415,63 @@ test("integration tests", async (t) => {
   t.after(() => {
     globalThis.fetch = originalFetch;
     fs.rmSync(testStateDir, { recursive: true, force: true });
+  });
+
+  const scheduledWaitSuggestions = {
+    projectId: "test-proj",
+    agents: ["plan_all"],
+    messageId: "offer",
+    buttons: [{
+      key: "start",
+      kind: "auto_run",
+      label: "Wait",
+      action: "wait_auto_run",
+      payload: {
+        entry_id: "offer",
+        button_key: "start",
+        label: "Start",
+        status: "scheduled",
+        fire_at: "2099-01-01T00:00:30+00:00",
+        server_now: "2099-01-01T00:00:00+00:00",
+      },
+    }],
+  };
+
+  async function assertDirectWaitRequest(run: () => Promise<unknown>) {
+    const requests: Array<{ url: string; init?: RequestInit }> = [];
+    globalThis.fetch = async (input, init) => {
+      requests.push({ url: String(input), init });
+      return Response.json({ status: "cancelled" });
+    };
+
+    await writeLatestSuggestions(testStateDir, "test-session", scheduledWaitSuggestions);
+    await run();
+
+    assert.strictEqual(requests.length, 1, "Wait must be the first and only API request");
+    assert.ok(requests[0].url.endsWith("/projects/test-proj/auto-runs/offer/wait"));
+    assert.strictEqual(requests[0].init?.method, "POST");
+    assert.strictEqual(requests[0].init?.body, undefined);
+    assert.strictEqual(new Headers(requests[0].init?.headers).get("Content-Type"), "application/json");
+  }
+
+  await t.test("natural-language Wait immediately posts the bodyless cancellation request", async () => {
+    const tool = createSelectButtonTool({
+      stateDir: () => testStateDir,
+      siteUrl: "http://localhost",
+      apiBaseUrl: "http://localhost",
+      sessionId: "test-session",
+    });
+
+    await assertDirectWaitRequest(() => tool.execute("id-wait", { choice: "wait" }, undefined, () => {}));
+  });
+
+  await t.test("slash-command Wait immediately posts the bodyless cancellation request", async () => {
+    const command = create8080Command(
+      { runtime: { state: { resolveStateDir: () => testStateDir } } },
+      { siteUrl: "http://localhost", apiBaseUrl: "http://localhost", sessionId: "test-session" }
+    );
+
+    await assertDirectWaitRequest(() => command.handler({ args: "select-button 2" }));
   });
 
   await t.test("should resolve choice and execute continue tool successfully", async () => {

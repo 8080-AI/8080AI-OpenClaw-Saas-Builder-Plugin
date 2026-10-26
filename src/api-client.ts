@@ -7,6 +7,92 @@ import { ApiKeyExpiredError, readApiKey } from "./api-key.ts";
 import { extractEventSuggestion, type PendingSuggestion } from "./suggested-agents.ts";
 import { log } from "../logger.ts";
 
+export type AutoRunEntry = {
+  entry_id: string;
+  session_id?: string;
+  kind?: string;
+  button_key: string;
+  label: string;
+  status: string;
+  fire_at: string;
+  reason?: string | null;
+};
+
+export type AutoRunsResponse = {
+  server_now?: string;
+  auto_runs: AutoRunEntry[];
+};
+
+export type BuildPhaseExecutionState = {
+  can_start: boolean;
+  blocking_reason?: string | null;
+  all_completed: boolean;
+  current_phase?: ({ id?: string; [key: string]: unknown }) | null;
+  runnable_tasks?: unknown[];
+  [key: string]: unknown;
+};
+
+export type PlanningStatus = {
+  is_active: boolean;
+  pm_step_status?: string | null;
+  run_status?: string | null;
+  pipeline_run_status?: string | null;
+  cancelled_phase?: string | null;
+  [key: string]: unknown;
+};
+
+function normalizeAutoRuns(data: unknown): AutoRunsResponse {
+  if (!data || typeof data !== "object") return { auto_runs: [] };
+  const record = data as Record<string, unknown>;
+  const autoRuns = Array.isArray(record.auto_runs)
+    ? record.auto_runs.filter((entry): entry is AutoRunEntry => {
+      if (!entry || typeof entry !== "object") return false;
+      const candidate = entry as Record<string, unknown>;
+      return (
+        typeof candidate.entry_id === "string" &&
+        typeof candidate.button_key === "string" &&
+        typeof candidate.label === "string" &&
+        candidate.status === "scheduled" &&
+        typeof candidate.fire_at === "string" &&
+        Number.isFinite(Date.parse(candidate.fire_at))
+      );
+    })
+    : [];
+
+  return {
+    server_now: typeof record.server_now === "string" ? record.server_now : undefined,
+    auto_runs: autoRuns,
+  };
+}
+
+function attachAutoRunsToPendingSuggestions(pending: unknown, data: AutoRunsResponse): Record<string, unknown> | null {
+  const record = pending && typeof pending === "object"
+    ? pending as Record<string, unknown>
+    : {};
+  const existingButtons = Array.isArray(record.buttons)
+    ? record.buttons.filter((button) => {
+      return !button || typeof button !== "object" || (button as Record<string, unknown>).kind !== "auto_run";
+    })
+    : [];
+  const autoRunButtons = data.auto_runs.map((entry) => ({
+    key: entry.button_key,
+    kind: "auto_run",
+    label: "Wait",
+    action: "wait_auto_run",
+    payload: {
+      ...entry,
+      server_now: data.server_now,
+    },
+  }));
+
+  if (Object.keys(record).length === 0 && autoRunButtons.length === 0) return null;
+
+  return {
+    ...record,
+    buttons: [...existingButtons, ...autoRunButtons],
+  };
+}
+
 export function isStartBuildingAgent(agent: string): boolean {
   return agent === "start_building" || agent === "start_build";
 }
@@ -361,8 +447,8 @@ export const AGENT_DISPLAY_NAMES: Record<string, string> = {
   'User Flow Planner Agent': '🔀 User Flows',
   'User Flow Planner': '🔀 User Flows',
   'plan_all': 'Start',
-  'start_build': '🛠️ Start Building',
-  'start_building': '🛠️ Start Building',
+  'start_build': 'Build Tasks',
+  'start_building': 'Build Tasks',
   'continue': '▶️ Continue',
   'review': '🔍 Review',
 };
@@ -445,7 +531,8 @@ async function apiFetch(
   opts: ClientOpts,
   method: string,
   path: string,
-  body?: unknown
+  body?: unknown,
+  requestOptions?: { jsonContentType?: boolean }
 ): Promise<unknown> {
   const url = `${opts.apiBaseUrl.replace(/\/$/, "")}${path}`;
   log.info("api_client request", {
@@ -458,7 +545,9 @@ async function apiFetch(
     method,
     headers: {
       ...authHeaders(opts),
-      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      ...(body !== undefined || requestOptions?.jsonContentType
+        ? { "Content-Type": "application/json" }
+        : {}),
     },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
   });
@@ -751,7 +840,18 @@ export function createApiClient(opts: ClientOpts) {
     // 8080.ai uses /projects/{id} (no slash) for detail
     // API returns ProjectDetailResponse: { project: {...}, messages: [...], pending_suggested_agents: {...} }
     async getProjectStatus(projectId: string): Promise<ProjectStatus> {
-      const raw = await get(`/projects/${projectId}`) as Record<string, unknown>;
+      const [raw, autoRuns] = await Promise.all([
+        get(`/projects/${projectId}`) as Promise<Record<string, unknown>>,
+        get(`/projects/${projectId}/auto-runs`)
+          .then(normalizeAutoRuns)
+          .catch((err) => {
+            log.info("project_auto_runs fetch failed", {
+              projectId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+            return { auto_runs: [] } as AutoRunsResponse;
+          }),
+      ]);
 
       // The API wraps project data inside a `project` field (ProjectDetailResponse).
       // Fall back to raw itself if the wrapper isn't present.
@@ -772,9 +872,61 @@ export function createApiClient(opts: ClientOpts) {
         steps: projectData.steps as BuildStep[] | undefined,
         progress: projectData.progress as number | undefined,
         // Extract pending_suggested_agents from the top-level response
-        pending_suggested_agents: raw.pending_suggested_agents as Record<string, unknown> | null ?? null,
+        pending_suggested_agents: attachAutoRunsToPendingSuggestions(raw.pending_suggested_agents, autoRuns),
       };
       return status;
+    },
+
+    async getAutoRuns(projectId: string): Promise<AutoRunsResponse> {
+      return normalizeAutoRuns(await get(`/projects/${projectId}/auto-runs`));
+    },
+
+    async getBuildPhaseExecutionState(
+      projectId: string,
+      modelTier: string = "super_large"
+    ): Promise<BuildPhaseExecutionState> {
+      const path =
+        `/projects/${encodeURIComponent(projectId)}/build-phases/execution-state` +
+        `?model_tier=${encodeURIComponent(modelTier)}`;
+      log.info("build_phase_execution_state api request", { projectId, modelTier, path });
+      const response = await get(path) as BuildPhaseExecutionState;
+      log.info("build_phase_execution_state api response", {
+        projectId,
+        modelTier,
+        canStart: response?.can_start,
+        blockingReason: response?.blocking_reason,
+        allCompleted: response?.all_completed,
+        currentPhaseId: response?.current_phase?.id,
+        runnableTaskCount: Array.isArray(response?.runnable_tasks) ? response.runnable_tasks.length : 0,
+      });
+      return response;
+    },
+
+    async getPlanningStatus(projectId: string): Promise<PlanningStatus> {
+      const path = `/chat/planning-status?project_id=${encodeURIComponent(projectId)}`;
+      log.info("planning_status api request", { projectId, path });
+      const response = await get(path) as PlanningStatus;
+      log.info("planning_status api response", {
+        projectId,
+        isActive: response?.is_active,
+        pmStepStatus: response?.pm_step_status,
+        runStatus: response?.run_status,
+        pipelineRunStatus: response?.pipeline_run_status,
+      });
+      return response;
+    },
+
+    async waitForAutoRun(projectId: string, entryId: string): Promise<{ status: string }> {
+      const response = await apiFetch(
+        opts,
+        "POST",
+        `/projects/${encodeURIComponent(projectId)}/auto-runs/${encodeURIComponent(entryId)}/wait`,
+        undefined,
+        { jsonContentType: true }
+      );
+      if (!response || typeof response !== "object") return { status: "not_scheduled" };
+      const status = (response as Record<string, unknown>).status;
+      return { status: typeof status === "string" ? status : "not_scheduled" };
     },
 
     // Resume the design pipeline after user review gate
@@ -796,8 +948,8 @@ export function createApiClient(opts: ClientOpts) {
 
     async getTasks(projectId: string): Promise<unknown> {
       const data = await get(`/projects/${projectId}/tasks`);
-      log.info("start_building readiness tasks", { projectId, summary: debugResponseSummary("tasks", data) });
-      log.info("start_building tasks response", {
+      log.info("project_tasks api response summary", { projectId, summary: debugResponseSummary("tasks", data) });
+      log.info("project_tasks api response", {
         projectId,
         count: Array.isArray(data) ? data.length : 0,
         latestFive: Array.isArray(data)
@@ -900,13 +1052,14 @@ export function createApiClient(opts: ClientOpts) {
     },
 
     // 8080.ai uses /projects/{id}/build (no slash) to start/continue building
-    async startBuilding(projectId: string, activeModel: string): Promise<void> {
+    async startBuilding(projectId: string, activeModel: string, phaseId?: string): Promise<void> {
       const path = `/projects/${projectId}/build`;
       const body = {
         default_model: activeModel || "super_large",
         force_execution_task_ids: [],
+        phase_id: phaseId ?? null,
       };
-      log.info("start_building build api request", { projectId, path, activeModel, body });
+      log.info("start_building build api request", { projectId, path, activeModel, phaseId, body });
       const response = await post(path, body);
       log.info("start_building build api response", { projectId, path, response });
     },

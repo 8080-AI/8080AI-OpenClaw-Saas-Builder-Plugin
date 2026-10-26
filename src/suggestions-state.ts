@@ -110,3 +110,30 @@ export async function readLatestSuggestionsForProject(
   log.info("suggestions-state read missing", { sessionId, filePath, projectPath, latestPath, projectId });
   return null;
 }
+
+/**
+ * Marks a completed/cancelled auto-run as consumed in locally cached
+ * suggestions. Its payload label remains available for the manual action,
+ * while Wait is no longer offered because the entry is not scheduled.
+ */
+export async function consumeAutoRunSuggestion(
+  stateDir: string,
+  sessionId: string,
+  projectId: string,
+  entryId: string
+): Promise<boolean> {
+  const suggestions = await readLatestSuggestionsForProject(stateDir, sessionId, projectId);
+  if (!suggestions?.buttons) return false;
+
+  let found = false;
+  const buttons = suggestions.buttons.map((button) => {
+    if (button?.kind !== "auto_run" || button?.payload?.entry_id !== entryId) return button;
+    found = true;
+    return { ...button, payload: { ...button.payload, status: "cancelled" } };
+  });
+  if (!found) return false;
+
+  await writeLatestSuggestions(stateDir, sessionId, { ...suggestions, buttons });
+  log.info("suggestions-state consumed auto-run", { sessionId, projectId, entryId });
+  return true;
+}

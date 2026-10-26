@@ -24,6 +24,7 @@
       "ai8080_list_projects",
       "ai8080_select_project",
       "ai8080_select_button",
+      "ai8080_wait_auto_run",
       "ai8080_task_list"
     ]
   },

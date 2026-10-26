@@ -1,7 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import { log } from "../logger.ts";
 import { AuthError, requireAuthenticatedClient } from "./api-client.ts";
-import { formatTaskList } from "./command.ts";
+import { formatProjectTasks } from "./task-summary.ts";
 import { readActiveProject } from "./project-state.ts";
 
 export function createTaskListTool(deps: {
@@ -12,9 +12,9 @@ export function createTaskListTool(deps: {
   return {
     name: "ai8080_task_list",
     description:
-      "Show the task list for a selected 8080.ai project. " +
+      "Show a compact list of todo tasks for a selected 8080.ai project. " +
       "Use this for '/ai8080 task-list', 'task-list', 'show project tasks', 'list tasks', or requests to fetch /projects/{project_id}/tasks. " +
-      "This tool must group tasks by their status such as todo, queued, ai_in_progress, done, error. " +
+      "Only todo tasks are shown; completed and other-status tasks are omitted. " +
       "Do not use ai8080_list_projects for task-list requests.",
     parameters: Type.Object({
       projectId: Type.Optional(Type.String({
@@ -59,7 +59,7 @@ export function createTaskListTool(deps: {
         });
 
         const tasksResponse = await client.getTasks(activeProjectId);
-        const formatted = formatTaskList(activeProjectId, tasksResponse);
+        const formatted = formatProjectTasks(activeProjectId, tasksResponse);
         log.info("task_list tool grouped response", {
           projectId: activeProjectId,
           totalTasks: formatted.totalTasks,
