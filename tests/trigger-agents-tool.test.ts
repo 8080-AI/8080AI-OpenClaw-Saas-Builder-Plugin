@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { writeApiKey } from "./api-key.ts";
-import { writeLatestSuggestions } from "./suggestions-state.ts";
-import { createTriggerAgentsTool } from "./trigger-agents-tool.ts";
+import { writeApiKey } from "../src/api-key.ts";
+import { writeLatestSuggestions } from "../src/suggestions-state.ts";
+import { createTriggerAgentsTool } from "../src/trigger-agents-tool.ts";
 
-test("trigger agent checkpoints include tasks returned by /tasks", async (t) => {
+test("automatic generation ends with Build Tasks and backend tasks", async (t) => {
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "ai8080-trigger-tasks-"));
   const issuedAt = new Date().toISOString();
   const apiKey = `sk-8080ai-${Buffer.from(JSON.stringify({
@@ -42,6 +42,7 @@ test("trigger agent checkpoints include tasks returned by /tasks", async (t) => 
     if (url.endsWith("/projects/test-project/events")) {
       const event = {
         type: "suggested_agents",
+        status: "paused_for_review",
         agents: ["generate_architecture", "review"],
         message_id: "message-2",
       };
@@ -49,6 +50,9 @@ test("trigger agent checkpoints include tasks returned by /tasks", async (t) => 
         headers: { "Content-Type": "text/event-stream" },
       });
     }
+    if (url.includes("planning-status")) return Response.json({ is_active: false, pm_step_status: "done" });
+    if (url.includes("execution-state")) return Response.json({ can_start: true, all_completed: false,
+      current_phase: { id: "phase" }, runnable_tasks: [{ task_number: 1, title: "Build calculator interface", status: "todo" }] });
     if (url.endsWith("/projects/test-project/tasks")) {
       taskRequestCount += 1;
       return Response.json([
@@ -115,5 +119,46 @@ test("trigger agent checkpoints include tasks returned by /tasks", async (t) => 
   assert.match(text, /### Task List/);
   assert.match(text, /Build calculator interface/);
   assert.match(text, /### Suggested Next Steps/);
-  assert.match(text, /Generate Architecture/);
+  assert.match(text, /Build Tasks/);
+});
+
+test("review polling waits for backend actions after planning has already completed", async () => {
+  const { waitForReviewActions } = await import("../src/trigger-agents-tool.ts");
+  let checks = 0;
+  const client = {
+    getProjectStatus: async () => ({
+      id: "project", messages: [{ content: "Please review the design." }],
+      pending_suggested_agents: ++checks < 3 ? null : {
+        buttons: [{ action: "resume_design", label: "Generate First Page" }],
+      },
+    }),
+    hasLatestCompletedAgentLog: async () => true,
+  };
+  const result = await waitForReviewActions(client as any, "project", {
+    pausedForReview: true, timeoutMs: 1000, intervalMs: 1,
+  });
+  assert.equal(checks, 3);
+  assert.equal(result.backendHasContinue, true);
+});
+
+test("review polling expires without inventing actions", async () => {
+  const { waitForReviewActions } = await import("../src/trigger-agents-tool.ts");
+  const { extractPendingSuggestion } = await import("../src/suggested-agents.ts");
+  const result = await waitForReviewActions({
+    getProjectStatus: async () => ({ id: "project", pending_suggested_agents: null }),
+    hasLatestCompletedAgentLog: async () => true,
+  } as any, "project", { pausedForReview: true, timeoutMs: 5, intervalMs: 1 });
+  assert.deepEqual(extractPendingSuggestion(result.status.pending_suggested_agents).agents, []);
+});
+
+test("scheduled backend buttons supply their action and retain Wait metadata", async () => {
+  const { extractPendingSuggestion } = await import("../src/suggested-agents.ts");
+  const { buildSuggestedAgentChoices } = await import("../src/review-continue.ts");
+  const button = { kind: "auto_run", action: "wait_auto_run", payload: {
+    entry_id: "first-page", button_key: "continue", label: "Generate First Page",
+    status: "scheduled", fire_at: "2030-01-01T00:00:30Z",
+  } };
+  const pending = extractPendingSuggestion({ buttons: [button] });
+  assert.deepEqual(buildSuggestedAgentChoices("project", pending.agents, undefined, pending.buttons).map(choice => choice.label), ["Generate First Page"]);
+  assert.deepEqual(extractPendingSuggestion({ buttons: [{ ...button, payload: { ...button.payload, status: "cancelled" } }] }).agents, []);
 });

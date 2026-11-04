@@ -1,17 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createApiClient } from "./api-client.ts";
-import { exactToolResult } from "./exact-response.ts";
-import { registerExactResponseHooks } from "./exact-response-hooks.ts";
-import { extractPendingSuggestion, mergeSuggestedButtons } from "./suggested-agents.ts";
+import { createApiClient } from "../src/api-client.ts";
+import { exactToolResult } from "../src/exact-response.ts";
+import { registerExactResponseHooks } from "../src/exact-response-hooks.ts";
+import { extractPendingSuggestion, hasScheduledAutoRunButton, isSuggestedActionReady, mergeSuggestedButtons } from "../src/suggested-agents.ts";
 import {
   buildSuggestedAgentChoices,
   buildSuggestedAgentsJsonl,
   buildSuggestedAgentsPresentation,
   buildSuggestedAgentsText,
+  isContinueActionAgent,
   parseButtonValue,
-} from "./review-continue.ts";
+} from "../src/review-continue.ts";
 
+const scheduledServerNow = Date.now();
 const scheduledStartButton = {
   key: "start",
   kind: "auto_run",
@@ -22,12 +24,12 @@ const scheduledStartButton = {
     button_key: "start",
     label: "Start",
     status: "scheduled",
-    fire_at: "2026-10-19T10:00:30+00:00",
-    server_now: "2026-10-19T10:00:00+00:00",
+    fire_at: new Date(scheduledServerNow + 30_000).toISOString(),
+    server_now: new Date(scheduledServerNow).toISOString(),
   },
 };
 
-test("scheduled Start renders Start first, Wait second, and a 30-second note", () => {
+test("scheduled Start renders only Start and its countdown without Wait", () => {
   const buttons = [scheduledStartButton];
   const presentation = buildSuggestedAgentsPresentation("project-123", ["plan_all"], "", undefined, buttons);
   const text = buildSuggestedAgentsText("project-123", ["plan_all"], "", undefined, buttons);
@@ -36,28 +38,26 @@ test("scheduled Start renders Start first, Wait second, and a 30-second note", (
   const textBlock = presentation?.blocks.find((block) => block.type === "text");
 
   assert.ok(buttonBlock?.type === "buttons");
-  assert.deepEqual(buttonBlock.buttons.map((button) => button.label), ["Start", "Wait"]);
+  assert.deepEqual(buttonBlock.buttons.map((button) => button.label), ["Start"]);
   assert.deepEqual(buttonBlock.buttons.map((button) => button.action), [
     { type: "command", command: "/ai8080 select-button 1" },
-    { type: "command", command: "/ai8080 select-button 2" },
   ]);
   assert.ok(textBlock?.type === "text");
   assert.match(textBlock.text, /Start will trigger automatically on 8080\.ai in 30 seconds/);
-  assert.match(text, /1\. Start\n2\. Wait/);
-  assert.match(text, /To run it manually, choose Wait first, then choose Start/);
-  assert.match(text, /`\/ai8080 select-button 2` cancels the automatic action directly/);
-  assert.deepEqual(jsonl.buttons.map((button: { label: string }) => button.label), ["Start", "Wait"]);
+  assert.match(text, /1\. Start/);
+  assert.doesNotMatch(text, /Wait/);
+  assert.doesNotMatch(text, /cancels the automatic action/);
+  assert.deepEqual(jsonl.buttons.map((button: { label: string }) => button.label), ["Start"]);
 
-  const parsed = parseButtonValue(buttonBlock.buttons[1].value ?? "");
+  const parsed = parseButtonValue(buttonBlock.buttons[0].value ?? "");
   assert.deepEqual(parsed, {
-    action: "wait",
+    action: "trigger_agents",
     projectId: "project-123",
-    entryId: "offer",
-    label: "Start",
+    agents: ["plan_all"],
   });
 });
 
-test("saved scheduled Generate First Page derives its label and renders Wait as option 1", () => {
+test("saved first-page schedule preserves its label without rendering Wait", () => {
   const buttons = [{
     ...scheduledStartButton,
     key: "continue",
@@ -79,7 +79,7 @@ test("saved scheduled Generate First Page derives its label and renders Wait as 
   const textBlock = presentation?.blocks.find((block) => block.type === "text");
 
   assert.ok(buttonBlock?.type === "buttons");
-  assert.deepEqual(buttonBlock.buttons.map((button) => button.label), ["Wait", "Generate First Page"]);
+  assert.deepEqual(buttonBlock.buttons.map((button) => button.label), ["Generate First Page"]);
   assert.ok(textBlock?.type === "text");
   assert.match(textBlock.text, /Generate First Page will trigger automatically/);
   const choices = buildSuggestedAgentChoices(
@@ -88,8 +88,8 @@ test("saved scheduled Generate First Page derives its label and renders Wait as 
     undefined,
     buttons
   );
-  assert.equal(parseButtonValue(choices[0]?.value ?? "")?.action, "wait");
-  assert.equal(parseButtonValue(choices[1]?.value ?? "")?.action, "continue");
+  assert.equal(parseButtonValue(choices[0]?.value ?? "")?.action, "continue");
+  assert.equal(choices.length, 1);
 });
 
 test("event buttons retain the scheduled Wait enriched by project status", () => {
@@ -122,7 +122,6 @@ test("event buttons retain the scheduled Wait enriched by project status", () =>
   );
 
   assert.deepEqual(choices.map((choice) => choice.label), [
-    "Wait",
     "Generate Architecture",
     "Review",
   ]);
@@ -137,8 +136,44 @@ test("ready-to-build suggestions are labeled Build Tasks instead of Generate Arc
   assert.deepEqual(choices.map((choice) => choice.label), ["Build Tasks", "Review"]);
 });
 
+test("completed design waits for the backend timer before showing Generate Architecture", () => {
+  const regularButton = {
+    key: "run_agents",
+    kind: "agent",
+    label: "Generate Architecture",
+    action: "resume_design",
+  };
+  const timerButton = {
+    key: "continue",
+    kind: "auto_run",
+    label: "Wait",
+    action: "wait_auto_run",
+    payload: {
+      entry_id: "architecture-entry",
+      button_key: "continue",
+      label: "Generate Architecture",
+      status: "scheduled",
+      fire_at: "2030-01-01T00:00:30Z",
+    },
+  };
+
+  assert.equal(hasScheduledAutoRunButton([regularButton]), false);
+  assert.equal(isSuggestedActionReady({
+    hasBackendAction: true,
+    checkpointReady: true,
+    requiresScheduledAutoRun: true,
+    buttons: [regularButton],
+  }), false);
+  assert.equal(isSuggestedActionReady({
+    hasBackendAction: true,
+    checkpointReady: true,
+    requiresScheduledAutoRun: true,
+    buttons: [regularButton, timerButton],
+  }), true);
+});
+
 for (const timedLabel of ["Generate Architecture", "Generate All Pages"]) {
-  test(`scheduled ${timedLabel} renders Wait, the action, and its countdown`, () => {
+  test(`scheduled ${timedLabel} renders the action and countdown without Wait`, () => {
     const buttons = [
       {
         key: "run_agents",
@@ -177,19 +212,17 @@ for (const timedLabel of ["Generate Architecture", "Generate All Pages"]) {
     assert.ok(buttonBlock?.type === "buttons");
     assert.deepEqual(
       buttonBlock.buttons.map((button) => button.label),
-      ["Wait", timedLabel, "Review"]
+      [timedLabel, "Review"]
     );
     assert.ok(textBlock?.type === "text");
     assert.match(textBlock.text, new RegExp(`${timedLabel} will trigger automatically on 8080\\.ai in 30 seconds`));
-    assert.match(text, new RegExp(`1\\. Wait\\n2\\. ${timedLabel}\\n3\\. Review`));
-    assert.match(text, new RegExp(`choose Wait first, then choose ${timedLabel}`));
+    assert.match(text, new RegExp(`1\\. ${timedLabel}\\n2\\. Review`));
+    assert.doesNotMatch(text, /Wait/);
 
     const parsed = parseButtonValue(buttonBlock.buttons[0].value ?? "");
     assert.deepEqual(parsed, {
-      action: "wait",
+      action: "continue",
       projectId: "project-123",
-      entryId: `gate-${timedLabel.toLowerCase().replaceAll(" ", "-")}`,
-      label: timedLabel,
     });
   });
 }
@@ -257,6 +290,29 @@ test("Wait is omitted when the auto-run is not scheduled or belongs to another a
   assert.deepEqual(mismatchedButtons.buttons.map((button) => button.label), ["Start"]);
 });
 
+test("backend-scheduled Start does not render Wait even with a past deadline", () => {
+  const expired = {
+    ...scheduledStartButton,
+    payload: {
+      ...scheduledStartButton.payload,
+      fire_at: new Date(Date.now() - 1_000).toISOString(),
+      server_now: new Date(Date.now() - 31_000).toISOString(),
+    },
+  };
+
+  const choices = buildSuggestedAgentChoices("project-123", ["plan_all"], undefined, [expired]);
+  assert.deepEqual(choices.map((choice) => choice.label), ["Start"]);
+  assert.equal(hasScheduledAutoRunButton([expired]), true);
+});
+
+test("all design continuation aliases use the resume-design action", () => {
+  assert.equal(isContinueActionAgent("continue"), true);
+  assert.equal(isContinueActionAgent("generate_first_page"), true);
+  assert.equal(isContinueActionAgent("generate_all_pages"), true);
+  assert.equal(isContinueActionAgent("generate_architecture"), true);
+  assert.equal(isContinueActionAgent("plan_all"), false);
+});
+
 test("exact-response hooks attach MessagePresentation to the delivered assistant reply", () => {
   const handlers = new Map<string, (event: any, ctx: any) => any>();
   registerExactResponseHooks({
@@ -287,7 +343,7 @@ test("exact-response hooks attach MessagePresentation to the delivered assistant
   }, ctx);
   assert.equal(delivered.payload.presentation.title, "8080.ai");
   const deliveredButtons = delivered.payload.presentation.blocks.find((block: { type: string }) => block.type === "buttons");
-  assert.deepEqual(deliveredButtons.buttons.map((button: { label: string }) => button.label), ["Start", "Wait"]);
+  assert.deepEqual(deliveredButtons.buttons.map((button: { label: string }) => button.label), ["Start"]);
 });
 
 test("terminal project responses release the chat turn without leaking into the next reply", () => {
@@ -322,7 +378,7 @@ test("terminal project responses release the chat turn without leaking into the 
   assert.equal(nextReply, undefined);
 });
 
-test("project status enriches pending actions from GET auto-runs and Wait posts without a body", async (t) => {
+test("schedule reads remain available but Wait cancellation is absent", async (t) => {
   const originalFetch = globalThis.fetch;
   const requests: Array<{ url: string; init?: RequestInit }> = [];
   t.after(() => { globalThis.fetch = originalFetch; });
@@ -358,9 +414,68 @@ test("project status enriches pending actions from GET auto-runs and Wait posts 
   assert.equal(pending.buttons?.[0]?.kind, "auto_run");
   assert.equal(pending.buttons?.[0]?.payload?.entry_id, "offer");
 
-  assert.deepEqual(await client.waitForAutoRun("project-123", "offer"), { status: "cancelled" });
-  const waitRequest = requests.find((request) => request.url.endsWith("/auto-runs/offer/wait"));
-  assert.equal(waitRequest?.init?.method, "POST");
-  assert.equal(waitRequest?.init?.body, undefined);
-  assert.equal(new Headers(waitRequest?.init?.headers).get("Content-Type"), "application/json");
+  assert.equal("waitForAutoRun" in client, false);
+  assert.equal(parseButtonValue(`8080_wait_${encodeURIComponent(JSON.stringify({ projectId: "project-123", entryId: "offer" }))}`), null);
+  assert.equal(requests.some(request => request.url.endsWith("/wait")), false);
+
+});
+
+test("project status retries a transient auto-run lookup before rendering suggestions", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let autoRunAttempts = 0;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.endsWith("/projects/project-retry/auto-runs")) {
+      autoRunAttempts += 1;
+      if (autoRunAttempts === 1) throw new TypeError("temporary connection failure");
+      return Response.json({
+        server_now: scheduledStartButton.payload.server_now,
+        auto_runs: [scheduledStartButton.payload],
+      });
+    }
+    if (url.endsWith("/projects/project-retry")) {
+      return Response.json({
+        project: { id: "project-retry", status: "active" },
+        pending_suggested_agents: { agents: ["plan_all"], buttons: [] },
+      });
+    }
+    return new Response("Not found", { status: 404 });
+  };
+
+  const client = createApiClient({ apiKey: "test-key", apiBaseUrl: "https://api.example/api/v1" });
+  const status = await client.getProjectStatus("project-retry");
+  const pending = extractPendingSuggestion(status.pending_suggested_agents);
+
+  assert.equal(autoRunAttempts, 2);
+  assert.equal(status.auto_runs_lookup_failed, false);
+  assert.equal(hasScheduledAutoRunButton(pending.buttons), true);
+});
+
+test("project status exposes an auto-run lookup failure after bounded retries", async (t) => {
+  const originalFetch = globalThis.fetch;
+  let autoRunAttempts = 0;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.endsWith("/projects/project-failure/auto-runs")) {
+      autoRunAttempts += 1;
+      throw new TypeError("connection unavailable");
+    }
+    if (url.endsWith("/projects/project-failure")) {
+      return Response.json({
+        project: { id: "project-failure", status: "active" },
+        pending_suggested_agents: { agents: ["plan_all"], buttons: [] },
+      });
+    }
+    return new Response("Not found", { status: 404 });
+  };
+
+  const client = createApiClient({ apiKey: "test-key", apiBaseUrl: "https://api.example/api/v1" });
+  const status = await client.getProjectStatus("project-failure");
+
+  assert.equal(autoRunAttempts, 2);
+  assert.equal(status.auto_runs_lookup_failed, true);
 });

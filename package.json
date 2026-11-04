@@ -46,7 +46,6 @@
         "ai8080_list_projects",
         "ai8080_select_project",
         "ai8080_select_button",
-        "ai8080_wait_auto_run",
         "ai8080_task_list"
       ]
     },
@@ -71,6 +70,7 @@
     "typescript": "^6.0.3"
   },
   "scripts": {
+    "test": "node --import tsx --test tests/*.test.ts",
     "build": "esbuild index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:openclaw",
     "prepack": "npm run build",
     "dev": "tsx watch index.ts",

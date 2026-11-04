@@ -22,8 +22,9 @@ function isSameButton(left: unknown, right: unknown): boolean {
 
 /**
  * Combines buttons emitted by the event stream with buttons from the latest
- * project status. Project status is authoritative for auto-runs because it is
- * enriched from GET /auto-runs and reflects the currently scheduled Wait.
+ * project status. Stream workflow buttons are authoritative; status only
+ * enriches auto-runs because it is
+ * enriched from GET /auto-runs and reflects the current automatic schedule.
  */
 export function mergeSuggestedButtons(
   eventButtons?: any[],
@@ -32,13 +33,34 @@ export function mergeSuggestedButtons(
   if (eventButtons === undefined) return statusButtons;
   if (statusButtons === undefined) return eventButtons;
 
-  const normalButtons = [...eventButtons, ...statusButtons]
+  const normalButtons = eventButtons
     .filter((button) => !isAutoRunButton(button))
     .filter((button, index, buttons) =>
       buttons.findIndex((candidate) => isSameButton(candidate, button)) === index
     );
   const currentAutoRunButtons = statusButtons.filter(isAutoRunButton);
   return [...normalButtons, ...currentAutoRunButtons];
+}
+
+export function hasScheduledAutoRunButton(buttons?: any[], buttonKey?: string): boolean {
+  return Boolean(buttons?.some((button) =>
+    isAutoRunButton(button) &&
+    button.action === "wait_auto_run" &&
+    button.payload?.status === "scheduled" &&
+    (!buttonKey || button.payload?.button_key === buttonKey) &&
+    typeof button.payload?.fire_at === "string" &&
+    Number.isFinite(Date.parse(button.payload.fire_at))
+  ));
+}
+
+export function isSuggestedActionReady(options: {
+  hasBackendAction: boolean;
+  checkpointReady: boolean;
+  requiresScheduledAutoRun: boolean;
+  buttons?: any[];
+}): boolean {
+  if (!options.hasBackendAction || !options.checkpointReady) return false;
+  return !options.requiresScheduledAutoRun || hasScheduledAutoRunButton(options.buttons);
 }
 
 const RESERVED_PENDING_KEYS = new Set(["agents", "message_id", "messageId", "session_id", "sessionId", "buttons"]);
@@ -66,6 +88,28 @@ export function extractAgentList(value: unknown): string[] {
     else if (entry === true) agents.push(key);
   }
   return agents;
+}
+
+// Normalize actions explicitly supplied by backend buttons, including auto-runs.
+// Artifact state and completion messages are deliberately not action sources.
+function extractButtonAgents(buttons?: any[]): string[] {
+  return (buttons ?? []).flatMap((button) => {
+    if (!button || button.enabled === false) return [];
+    if (button.kind === "auto_run") {
+      if (!hasScheduledAutoRunButton([button])) return [];
+      const labels: Record<string, string> = {
+        "start": "plan_all",
+        "generate first page": "generate_first_page",
+        "generate all pages": "generate_all_pages",
+        "generate architecture": "generate_architecture",
+      };
+      const agent = labels[String(button.payload?.label ?? "").trim().toLowerCase()];
+      return agent ? [agent] : [];
+    }
+    if (button.action === "trigger_agents") return extractAgentList(button.payload?.agents);
+    if (button.action === "continue" || button.action === "resume_design") return ["continue"];
+    return [];
+  });
 }
 
 export function extractPendingSuggestion(pending: unknown): PendingSuggestion {
@@ -99,7 +143,8 @@ export function extractPendingSuggestion(pending: unknown): PendingSuggestion {
     };
   }
 
-  return { agents: extractAgentList(record), messageId, sessionId, buttons };
+  const legacyAgents = extractAgentList(record);
+  return { agents: legacyAgents.length > 0 ? legacyAgents : uniqueStrings(extractButtonAgents(buttons)), messageId, sessionId, buttons };
 }
 
 export function extractEventSuggestion(event: unknown): PendingSuggestion {
@@ -137,5 +182,32 @@ export function extractEventSuggestion(event: unknown): PendingSuggestion {
         ? record.sessionId
         : pending.sessionId;
 
-  return { agents, messageId, sessionId, buttons };
+  return { agents: agents.length > 0 ? agents : uniqueStrings(extractButtonAgents(buttons)), messageId, sessionId, buttons };
+}
+
+/** Preserve the backend review gate; labels alone do not identify its resume phase. */
+export function getResumeDesignPhase(buttons?: any[]): string | undefined {
+  const button = buttons?.find(button => button?.action === "resume_design" && button.enabled !== false && typeof button.payload?.phase === "string");
+  return button?.payload.phase;
+}
+
+/** Recover the action explicitly offered by the latest backend reply when
+ * pending_suggested_agents is cleared at a manual review gate. Never infer an
+ * action from completed logs, artifacts, or older conversation messages. */
+export function extractLatestReplySuggestion(messages: unknown, since = 0): PendingSuggestion {
+  if (!Array.isArray(messages)) return { agents: [], messageId: "", sessionId: "" };
+  const latest = [...messages].reverse().find(message => message && typeof message === "object" &&
+    ["assistant", "system"].includes(message.author ?? message.role));
+  if (!latest) return { agents: [], messageId: "", sessionId: "" };
+  const rawTime = latest.created_at ?? latest.createdAt;
+  if (typeof rawTime === "string") {
+    const time = Date.parse(/(?:z|[+-]\d{2}:?\d{2})$/i.test(rawTime) ? rawTime : `${rawTime}Z`);
+    if (Number.isFinite(time) && time < since - 5_000) return { agents: [], messageId: "", sessionId: "" };
+  }
+  const messageId = String(latest.message_id ?? latest.id ?? "");
+  const explicit = extractEventSuggestion({ ...latest, message_id: messageId });
+  if (explicit.agents.length) return explicit;
+  // Only structured suggested-agent/button data authorizes a manual action.
+  // Never manufacture a button by parsing prose in an assistant reply.
+  return { agents: [], messageId: "", sessionId: "" };
 }

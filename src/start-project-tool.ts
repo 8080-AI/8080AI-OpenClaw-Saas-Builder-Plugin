@@ -5,10 +5,10 @@ import { readActiveModel } from "./model-state.ts";
 import { stripA2UI, groupAgents } from "./command.ts";
 import { writeActiveProject } from "./project-state.ts";
 import { writeLatestSuggestions } from "./suggestions-state.ts";
-import { extractPendingSuggestion } from "./suggested-agents.ts";
+import { extractPendingSuggestion, hasScheduledAutoRunButton } from "./suggested-agents.ts";
 import { exactToolResult } from "./exact-response.ts";
-import { formatProjectTasks } from "./task-summary.ts";
 import { log } from "../logger.ts";
+import { waitForProjectResponse } from "./workflow-response.ts";
 
 // AgentToolResult shape required by the OpenClaw SDK's onUpdate callback.
 type ToolContent = { type: "text"; text: string };
@@ -37,6 +37,16 @@ function latestAssistantContent(messages: unknown): string {
   return assistant?.content?.trim() ?? "";
 }
 
+function planningHasStarted(status: Record<string, unknown> | null): boolean {
+  if (!status) return false;
+  if (status.is_active === true) return true;
+  return [status.pm_step_status, status.run_status, status.pipeline_run_status]
+    .some((value) =>
+      typeof value === "string" &&
+      ["running", "in_progress", "active", "completed", "complete"].includes(value.toLowerCase())
+    );
+}
+
 export function createStartProjectTool(deps: {
   stateDir: () => string;
   apiBaseUrl: string;
@@ -52,7 +62,7 @@ export function createStartProjectTool(deps: {
       "Use this whenever the user wants to create, build, or scaffold a new application. " +
       "It connects to the 8080.ai platform which handles architecture, coding, and deployment. " +
       "Shows live agent activity from the platform as it works. " +
-      "For long-running 8080.ai actions, always pass timeoutMs=600000 so OpenClaw allows the tool call to wait for agent completion.",
+      "For long-running 8080.ai actions, always pass timeoutMs=600000 so OpenClaw allows the tool call to wait for agent completion. A running result is not final: immediately call its nextTool with observeOnly=true until actual suggested actions are returned. If exec yields a pending cell, keep waiting for that same cell; do not end the turn or recreate the project.",
     parameters: Type.Object({
       user_raw_prompt: Type.String({
         description:
@@ -77,6 +87,7 @@ export function createStartProjectTool(deps: {
       _signal: AbortSignal | undefined,
       onUpdate: OnUpdate | undefined
     ): Promise<ToolResult> {
+      const observationStartedAt = Date.now();
       const stateDir = deps.stateDir();
       const { apiBaseUrl, pollingTimeoutMs, sessionId } = deps;
      
@@ -172,6 +183,7 @@ export function createStartProjectTool(deps: {
         // endpoint's `pending_suggested_agents` field after stream ends.
         // ----------------------------------------------------------------
         let pendingButtons: any[] | undefined;
+        let autoRunLookupFailed = false;
         if (projectId) {
           try {
             const status = await client.getProjectStatus(projectId);
@@ -179,8 +191,10 @@ export function createStartProjectTool(deps: {
             if (suggestedAgents.length === 0) suggestedAgents.push(...pending.agents);
             if (pending.messageId) suggestionMessageId = pending.messageId;
             pendingButtons = pending.buttons;
+            autoRunLookupFailed = status.auto_runs_lookup_failed === true;
             log.info("Fetched pending agents from status", suggestedAgents);
           } catch (statusErr) {
+            autoRunLookupFailed = true;
             log.info("Failed to fetch project status for agents", statusErr);
           }
         }
@@ -190,8 +204,30 @@ export function createStartProjectTool(deps: {
           suggestedAgents = filterStartBuildingAgents(suggestedAgents, false);
         }
 
+        let autoRunNotice = "";
+        const offeredPlanningStart = suggestedAgents.includes("plan_all");
+        let observePlanning = hasScheduledAutoRunButton(pendingButtons, "start");
+        if (offeredPlanningStart && !hasScheduledAutoRunButton(pendingButtons, "start")) {
+          if (autoRunLookupFailed) {
+            autoRunNotice =
+              "⚠️ I could not verify the automatic planning schedule. " +
+              "Choose Start to begin manually, or allow 8080.ai to continue if its countdown is still active.";
+          } else {
+            const planningStatus = await client.getPlanningStatus(projectId, 1_500).catch(() => null);
+            if (planningHasStarted(planningStatus)) {
+              observePlanning = true;
+              suggestedAgents = suggestedAgents.filter((agent) => agent !== "plan_all");
+              pendingButtons = [];
+              autoRunNotice = "Planning has already started automatically. No Start action is needed.";
+            } else {
+              autoRunNotice =
+                "The automatic planning countdown is no longer available. Choose Start to begin planning manually.";
+            }
+          }
+        }
+
         const groupedAgents = groupAgents(suggestedAgents);
-        if (suggestedAgents.length > 0) {
+        if (offeredPlanningStart || suggestedAgents.length > 0) {
           await writeLatestSuggestions(stateDir, sessionId, {
             projectId,
             agents: groupedAgents,
@@ -203,21 +239,17 @@ export function createStartProjectTool(deps: {
         const cleanText = stripA2UI(accumulatedText);
         const isQuestion = cleanText.trim().endsWith("?");
 
-        let taskListText = "";
-        try {
-          const tasksResponse = await client.getTasks(projectId);
-          const formattedTasks = formatProjectTasks(projectId, tasksResponse);
-          taskListText = formattedTasks.text;
-          log.info("start_project tasks attached to Tech Lead response", {
-            projectId,
-            totalTasks: formattedTasks.totalTasks,
-            statusCounts: formattedTasks.statusCounts,
-          });
-        } catch (taskErr) {
-          log.info("start_project task fetch failed; returning Tech Lead response without tasks", {
-            projectId,
-            error: taskErr instanceof Error ? taskErr.message : String(taskErr),
-          });
+        // A timed Start is progress, not a manual checkpoint. Follow the same
+        // automatic pipeline used after a click, without firing Start ourselves.
+        if (!isQuestion && observePlanning) {
+          return await waitForProjectResponse(client, {
+            stateDir, sessionId, projectId, modelTier: activeModel,
+            signal: _signal, timeoutMs: params.timeoutMs, startedAt: observationStartedAt,
+            toolDeadlineAt: observationStartedAt + Math.min(params.timeoutMs ?? 600_000, 600_000),
+            onUpdate,
+            initialSuggestion: { agents: groupedAgents, messageId: suggestionMessageId,
+              sessionId: "", buttons: pendingButtons },
+          }) as ToolResult;
         }
 
         let finalResponse = cleanText;
@@ -226,9 +258,7 @@ export function createStartProjectTool(deps: {
             `Project \`${projectId}\` was created, but 8080.ai did not return an assistant response from /stream-trigger yet. ` +
             `Open or refresh the project on 8080.ai to check whether the Tech Lead response is still pending.`;
         }
-        if (taskListText) {
-          finalResponse += `${finalResponse.trim() ? "\n\n" : ""}${taskListText}`;
-        }
+        if (autoRunNotice) finalResponse += `\n\n${autoRunNotice}`;
         const suggestionText = !isQuestion && groupedAgents.length > 0
           ? buildSuggestedAgentsText(projectId, groupedAgents, "", undefined, pendingButtons)
           : "";

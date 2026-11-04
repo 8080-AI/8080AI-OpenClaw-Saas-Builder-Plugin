@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createApiClient } from "./api-client.ts";
-import { evaluateBuildTasksReadiness } from "./build-readiness.ts";
+import { createApiClient } from "../src/api-client.ts";
+import { canOfferBuildTasksAction, evaluateBuildTasksReadiness } from "../src/build-readiness.ts";
 
 test("Build Tasks is ready only with can_start, a current phase, and runnable tasks", () => {
   const planningComplete = { is_active: false, pm_step_status: "done" };
@@ -51,6 +51,32 @@ test("Build Tasks is ready only with can_start, a current phase, and runnable ta
     current_phase: { id: "phase-1" },
     runnable_tasks: [{ id: "task-1" }],
   }, { is_active: false, pm_step_status: "running" }).canStart, false);
+});
+
+test("Build Tasks remains visible for a completed plan held only by credits", () => {
+  const readiness = evaluateBuildTasksReadiness({
+    can_start: false,
+    blocking_reason: "insufficient_credits",
+    all_completed: false,
+    current_phase: { id: "phase-1" },
+    runnable_tasks: [],
+  }, { is_active: false, pm_step_status: "done" });
+
+  assert.equal(readiness.canStart, false);
+  assert.equal(canOfferBuildTasksAction(readiness, 1), true);
+  assert.equal(canOfferBuildTasksAction(readiness, 0), false);
+});
+
+test("Build Tasks stays hidden for incomplete or structurally blocked plans", () => {
+  const blocked = evaluateBuildTasksReadiness({
+    can_start: false,
+    blocking_reason: "task_plan_missing",
+    all_completed: false,
+    current_phase: null,
+    runnable_tasks: [],
+  }, { is_active: false, pm_step_status: "done" });
+
+  assert.equal(canOfferBuildTasksAction(blocked, 1), false);
 });
 
 test("execution-state is checked and Build Tasks posts the current phase to /build", async (t) => {

@@ -1,3 +1,4 @@
+import { getResumeDesignPhase } from "./suggested-agents.ts";
 import { cleanApiKey, validateApiKey, writeApiKey } from "./api-key.ts";
 import { AuthError, AGENT_DISPLAY_NAMES, type BuildStep, requireAuthenticatedClient, filterStartBuildingAgents, isReviewArchitectureStartBuildingChatMessage, isPauseForReviewText, determineContinueButtonLabel } from "./api-client.ts";
 import { readActiveProject, writeActiveProject } from "./project-state.ts";
@@ -9,9 +10,9 @@ import {
   buildSuggestedAgentsJsonl,
   buildSuggestedAgentsPresentation,
   buildSuggestedAgentsText,
-  parseButtonValue,
+  isContinueActionAgent,
 } from "./review-continue.ts";
-import { consumeAutoRunSuggestion, writeLatestSuggestions, readLatestSuggestions } from "./suggestions-state.ts";
+import { writeLatestSuggestions, readLatestSuggestions } from "./suggestions-state.ts";
 import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { formatProjectTasks, formatStartBuildingTasks } from "./task-summary.ts";
@@ -608,10 +609,7 @@ export function create8080Command(
               });
             }
             if (!selectedAgent) {
-              const parsedDisplayedChoice = selectedValue ? parseButtonValue(selectedValue) : null;
-              if (parsedDisplayedChoice?.action !== "wait") {
-                return { text: `⚠️  "${choice}" is not valid. Pick a number between 1 and ${displayedChoices.length}, or use an option name like \`wait\` or \`start-building\`.` };
-              }
+              return { text: `⚠️  "${choice}" is not valid. Pick a number between 1 and ${displayedChoices.length}, or use an option name like \`start-building\`.` };
             }
           }
 
@@ -624,31 +622,6 @@ export function create8080Command(
 
           try {
             const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
-            const parsedSelection = selectedValue ? parseButtonValue(selectedValue) : null;
-
-            if (parsedSelection?.action === "wait" && parsedSelection.entryId) {
-              // Cancel first: an extra status request here would consume part
-              // of the short auto-run countdown for no functional benefit.
-              const result = await client.waitForAutoRun(parsedSelection.projectId, parsedSelection.entryId);
-              await consumeAutoRunSuggestion(
-                stateDir,
-                sessionId,
-                parsedSelection.projectId,
-                parsedSelection.entryId
-              );
-              if (result.status === "cancelled") {
-                const label = parsedSelection.label || "the action";
-                return {
-                  text:
-                    `Automatic ${label} was cancelled. Choose ${label} when you are ready to trigger it manually.` +
-                    `\n\n### Suggested Next Steps:\n1. ${label}`,
-                };
-              }
-              return {
-                text: "That automatic action is no longer scheduled; it may already be running or completed.",
-              };
-            }
-
             if (!selectedAgent) {
               return { text: `⚠️  "${choice}" is not a valid action.` };
             }
@@ -728,7 +701,7 @@ export function create8080Command(
               };
             }
 
-            if (selectedAgent === 'continue') {
+            if (parsedSelection?.action === "continue" || isContinueActionAgent(selectedAgent)) {
               try {
                 await writeLatestSuggestions(stateDir, sessionId, {
                   projectId: suggestions.projectId,
@@ -739,10 +712,10 @@ export function create8080Command(
                   projectId: suggestions.projectId,
                   messageId: suggestions.messageId || "",
                 });
-                await client.resumeDesign(suggestions.projectId);
+                await client.resumeDesign(suggestions.projectId, getResumeDesignPhase(suggestions.buttons));
               } catch (err) {
                 if (err instanceof AuthError) {
-                  const reviewAgents = groupAgents(["continue", "review"]);
+                  const reviewAgents = suggestions.agents;
                   await writeLatestSuggestions(stateDir, sessionId, {
                     projectId: suggestions.projectId,
                     agents: reviewAgents,
@@ -886,7 +859,7 @@ export function create8080Command(
                 );
                 const hasBackendContinue = backendReviewAgents.includes("continue");
                 const hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(suggestions.projectId);
-                const reviewAgents = hasBackendContinue ? backendReviewAgents : groupAgents(["continue", "review"]);
+                const reviewAgents = backendReviewAgents;
                 log.info("command_continue paused_for_review backend suggestion gate", {
                   projectId: suggestions.projectId,
                   pendingSuggestions: pendingAfterPause.agents,
@@ -1032,7 +1005,7 @@ export function create8080Command(
                 );
                 const hasBackendContinue = backendContinueAgents.includes("continue");
                 const hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(suggestions.projectId);
-                const continueAgents = hasBackendContinue ? backendContinueAgents : groupAgents(["continue", "review"]);
+                const continueAgents = backendContinueAgents;
                 log.info("command_continue backend suggestion gate no outputs", {
                   projectId: suggestions.projectId,
                   pendingSuggestions: pendingAfterNoOutputs.agents,
@@ -1146,11 +1119,11 @@ export function create8080Command(
               const statusAfterPause = await client.getProjectStatus(suggestions.projectId).catch(() => null);
               const pendingAfterPause = extractPendingSuggestion(statusAfterPause?.pending_suggested_agents);
               const backendReviewAgents = groupAgents(
-                pendingAfterPause.agents.filter((agent) => agent === "continue" || agent === "review")
+                pendingAfterPause.agents.filter((agent) => isContinueActionAgent(agent) || agent === "review")
               );
-              const hasBackendContinue = backendReviewAgents.includes("continue");
+              const hasBackendContinue = backendReviewAgents.some(isContinueActionAgent);
               const hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(suggestions.projectId);
-              const reviewAgents = hasBackendContinue ? backendReviewAgents : groupAgents(["continue", "review"]);
+              const reviewAgents = backendReviewAgents;
               log.info("command trigger paused_for_review backend suggestion gate", {
                 projectId: suggestions.projectId,
                 pendingSuggestions: pendingAfterPause.agents,
@@ -1232,29 +1205,13 @@ export function create8080Command(
               hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(suggestions.projectId);
             }
 
-            // If the backend exposed "continue" via review checkpoint, show continue/review
-            if (hasLatestCompletedAgentLog && !pendingAgentsAfter.includes("continue")) {
-              // The backend completed but hasn't yet exposed continue —
-              // check if it's a review-ready state and inject continue/review
-              const hasReviewText = (Array.isArray(projectStatusAfter.messages) ? projectStatusAfter.messages : [])
-                .some((m: any) => isPauseForReviewText(m.content));
-              if (hasReviewText || pendingAgentsAfter.length === 0) {
-                pendingAgentsAfter = ["continue", "review"];
-                log.info("command trigger injected continue/review after poll", {
-                  projectId: suggestions.projectId,
-                  reason: "latest_agent_completed_but_backend_stale",
-                  hasReviewText,
-                });
-              }
-            }
-
             let finalAgentsAfter = [...pendingAgentsAfter];
 
             log.info("command trigger backend suggested agents after events", {
               projectId: suggestions.projectId,
               pendingAgents: finalAgentsAfter,
               hasLatestCompletedAgentLog,
-              reason: finalAgentsAfter.includes("continue")
+              reason: finalAgentsAfter.some(isContinueActionAgent)
                 ? "backend_exposed_continue"
                 : "backend_has_not_exposed_continue",
             });

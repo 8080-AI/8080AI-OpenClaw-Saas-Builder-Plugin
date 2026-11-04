@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert";
-import { checkGenerateFirstPageCondition, determineContinueButtonLabel, type AgentLog } from "./api-client.ts";
-import { createProjectStatusTool } from "./project-status-tool.ts";
-import { createContinueProjectTool } from "./continue-project-tool.ts";
-import { extractEventSuggestion } from "./suggested-agents.ts";
+import { checkGenerateFirstPageCondition, determineContinueButtonLabel, type AgentLog } from "../src/api-client.ts";
+import { createProjectStatusTool } from "../src/project-status-tool.ts";
+import { createContinueProjectTool, findFailedAgentLogSince } from "../src/continue-project-tool.ts";
+import { extractEventSuggestion } from "../src/suggested-agents.ts";
 
 test("extractEventSuggestion", () => {
   const suggestion = extractEventSuggestion({
@@ -25,6 +25,27 @@ test("extractEventSuggestion", () => {
   assert.strictEqual(suggestion.messageId, "msg-generate-architecture");
   assert.strictEqual(suggestion.sessionId, "session-1");
   assert.strictEqual(suggestion.buttons?.[0]?.label, "Generate Architecture");
+});
+
+test("architecture retries ignore failures from an older run", () => {
+  const actionStartedAt = Date.parse("2026-10-27T10:00:00Z");
+  const logs = [
+    {
+      action: "error",
+      agent_type: "System Architect",
+      summary: "Architecture generation could not complete",
+      created_at: "2026-10-27T09:50:00Z",
+    },
+  ];
+
+  assert.equal(findFailedAgentLogSince(logs, actionStartedAt), undefined);
+  assert.equal(
+    findFailedAgentLogSince([
+      ...logs,
+      { ...logs[0], created_at: "2026-10-27T10:00:02Z" },
+    ], actionStartedAt)?.created_at,
+    "2026-10-27T10:00:02Z"
+  );
 });
 
 test("checkGenerateFirstPageCondition", async (t) => {
@@ -68,7 +89,7 @@ test("checkGenerateFirstPageCondition", async (t) => {
     assert.strictEqual(result, false);
   });
 
-  await t.test("should return true if both System Requirements and User Flow Planner are completed", async () => {
+  await t.test("does not offer first-page generation from completed historical planning logs", async () => {
     const mockClient = {
       getAgentLogs: async (projectId: string) => [
         {
@@ -88,10 +109,10 @@ test("checkGenerateFirstPageCondition", async (t) => {
       ] as AgentLog[],
     };
     const result = await checkGenerateFirstPageCondition(mockClient, "test-project");
-    assert.strictEqual(result, true);
+    assert.strictEqual(result, false);
   });
 
-  await t.test("should return true when completed status is in summary prefix", async () => {
+  await t.test("does not offer first-page generation from historical completion summaries", async () => {
     const mockClient = {
       getAgentLogs: async (projectId: string) => [
         {
@@ -111,7 +132,7 @@ test("checkGenerateFirstPageCondition", async (t) => {
       ] as AgentLog[],
     };
     const result = await checkGenerateFirstPageCondition(mockClient, "test-project");
-    assert.strictEqual(result, true);
+    assert.strictEqual(result, false);
   });
 
   await t.test("should return false if getAgentLogs rejects", async () => {
@@ -153,184 +174,15 @@ test("checkGenerateFirstPageCondition", async (t) => {
   });
 });
 
-test("determineContinueButtonLabel", async (t) => {
-  await t.test("should return 'Continue' if logs are empty", async () => {
-    const mockClient = {
-      getAgentLogs: async () => [] as AgentLog[],
-    };
-    const result = await determineContinueButtonLabel(mockClient, "test-project");
-    assert.strictEqual(result, "Continue");
-  });
-
-  await t.test("should return 'Generate First Page' if requirements and flows are completed and Design Agent has not run", async () => {
-    const mockClient = {
-      getAgentLogs: async () => [
-        {
-          agent_type: "System Requirements Agent",
-          action: "completed",
-          summary: "Finished requirements",
-          created_at: new Date().toISOString(),
-          message_id: "msg1",
-        },
-        {
-          agent_type: "User Flow Planner Agent",
-          action: "completed",
-          summary: "Finished user flow",
-          created_at: new Date().toISOString(),
-          message_id: "msg2",
-        },
-      ] as AgentLog[],
-    };
-    const result = await determineContinueButtonLabel(mockClient, "test-project");
-    assert.strictEqual(result, "Generate First Page");
-  });
-
-  await t.test("should return 'Generate Architecture' if Design Agent is completed and all design pages are completed", async () => {
-    const mockClient = {
-      getAgentLogs: async () => [
-        {
-          agent_type: "Design Agent",
-          action: "completed",
-          summary: "Finished design",
-          created_at: new Date().toISOString(),
-          message_id: "msg3",
-        },
-      ] as AgentLog[],
-      getDesignPages: async () => [
-        {
-          page_name: "Todo",
-          generation_in_progress: false,
-          sections_done: 3,
-          sections_total: 3,
-          generation_phase: "complete",
-          screenshot_url: "http://screenshot",
-        },
-      ],
-    };
-    const result = await determineContinueButtonLabel(mockClient, "test-project");
-    assert.strictEqual(result, "Generate Architecture");
-  });
-
-  await t.test("should return 'Continue' if tasks and architecture are already generated", async () => {
-    const mockClient = {
-      getAgentLogs: async () => [
-        {
-          agent_type: "Design Agent",
-          action: "completed",
-          summary: "Finished design",
-          created_at: new Date().toISOString(),
-          message_id: "msg3",
-        },
-      ] as AgentLog[],
-      getDesignPages: async () => [
-        {
-          page_name: "Todo",
-          generation_in_progress: false,
-          sections_done: 3,
-          sections_total: 3,
-          generation_phase: "complete",
-          screenshot_url: "http://screenshot",
-        },
-      ],
-      getTasks: async () => [
-        {
-          title: "Create Task Model",
-          status: "todo",
-        },
-      ],
-      getArchitecture: async () => ({
-        service_network: [{ name: "API" }],
-      }),
-    };
-    const result = await determineContinueButtonLabel(mockClient, "test-project");
-    assert.strictEqual(result, "Continue");
-  });
-
-  await t.test("should return 'Generate All Pages' if Design Agent is completed but some design pages are not completed", async () => {
-    const mockClient = {
-      getAgentLogs: async () => [
-        {
-          agent_type: "Design Agent",
-          action: "completed",
-          summary: "Finished design",
-          created_at: new Date().toISOString(),
-          message_id: "msg3",
-        },
-      ] as AgentLog[],
-      getDesignPages: async () => [
-        {
-          page_name: "Todo",
-          generation_in_progress: false,
-          sections_done: 3,
-          sections_total: 3,
-          generation_phase: "complete",
-          screenshot_url: "http://screenshot",
-        },
-        {
-          page_name: "Settings",
-          generation_in_progress: true,
-          sections_done: 1,
-          sections_total: 3,
-          generation_phase: "generating",
-          screenshot_url: "",
-        },
-      ],
-    };
-    const result = await determineContinueButtonLabel(mockClient, "test-project");
-    assert.strictEqual(result, "Generate All Pages");
-  });
-
-  await t.test("should return 'Generate All Pages' if first design page is ready and more pages are expected", async () => {
-    const mockClient = {
-      getAgentLogs: async () => [
-        {
-          agent_type: "Design Agent",
-          action: "started",
-          summary: "Found 2 pages: Home, To-Do App. Starting design...",
-          created_at: new Date().toISOString(),
-          message_id: "resume-design",
-        },
-        {
-          agent_type: "Design Agent",
-          action: "started",
-          summary: "Designing Home (new, 1/2)...",
-          created_at: new Date().toISOString(),
-          message_id: "resume-design",
-        },
-      ] as AgentLog[],
-      getDesignPages: async () => [
-        {
-          page_name: "Home",
-          generation_in_progress: false,
-          sections_done: 6,
-          sections_total: 6,
-          generation_phase: "complete",
-          screenshot_url: "http://screenshot",
-        },
-      ],
-    };
-    const result = await determineContinueButtonLabel(mockClient, "test-project");
-    assert.strictEqual(result, "Generate All Pages");
-  });
-
-  await t.test("should return 'Continue' if Design Agent is started but not completed", async () => {
-    const mockClient = {
-      getAgentLogs: async () => [
-        {
-          agent_type: "Design Agent",
-          action: "started",
-          summary: "Designing first page",
-          created_at: new Date().toISOString(),
-          message_id: "msg3",
-        },
-      ] as AgentLog[],
-    };
-    const result = await determineContinueButtonLabel(mockClient, "test-project");
-    assert.strictEqual(result, "Continue");
-  });
+test("continue labels are not inferred from historical logs or artifacts", async () => {
+  const client = {
+    getAgentLogs: async () => { throw new Error("must not inspect old logs"); },
+    getDesignPages: async () => { throw new Error("must not infer actions from artifacts"); },
+  };
+  assert.equal(await determineContinueButtonLabel(client, "project"), "Continue");
 });
 
-import { getLabelForAgent, type BackendButton } from "./review-continue.ts";
+import { getLabelForAgent, type BackendButton } from "../src/review-continue.ts";
 
 test("getLabelForAgent", (t) => {
   t.test("should fall back to default label when no buttons are provided", () => {
@@ -389,10 +241,10 @@ test("getLabelForAgent", (t) => {
 
 import fs from "node:fs";
 import path from "node:path";
-import { createSelectButtonTool } from "./select-button-tool.ts";
-import { create8080Command } from "./command.ts";
-import { writeLatestSuggestions } from "./suggestions-state.ts";
-import { writeApiKey } from "./api-key.ts";
+import { createSelectButtonTool } from "../src/select-button-tool.ts";
+import { create8080Command } from "../src/command.ts";
+import { writeLatestSuggestions } from "../src/suggestions-state.ts";
+import { writeApiKey } from "../src/api-key.ts";
 
 test("integration tests", async (t) => {
   await t.test("select-button-tool integration tests", async (t) => {
@@ -447,14 +299,10 @@ test("integration tests", async (t) => {
     await writeLatestSuggestions(testStateDir, "test-session", scheduledWaitSuggestions);
     await run();
 
-    assert.strictEqual(requests.length, 1, "Wait must be the first and only API request");
-    assert.ok(requests[0].url.endsWith("/projects/test-proj/auto-runs/offer/wait"));
-    assert.strictEqual(requests[0].init?.method, "POST");
-    assert.strictEqual(requests[0].init?.body, undefined);
-    assert.strictEqual(new Headers(requests[0].init?.headers).get("Content-Type"), "application/json");
+    assert.strictEqual(requests.length, 0, "Disabled Wait must not call the API");
   }
 
-  await t.test("natural-language Wait immediately posts the bodyless cancellation request", async () => {
+  await t.test("natural-language Wait is disabled without an API request", async () => {
     const tool = createSelectButtonTool({
       stateDir: () => testStateDir,
       siteUrl: "http://localhost",
@@ -465,16 +313,18 @@ test("integration tests", async (t) => {
     await assertDirectWaitRequest(() => tool.execute("id-wait", { choice: "wait" }, undefined, () => {}));
   });
 
-  await t.test("slash-command Wait immediately posts the bodyless cancellation request", async () => {
+  await t.test("slash-command Wait is disabled without an API request", async () => {
     const command = create8080Command(
       { runtime: { state: { resolveStateDir: () => testStateDir } } },
       { siteUrl: "http://localhost", apiBaseUrl: "http://localhost", sessionId: "test-session" }
     );
 
-    await assertDirectWaitRequest(() => command.handler({ args: "select-button 2" }));
+    await assertDirectWaitRequest(() => command.handler({ args: "select-button wait" }));
   });
 
   await t.test("should resolve choice and execute continue tool successfully", async () => {
+    let resumeCalls = 0;
+    let triggerAgentCalls = 0;
     // Write suggestions state
     await writeLatestSuggestions(testStateDir, "test-session", {
       projectId: "test-proj",
@@ -489,13 +339,19 @@ test("integration tests", async (t) => {
     globalThis.fetch = async (url, init) => {
       const urlStr = String(url);
       if (urlStr.includes("/chat/resume-design")) {
-        return new Response("data: " + JSON.stringify({ type: "message", content: "Resume success" }) + "\n\n", {
-          status: 200,
-          headers: { "Content-Type": "text/event-stream" }
-        });
+        resumeCalls += 1;
+        return Response.json({ status: "resumed" });
+      }
+      if (urlStr.includes("/chat/trigger-agents")) {
+        triggerAgentCalls += 1;
+        return Response.json({ status: "triggered" });
       }
       if (urlStr.includes("/projects/test-proj/events")) {
-        return new Response("data: " + JSON.stringify({ type: "message", content: "Event message" }) + "\n\n", {
+        const events = [
+          { type: "suggested_agents", agents: ["generate_architecture", "review"] },
+          { type: "planning_complete", status: "paused_for_review" },
+        ].map((event) => `data: ${JSON.stringify(event)}\n\n`).join("");
+        return new Response(events, {
           status: 200,
           headers: { "Content-Type": "text/event-stream" }
         });
@@ -522,15 +378,25 @@ test("integration tests", async (t) => {
     });
 
     // Test choice: "1"
-    const result1 = await tool.execute("id-1", { choice: "1" }, undefined, () => {});
+    const result1 = await tool.execute("id-1", { choice: "1", timeoutMs: 5_050 }, undefined, () => {});
     assert.ok(result1);
 
-    // Test choice: label "Generate Architecture" (case insensitive/normalized)
-    const result2 = await tool.execute("id-2", { choice: "Generate Architecture" }, undefined, () => {});
+    // An explicit stage agent must still use resume-design, never trigger-agents.
+    await writeLatestSuggestions(testStateDir, "test-session", {
+      projectId: "test-proj",
+      agents: ["generate_architecture", "review"],
+      messageId: "msg-architecture",
+      buttons: [
+        { key: "run_agents", kind: "agent", label: "Generate Architecture", action: "resume_design" }
+      ],
+    });
+    const result2 = await tool.execute("id-2", { choice: "Generate Architecture", timeoutMs: 5_050 }, undefined, () => {});
     assert.ok(result2);
+    assert.equal(triggerAgentCalls, 0);
+    assert.ok(resumeCalls >= 2);
 
     // Test choice: ultimate fallback "continue"
-    const result3 = await tool.execute("id-3", { choice: "continue" }, undefined, () => {});
+    const result3 = await tool.execute("id-3", { choice: "continue", timeoutMs: 5_050 }, undefined, () => {});
     assert.ok(result3);
   });
 
@@ -570,7 +436,7 @@ test("integration tests", async (t) => {
     fs.rmSync(testStateDir, { recursive: true, force: true });
   });
 
-  await t.test("should recover design suggestions when Design Agent is completed and pages are done but pending suggestions is null", async () => {
+  await t.test("does not invent design suggestions when pages are done but pending suggestions is null", async () => {
     globalThis.fetch = async (url) => {
       const urlStr = String(url);
       if (urlStr.includes("/projects/test-proj/agent-logs")) {
@@ -617,8 +483,9 @@ test("integration tests", async (t) => {
 
     const result = await tool.execute("id-5", { projectId: "test-proj" }, undefined, () => {});
     assert.ok(result);
-    // Check that recovered suggestions are included in text
-    assert.ok(result.content[0].text.includes("Generate Architecture"));
+    // Completed artifacts do not authorize another pipeline action.
+    assert.ok(!result.content[0].text.includes("Generate Architecture"));
+    assert.ok(!result.presentation);
   });
 });
 
@@ -643,7 +510,7 @@ test("integration tests", async (t) => {
       fs.rmSync(testStateDir, { recursive: true, force: true });
     });
 
-    await t.test("should extract suggested agents from streamProjectEvents raw event on pause_for_review", async () => {
+    await t.test("continues observing after an intermediate review pause", async () => {
       // Mock suggestions file state
       await writeLatestSuggestions(testStateDir, "test-session", {
         projectId: "test-proj",
@@ -693,7 +560,7 @@ test("integration tests", async (t) => {
             phase: "design",
             title: "My App",
             status: "paused_for_review",
-            pending_suggested_agents: null
+            pending_suggested_agents: { agents: ["continue", "review"] }
           }), { status: 200, headers: { "Content-Type": "application/json" } });
         }
         return new Response("Not found", { status: 404 });
@@ -705,7 +572,7 @@ test("integration tests", async (t) => {
         sessionId: "test-session"
       } as any);
 
-      const result = await tool.execute("id-6", { projectId: "test-proj" }, undefined, () => {});
+      const result = await tool.execute("id-6", { projectId: "test-proj", timeoutMs: 5_050 }, undefined, () => {});
       assert.ok(result);
       assert.ok(resumeCalled);
       
@@ -714,7 +581,7 @@ test("integration tests", async (t) => {
       assert.ok(text.includes("Generate First Page"));
     });
 
-    await t.test("should throw error if an agent failure occurs during event stream", async () => {
+    await t.test("returns the agent failure as an error response", async () => {
       // Mock suggestions file state
       await writeLatestSuggestions(testStateDir, "test-session", {
         projectId: "test-proj",
@@ -724,6 +591,9 @@ test("integration tests", async (t) => {
 
       globalThis.fetch = async (url) => {
         const urlStr = String(url);
+        if (urlStr.endsWith("/projects/test-proj")) {
+          return Response.json({ id: "test-proj", pending_suggested_agents: { agents: ["continue"], buttons: [{ action: "resume_design", label: "Generate First Page" }] } });
+        }
         if (urlStr.includes("/chat/resume-design")) {
           return new Response("{}", { status: 200 });
         }
@@ -750,15 +620,14 @@ test("integration tests", async (t) => {
         sessionId: "test-session"
       } as any);
 
-      await assert.rejects(async () => {
-        try {
-          const res = await tool.execute("id-7", { projectId: "test-proj" }, undefined, () => {});
-          console.log("EXECUTE_RESULT:", JSON.stringify(res));
-        } catch (e) {
-          console.log("EXECUTE_THROWN:", e);
-          throw e;
-        }
-      }, /Agent Design Agent failed: Insufficient credits or prompt block/);
+      const result = await tool.execute("id-7", { projectId: "test-proj" }, undefined, () => {});
+      assert.match(result.content[0].text, /Agent Design Agent failed: Insufficient credits or prompt block/);
     });
   });
+});
+
+
+test("active visual review is not completed design output", async () => {
+  const { hasCompletedDesignPages } = await import("../src/api-client.ts");
+  assert.equal(hasCompletedDesignPages([{ generation_in_progress: true, generation_phase: "reviewing", sections_done: 3, sections_total: 3, compiled_html: "<html/>" }]), false);
 });

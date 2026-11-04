@@ -30,9 +30,10 @@ type PendingReply =
     expiresAt: number;
     toolName?: string;
     presentation?: MessagePresentation;
+    protectFromStatusLookup?: boolean;
   }
   | { mode: "silent"; expiresAt: number; toolName?: string };
-type PendingPresentation = { presentation: MessagePresentation; expiresAt: number };
+type PendingPresentation = { text: string; presentation?: MessagePresentation; expiresAt: number; protectFromStatusLookup?: boolean };
 
 const AI8080_TOOL_PREFIX = "ai8080_";
 const PENDING_TTL_MS = 120_000;
@@ -80,6 +81,9 @@ function remember(ctx: HookContext, pending: Omit<PendingReply, "expiresAt">): v
   pruneExpired();
   const key = sessionKey(ctx);
   const existing = pendingReplies.get(key);
+  if (pending.toolName === "ai8080_get_project_status" &&
+      ((existing?.mode === "exact" && existing.protectFromStatusLookup) ||
+        pendingPresentations.get(key)?.protectFromStatusLookup)) return;
   const presentation = pending.mode === "exact"
     ? pending.presentation ?? (existing?.mode === "exact" ? existing.presentation : undefined)
     : undefined;
@@ -98,20 +102,22 @@ function consume(ctx: HookContext, event?: Record<string, unknown>): PendingRepl
   return pending;
 }
 
-function rememberPresentation(ctx: HookContext, presentation: MessagePresentation): void {
+function rememberPresentation(ctx: HookContext, text: string, presentation?: MessagePresentation, protectFromStatusLookup?: boolean): void {
   pruneExpired();
   pendingPresentations.set(sessionKey(ctx), {
+    text,
     presentation,
+    protectFromStatusLookup,
     expiresAt: Date.now() + PENDING_TTL_MS,
   });
 }
 
-function consumePresentation(ctx: HookContext, event?: Record<string, unknown>): MessagePresentation | undefined {
+function consumePresentation(ctx: HookContext, event?: Record<string, unknown>): PendingPresentation | undefined {
   pruneExpired();
   const key = sessionKey(ctx, event);
   const pending = pendingPresentations.get(key);
   if (pending) pendingPresentations.delete(key);
-  return pending?.presentation;
+  return pending;
 }
 
 function collectTextContent(content: unknown): string {
@@ -204,7 +210,8 @@ function modeFromResult(toolName: string | undefined, result: unknown): Omit<Pen
   const exactText = explicitExactText ?? markedText ?? contentText.trim();
   if (!exactText) return undefined;
 
-  return { mode: "exact", text: exactText, toolName, presentation };
+  return { mode: "exact", text: exactText, toolName, presentation,
+    protectFromStatusLookup: details?.protectFromStatusLookup === true };
 }
 
 function replaceAssistantText(message: MessageRecord, text: string): MessageRecord {
@@ -232,6 +239,23 @@ export function registerExactResponseHooks(api: HookApi): void {
     api.registerHook(hookName, handler, legacyOptions);
     log.info("registered legacy exact response hook", { hookName });
   };
+
+  register(
+    "before_tool_call",
+    (event: { toolName?: string }, ctx: HookContext) => {
+      pruneExpired();
+      const pending = pendingReplies.get(sessionKey(ctx));
+      if (event.toolName === "ai8080_get_project_status" &&
+          ((pending?.mode === "exact" && pending.protectFromStatusLookup) ||
+            pendingPresentations.get(sessionKey(ctx))?.protectFromStatusLookup)) {
+        return { block: true, blockReason: "Do not replace generation with Project Status. If the generation result supplies nextTool, call it with observeOnly=true. Otherwise display its exact suggested buttons and wait for the user's selection." };
+      }
+    },
+    {
+      name: "8080.ai generation response guard",
+      description: "Deliver the pending generation response before another status lookup.",
+    }
+  );
 
   register(
     "tool_result_persist",
@@ -299,7 +323,7 @@ export function registerExactResponseHooks(api: HookApi): void {
         return { block: true };
       }
 
-      if (pending.presentation) rememberPresentation(ctx, pending.presentation);
+      rememberPresentation(ctx, pending.text, pending.presentation, pending.protectFromStatusLookup);
 
       return { message: replaceAssistantText(message, pending.text) };
     },
@@ -314,13 +338,17 @@ export function registerExactResponseHooks(api: HookApi): void {
     (event: { payload?: unknown; sessionKey?: string }, ctx: HookContext) => {
       const payload = asRecord(event.payload);
       if (!payload) return;
-      const presentation = consumePresentation(ctx, event as Record<string, unknown>);
-      if (!presentation) return;
+      const pending = consumePresentation(ctx, event as Record<string, unknown>);
+      if (!pending) return;
 
       log.info("exact response presentation applied before reply delivery", {
-        blocks: presentation.blocks.length,
+        blocks: pending.presentation?.blocks.length ?? 0,
       });
-      return { payload: { ...payload, presentation } };
+      // Stored assistant messages and outbound payloads are separate runtime paths.
+      // Enforce exact text here too, even if delivery still contains model prose.
+      return { payload: { ...payload, text: pending.text,
+        ...(pending.presentation ? { presentation: pending.presentation } : {}),
+      } };
     },
     {
       name: "8080.ai exact response presentation",

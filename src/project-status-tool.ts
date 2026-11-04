@@ -120,29 +120,6 @@ export function createProjectStatusTool(deps: {
           });
         }
 
-        if (agents.length === 0) {
-          try {
-            const [designPages, hasLatestCompletedAgentLog] = await Promise.all([
-              client.getDesignPages(projectId).catch(() => null),
-              client.hasLatestCompletedAgentLog(projectId).catch(() => false),
-            ]);
-            const designPagesReady = hasCompletedDesignPages(designPages);
-            const hasDesignPages = getDesignPageRecords(designPages).length > 0;
-            const canShowReviewActions = (hasDesignPages && hasLatestCompletedAgentLog) || designPagesReady;
-            if (canShowReviewActions) {
-              agents = ["continue", "review"];
-              log.info("project_status recovered suggestions from design completion state", {
-                projectId,
-                agents,
-                hasLatestCompletedAgentLog,
-                designPagesReady,
-              });
-            }
-          } catch (err) {
-            log.info("project_status failed to recover suggestions", err);
-          }
-        }
-
         if (agents && agents.length > 0) {
           await writeLatestSuggestions(stateDir, sessionId, {
             projectId,

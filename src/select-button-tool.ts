@@ -2,10 +2,9 @@ import { Type } from "@sinclair/typebox";
 import { createContinueProjectTool } from "./continue-project-tool.ts";
 import { createReviewProjectTool } from "./review-project-tool.ts";
 import { createTriggerAgentsTool } from "./trigger-agents-tool.ts";
-import { createWaitAutoRunTool } from "./wait-auto-run-tool.ts";
 import { readLatestSuggestions } from "./suggestions-state.ts";
 import { requireAuthenticatedClient, determineContinueButtonLabel } from "./api-client.ts";
-import { buildSuggestedAgentChoices, getLabelForAgent, parseButtonValue } from "./review-continue.ts";
+import { buildSuggestedAgentChoices, getLabelForAgent, isContinueActionAgent, parseButtonValue } from "./review-continue.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { log } from "../logger.ts";
 
@@ -22,15 +21,17 @@ export function createSelectButtonTool(deps: {
   return {
     name: "ai8080_select_button",
     description:
+      "When the result supplies nextTool, call it automatically to continue observation without submitting work. Do not ask the user to refresh. " +
       "Select one of the currently displayed 8080.ai Suggested Next Steps by number or name. " +
       "Use this when the user says 'select 1', 'select-1', 'choose option 1', 'option 2', " +
-      "'wait', 'continue', 'review', 'start', 'build tasks', or similar after 8080.ai shows numbered suggestions. " +
+      "'continue', 'review', 'start', 'build tasks', or similar after 8080.ai shows numbered suggestions. " +
       "Resolve the choice against the saved suggestions and run the matching action. " +
+      "The selected action observes completion internally; await its native wait handle and do not select the generation action again to poll. " +
       "For long-running 8080.ai actions, always pass timeoutMs=600000 so OpenClaw allows the tool call to wait for agent completion.",
     parameters: Type.Object({
       choice: Type.String({
         description:
-          "The user's selected option number or name, for example '1', '2', 'wait', 'start', 'continue', 'review', or 'build tasks'.",
+          "The user's selected option number or name, for example '1', '2', 'start', 'continue', 'review', or 'build tasks'.",
       }),
       timeoutMs: Type.Number({
         default: 600000,
@@ -117,69 +118,57 @@ export function createSelectButtonTool(deps: {
         );
         selectedAgent = displayedChoice?.agent;
         selectedValue = displayedChoice?.value;
-        const parsedDisplayedChoice = selectedValue ? parseButtonValue(selectedValue) : null;
+        // 1. Try matching agent ID directly
+        selectedAgent ??= agents.find((agent) => {
+          const normalizedAgent = normalizeChoiceText(agent);
+          return normalizedAgent === normalizedChoice;
+        });
 
-        // Wait choices intentionally have no agent. Do not run the fallback
-        // label/readiness lookups for them; cancellation must be the first API
-        // request made after resolving the choice.
-        if (parsedDisplayedChoice?.action !== "wait") {
-          // 1. Try matching agent ID directly
-          selectedAgent ??= agents.find((agent) => {
-            const normalizedAgent = normalizeChoiceText(agent);
-            return normalizedAgent === normalizedChoice;
+        // 2. Try matching start building/start build
+        if (!selectedAgent && (normalizedChoice === "start_building" || normalizedChoice === "start_build")) {
+          selectedAgent = agents.find((agent) => agent === "start_building" || agent === "start_build");
+        }
+
+        // 3. Try matching resolved button labels
+        if (!selectedAgent && activeProjectId) {
+          const client = await requireAuthenticatedClient(stateDir, deps.apiBaseUrl).catch(() => null);
+          let continueButtonLabel: string | boolean = false;
+          if (client) {
+            continueButtonLabel = await determineContinueButtonLabel(client, activeProjectId).catch(() => false);
+          }
+          selectedAgent = agents.find((agent) => {
+            const label = getLabelForAgent(agent, continueButtonLabel, buttons);
+            const normalizedLabel = normalizeChoiceText(label);
+            return normalizedLabel === normalizedChoice;
           });
+        }
 
-          // 2. Try matching start building/start build
-          if (!selectedAgent && (normalizedChoice === "start_building" || normalizedChoice === "start_build")) {
-            selectedAgent = agents.find((agent) => agent === "start_building" || agent === "start_build");
-          }
-
-          // 3. Try matching resolved button labels
-          if (!selectedAgent && activeProjectId) {
-            const client = await requireAuthenticatedClient(stateDir, deps.apiBaseUrl).catch(() => null);
-            let continueButtonLabel: string | boolean = false;
-            if (client) {
-              continueButtonLabel = await determineContinueButtonLabel(client, activeProjectId).catch(() => false);
-            }
-            selectedAgent = agents.find((agent) => {
-              const label = getLabelForAgent(agent, continueButtonLabel, buttons);
-              const normalizedLabel = normalizeChoiceText(label);
-              return normalizedLabel === normalizedChoice;
-            });
-          }
-
-          // 4. Ultimate fallbacks for direct choice text:
-          if (!selectedAgent) {
-            if (
-              normalizedChoice === "continue" ||
-              normalizedChoice === "generate_first_page" ||
-              normalizedChoice === "generate_all_pages" ||
-              normalizedChoice === "generate_architecture" ||
-              normalizedChoice === "start_building" ||
-              normalizedChoice === "start_build"
-            ) {
-              selectedAgent = "continue";
-            } else if (normalizedChoice === "review" || normalizedChoice === "review_requirements") {
-              selectedAgent = "review";
-            }
+        // 4. Ultimate fallbacks for direct choice text:
+        if (!selectedAgent) {
+          if (
+            normalizedChoice === "continue" ||
+            normalizedChoice === "generate_first_page" ||
+            normalizedChoice === "generate_all_pages" ||
+            normalizedChoice === "generate_architecture" ||
+            normalizedChoice === "start_building" ||
+            normalizedChoice === "start_build"
+          ) {
+            selectedAgent = "continue";
+          } else if (normalizedChoice === "review" || normalizedChoice === "review_requirements") {
+            selectedAgent = "review";
           }
         }
       }
 
       const parsedSelection = selectedValue ? parseButtonValue(selectedValue) : null;
-      if (parsedSelection?.action === "wait" && parsedSelection.entryId) {
-        const waitTool = createWaitAutoRunTool({
-          stateDir: deps.stateDir,
-          apiBaseUrl: deps.apiBaseUrl,
-          sessionId: deps.sessionId,
-        });
-        return waitTool.execute(_id, {
-          projectId: parsedSelection.projectId,
-          entryId: parsedSelection.entryId,
-          label: parsedSelection.label,
-        });
-      }
-
+      const selectedResumeDesignButton = buttons.find((button) =>
+        button?.enabled !== false &&
+        button?.action === "resume_design" &&
+        (
+          normalizeChoiceText(String(button.label ?? "")) === normalizedChoice ||
+          (parsedSelection?.action === "continue" && selectedAgent === "continue")
+        )
+      );
       if (!selectedAgent || !activeProjectId) {
         const validRangeText = displayedChoices.length > 0 ? `between 1 and ${displayedChoices.length}` : "";
         return {
@@ -197,13 +186,19 @@ export function createSelectButtonTool(deps: {
         suggestions: agents,
       });
 
-      if (selectedAgent === "continue") {
+      if (parsedSelection?.action === "continue" || isContinueActionAgent(selectedAgent)) {
         const tool = createContinueProjectTool({
           stateDir: deps.stateDir,
           apiBaseUrl: deps.apiBaseUrl,
           sessionId: deps.sessionId,
         });
-        return tool.execute(_id, { projectId: activeProjectId }, signal, onUpdate);
+        return tool.execute(_id, {
+          projectId: activeProjectId,
+          timeoutMs: params.timeoutMs,
+          // Preserve the action from the backend button the user selected.
+          selectedAction: selectedResumeDesignButton ? "resume_design" : undefined,
+          selectedPhase: typeof selectedResumeDesignButton?.payload?.phase === "string" ? selectedResumeDesignButton.payload.phase : undefined,
+        }, signal, onUpdate);
       }
 
       if (selectedAgent === "review") {
@@ -224,7 +219,7 @@ export function createSelectButtonTool(deps: {
         apiBaseUrl: deps.apiBaseUrl,
         sessionId: deps.sessionId,
       });
-      return tool.execute(_id, { projectId: activeProjectId, agents: triggerAgents }, signal, onUpdate);
+      return tool.execute(_id, { projectId: activeProjectId, agents: triggerAgents, timeoutMs: params.timeoutMs }, signal, onUpdate);
     },
   };
 }

@@ -38,6 +38,30 @@ export function evaluateBuildTasksReadiness(
   return { state, planningStatus, planningComplete, canStart, phaseId };
 }
 
+/**
+ * Whether the dashboard should expose the Build Tasks action.
+ *
+ * An insufficient-credit hold is actionable: the user should still be able to
+ * choose Build Tasks and receive the existing Add Credits response. Other
+ * holds (missing plan, dependencies, an active build, and so on) must keep the
+ * action hidden until the backend resolves them.
+ */
+export function canOfferBuildTasksAction(
+  readiness: BuildTasksReadiness,
+  todoTaskCount: number
+): boolean {
+  if (
+    todoTaskCount < 1 ||
+    !readiness.planningComplete ||
+    readiness.state.current_phase == null ||
+    readiness.state.all_completed === true
+  ) {
+    return false;
+  }
+
+  return readiness.canStart || readiness.state.blocking_reason === "insufficient_credits";
+}
+
 export async function getBuildTasksReadiness(
   client: BuildReadinessClient,
   projectId: string,

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { formatProjectTasks } from "./task-summary.ts";
+import { formatProjectTasks } from "../src/task-summary.ts";
 
 test("formatProjectTasks renders only compact todo tasks returned by /tasks", () => {
   const result = formatProjectTasks("project-123", [

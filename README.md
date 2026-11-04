@@ -178,8 +178,11 @@ These requests are handled through the registered OpenClaw tools:
 | `ai8080_list_projects` | Lists available projects and shows project-selection UI. |
 | `ai8080_select_project` | Sets an existing project as the active project for the session. |
 | `ai8080_select_button` | Resolves numbered suggested actions such as Continue, Review, or Build Tasks. |
-| `ai8080_wait_auto_run` | Cancels a scheduled automatic action so its adjacent action button can be triggered manually. |
 | `ai8080_task_list` | Fetches and summarizes the task list for the active project. |
+
+## Tests
+
+Development tests live in [`tests/`](tests/README.md). Run them with `npm test` after installing dependencies with `npm install`.
 
 ## Notes
 

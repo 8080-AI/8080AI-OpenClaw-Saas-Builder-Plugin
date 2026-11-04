@@ -95,6 +95,15 @@ function normalizeActionLabel(value: string): string {
   return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
+export function isContinueActionAgent(agent: string | undefined): boolean {
+  return Boolean(agent && [
+    "continue",
+    "generate_first_page",
+    "generate_all_pages",
+    "generate_architecture",
+  ].includes(agent));
+}
+
 // Generate All Pages is included defensively for an exact backend entry, even
 // though the backend does not currently schedule it. getScheduledAutoRun's
 // label check prevents a Generate Architecture timer from leaking onto it.
@@ -142,16 +151,6 @@ function getScheduledAutoRun(agent: string, label: string | undefined, backendBu
   return undefined;
 }
 
-function buildWaitButtonValue(projectId: string, autoRun: ScheduledAutoRun): string {
-  return `8080_wait_${encodeURIComponent(JSON.stringify({
-    projectId,
-    entryId: autoRun.entry_id,
-    label: autoRun.label,
-    fireAt: autoRun.fire_at,
-    serverNow: autoRun.server_now,
-  }))}`;
-}
-
 function buildAutoRunNote(autoRun: ScheduledAutoRun | undefined): string {
   if (!autoRun) return "";
   const label = normalizeActionLabel(autoRun.label);
@@ -162,7 +161,7 @@ function buildAutoRunNote(autoRun: ScheduledAutoRun | undefined): string {
   const seconds = Number.isFinite(serverNow)
     ? Math.max(0, Math.ceil((fireAt - serverNow) / 1000))
     : 30;
-  return `Note: ${autoRun.label} will trigger automatically on 8080.ai in ${seconds} second${seconds === 1 ? "" : "s"}. To run it manually, choose Wait first, then choose ${autoRun.label}.`;
+  return `Note: ${autoRun.label} will trigger automatically on 8080.ai in ${seconds} second${seconds === 1 ? "" : "s"}.`;
 }
 
 export function getLabelForAgent(
@@ -199,7 +198,7 @@ export function getLabelForAgent(
 
       // Saved suggestions do not persist continueButtonLabel separately. If
       // no regular action button exists, retain the auto-run payload label so
-      // direct `wait` can match timed Continue actions without readiness lookups.
+      // timed Continue actions keep their backend labels.
       const expectedButtonKey = getAutoRunButtonKey(agent);
       const autoRunPayload = backendButtons
         .find((button) =>
@@ -214,7 +213,7 @@ export function getLabelForAgent(
         b.action === "review" ||
         b.key === "review" ||
         b.key === "review_document" ||
-        b.label.toLowerCase().includes("review")
+        (typeof b.label === "string" && b.label.toLowerCase().includes("review"))
       );
       if (btn) return btn.label;
     } else {
@@ -243,13 +242,13 @@ export function getLabelForAgent(
     agent === "generate_all_pages" ||
     agent === "generate_architecture"
   ) {
-    if (typeof continueButtonLabel === "string") {
+    if (typeof continueButtonLabel === "string" && continueButtonLabel !== "Continue") {
       return continueButtonLabel;
     }
     if (agent === "generate_first_page") return "Generate First Page";
     if (agent === "generate_all_pages") return "Generate All Pages";
     if (agent === "generate_architecture") return "Generate Architecture";
-    return continueButtonLabel ? "Generate First Page" : "Continue";
+    return continueButtonLabel === true ? "Generate First Page" : "Continue";
   }
   if (agent === "review") {
     return "Review";
@@ -258,15 +257,13 @@ export function getLabelForAgent(
 }
 
 export type SuggestedAgentChoice = {
-  kind: "agent" | "wait";
+  kind: "agent";
   label: string;
   value: string;
   agent?: string;
-  entryId?: string;
 };
 
 function choiceStyle(choice: SuggestedAgentChoice): "primary" | "secondary" {
-  if (choice.kind === "wait") return "secondary";
   const agent = choice.agent ?? "";
   return (
     agent === "plan_all" ||
@@ -293,9 +290,6 @@ function buildAgentButtonValue(projectId: string, agent: string): string {
 
 /**
  * Returns choices in the same order shown in the plain-text response.
- * Start remains the primary first step when it has a scheduled auto-run;
- * Wait follows it as the cancellation option. Other scheduled actions retain
- * the existing Wait-first ordering.
  */
 export function buildSuggestedAgentChoices(
   projectId: string,
@@ -311,17 +305,7 @@ export function buildSuggestedAgentChoices(
       value: buildAgentButtonValue(projectId, agent),
       agent,
     };
-    const autoRun = getScheduledAutoRun(agent, label, backendButtons);
-    if (!autoRun) return [actionChoice];
-    const waitChoice: SuggestedAgentChoice = {
-      kind: "wait" as const,
-      label: "Wait",
-      value: buildWaitButtonValue(projectId, autoRun),
-      entryId: autoRun.entry_id,
-    };
-    return normalizeActionLabel(label) === "start"
-      ? [actionChoice, waitChoice]
-      : [waitChoice, actionChoice];
+    return [actionChoice];
   });
 }
 
@@ -362,8 +346,6 @@ export function buildSuggestedAgentsPresentation(
   const buttons = choices.map((choice, index) => ({
     label: choice.label,
     value: choice.value,
-    // Commands are handled by the plugin before agent invocation, so pressing
-    // Wait does not spend part of the countdown waiting for an LLM turn.
     action: { type: "command" as const, command: `/ai8080 select-button ${index + 1}` },
     style: choiceStyle(choice),
   }));
@@ -392,21 +374,7 @@ export function buildSuggestedAgentsPresentation(
 // Returns null if the value is not from this plugin.
 export function parseButtonValue(
   value: string
-): { action: "review" | "continue" | "trigger_agents" | "select" | "wait"; projectId: string; agents?: string[]; entryId?: string; label?: string } | null {
-  if (value.startsWith("8080_wait_")) {
-    try {
-      const payload = JSON.parse(decodeURIComponent(value.slice("8080_wait_".length))) as Record<string, unknown>;
-      if (typeof payload.projectId !== "string" || typeof payload.entryId !== "string") return null;
-      return {
-        action: "wait",
-        projectId: payload.projectId,
-        entryId: payload.entryId,
-        ...(typeof payload.label === "string" ? { label: payload.label } : {}),
-      };
-    } catch {
-      return null;
-    }
-  }
+): { action: "review" | "continue" | "trigger_agents" | "select"; projectId: string; agents?: string[] } | null {
   if (value.startsWith("8080_review_")) {
     return { action: "review", projectId: value.slice("8080_review_".length) };
   }
@@ -452,10 +420,6 @@ export function buildSuggestedAgentsText(
 
   const choices = buildSuggestedAgentChoices(projectId, agents, continueButtonLabel, backendButtons);
   const lines = choices.map((choice, index) => `${index + 1}. ${choice.label}`);
-  const waitIndex = choices.findIndex((choice) => choice.kind === "wait");
-  const directWaitHint = waitIndex >= 0
-    ? `OpenClaw Chat fallback: \`/ai8080 select-button ${waitIndex + 1}\` cancels the automatic action directly without waiting for the model.`
-    : "";
   const note = agents
     .map((agent) => {
       const label = getLabelForAgent(agent, continueButtonLabel, backendButtons);
@@ -463,5 +427,5 @@ export function buildSuggestedAgentsText(
     })
     .find(Boolean);
 
-  return `### Suggested Next Steps:\n${lines.join("\n")}\n${note ? `\n${note}\n` : ""}${directWaitHint ? `\n${directWaitHint}\n` : ""}`;
+  return `### Suggested Next Steps:\n${lines.join("\n")}\n${note ? `\n${note}\n` : ""}`;
 }

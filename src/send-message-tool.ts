@@ -1,3 +1,4 @@
+import { getResumeDesignPhase } from "./suggested-agents.ts";
 import { Type } from "@sinclair/typebox";
 import { requireAuthenticatedClient, AuthError, filterStartBuildingAgents, isPauseForReviewText, isReviewArchitectureStartBuildingChatMessage, checkGenerateFirstPageCondition, determineContinueButtonLabel } from "./api-client.ts";
 import {
@@ -5,6 +6,7 @@ import {
   buildSuggestedAgentsPresentation,
   buildSuggestedAgentsJsonl,
   buildSuggestedAgentsText,
+  isContinueActionAgent,
 } from "./review-continue.ts";
 import { groupAgents, hasGeneratedData } from "./command.ts";
 import { readActiveModel } from "./model-state.ts";
@@ -120,7 +122,7 @@ export function createSendMessageTool(deps: {
             const index = parseInt(numericSelection[1], 10) - 1;
             if (lastSuggestions && lastSuggestions.agents && lastSuggestions.agents[index]) {
               const selected = lastSuggestions.agents[index];
-              if (selected === "continue") {
+              if (isContinueActionAgent(selected)) {
                 action = "resume";
               } else if (selected === "review") {
                 action = "review";
@@ -253,10 +255,10 @@ export function createSendMessageTool(deps: {
                 projectId: activeProjectId,
                 messageId,
               });
-              await client.resumeDesign(activeProjectId);
+              await client.resumeDesign(activeProjectId, getResumeDesignPhase(lastSuggestions?.buttons));
             } catch (err) {
               if (err instanceof AuthError) {
-                const finalAgents = ["continue", "review"];
+                const finalAgents = agents;
                 await writeLatestSuggestions(stateDir, sessionId, {
                   projectId: activeProjectId,
                   agents: finalAgents,
@@ -385,7 +387,7 @@ export function createSendMessageTool(deps: {
             const statusAfter = await client.getProjectStatus(activeProjectId);
             const pending = extractPendingSuggestion(statusAfter.pending_suggested_agents);
             pendingButtons = pending.buttons;
-            const backendResumeSuggestions = pending.agents.filter((agent) => agent === "continue" || agent === "review");
+            const backendResumeSuggestions = pending.agents.filter((agent) => isContinueActionAgent(agent) || agent === "review");
             const hasBackendContinue = backendResumeSuggestions.includes("continue");
             const hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(activeProjectId);
             if (pending.messageId) finalMessageId = pending.messageId;
@@ -398,7 +400,7 @@ export function createSendMessageTool(deps: {
               hasLatestCompletedAgentLog,
             });
             finalAgents = hasLatestCompletedAgentLog
-              ? (hasBackendContinue ? backendResumeSuggestions : ["continue", "review"])
+              ? backendResumeSuggestions
               : [];
           } else {
             const statusAfter = await client.getProjectStatus(activeProjectId);
@@ -463,7 +465,7 @@ export function createSendMessageTool(deps: {
               // The execution-state endpoint is authoritative for Build Tasks.
               if (canBuildForPlan) {
                 const canShowStartBuilding = buildReadiness.canStart;
-                const backendResumeSuggestions = finalAgents.filter((agent) => agent === "continue" || agent === "review");
+                const backendResumeSuggestions = finalAgents.filter((agent) => isContinueActionAgent(agent) || agent === "review");
                 const hasBackendContinue = backendResumeSuggestions.includes("continue");
                 log.info("agent_logs continue override decision", {
                   projectId: activeProjectId,

@@ -12,10 +12,8 @@ import { createListProjectsTool } from "./src/list-projects-tool.ts";
 import { createSelectProjectTool } from "./src/select-project-tool.ts";
 import { createTaskListTool } from "./src/task-list-tool.ts";
 import { createSelectButtonTool } from "./src/select-button-tool.ts";
-import { createWaitAutoRunTool } from "./src/wait-auto-run-tool.ts";
 import { generateSessionId } from "./src/command.ts";
 import { registerExactResponseHooks } from "./src/exact-response-hooks.ts";
-import { registerWaitFastPath } from "./src/wait-fast-path.ts";
 import { configureLogger, log } from "./logger.ts";
 type PluginConfig = {
   siteUrl?: string;
@@ -47,7 +45,6 @@ export default definePluginEntry({
     const stateDir = () => api.runtime.state.resolveStateDir();
     const sessionId = generateSessionId();
     registerExactResponseHooks(api);
-    registerWaitFastPath(api, { stateDir, apiBaseUrl, sessionId });
 
     // -----------------------------------------------------------------------
     // 1. Slash command — /ai8080 login | set api-key | credits | status | review | continue
@@ -82,7 +79,6 @@ export default definePluginEntry({
     api.registerTool(createListProjectsTool({ stateDir, apiBaseUrl }));
     api.registerTool(createSelectProjectTool({ stateDir, apiBaseUrl, sessionId }));
     api.registerTool(createSelectButtonTool({ stateDir, siteUrl, apiBaseUrl, sessionId }));
-    api.registerTool(createWaitAutoRunTool({ stateDir, apiBaseUrl, sessionId }));
     api.registerTool(createTaskListTool({ stateDir, apiBaseUrl, sessionId }));
   },
 });

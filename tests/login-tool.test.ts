@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createLoginTool } from "./login-tool.ts";
+import { createLoginTool } from "../src/login-tool.ts";
 
 test("login tool advertises natural-language aliases and forbids automatic browsing", () => {
   const tool = createLoginTool({
