@@ -4,7 +4,7 @@ import { createReviewProjectTool } from "./review-project-tool.ts";
 import { createTriggerAgentsTool } from "./trigger-agents-tool.ts";
 import { readLatestSuggestions } from "./suggestions-state.ts";
 import { requireAuthenticatedClient, determineContinueButtonLabel } from "./api-client.ts";
-import { getLabelForAgent } from "./review-continue.ts";
+import { buildSuggestedAgentChoices, getLabelForAgent, isContinueActionAgent, parseButtonValue } from "./review-continue.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { log } from "../logger.ts";
 
@@ -21,15 +21,17 @@ export function createSelectButtonTool(deps: {
   return {
     name: "ai8080_select_button",
     description:
+      "When the result supplies nextTool, call it automatically to continue observation without submitting work. Do not ask the user to refresh. " +
       "Select one of the currently displayed 8080.ai Suggested Next Steps by number or name. " +
       "Use this when the user says 'select 1', 'select-1', 'choose option 1', 'option 2', " +
-      "'continue', 'review', 'start building', or similar after 8080.ai shows numbered suggestions. " +
+      "'continue', 'review', 'start', 'build tasks', or similar after 8080.ai shows numbered suggestions. " +
       "Resolve the choice against the saved suggestions and run the matching action. " +
+      "The selected action observes completion internally; await its native wait handle and do not select the generation action again to poll. " +
       "For long-running 8080.ai actions, always pass timeoutMs=600000 so OpenClaw allows the tool call to wait for agent completion.",
     parameters: Type.Object({
       choice: Type.String({
         description:
-          "The user's selected option number or name, for example '1', '2', 'continue', 'review', or 'start building'.",
+          "The user's selected option number or name, for example '1', '2', 'start', 'continue', 'review', or 'build tasks'.",
       }),
       timeoutMs: Type.Number({
         default: 600000,
@@ -85,9 +87,13 @@ export function createSelectButtonTool(deps: {
       const normalizedChoice = normalizeChoiceText(choice);
       const num = parseInt(choice, 10);
       let selectedAgent: string | undefined;
+      let selectedValue: string | undefined;
+      const displayedChoices = activeProjectId
+        ? buildSuggestedAgentChoices(activeProjectId, agents, undefined, buttons)
+        : [];
 
       if (!Number.isNaN(num)) {
-        if (agents.length === 0) {
+        if (displayedChoices.length === 0) {
           return {
             content: [{
               type: "text",
@@ -95,18 +101,25 @@ export function createSelectButtonTool(deps: {
             }],
           };
         }
-        if (num < 1 || num > agents.length) {
+        if (num < 1 || num > displayedChoices.length) {
           return {
             content: [{
               type: "text",
-              text: `"${choice}" is not valid. Pick a number between 1 and ${agents.length}.`,
+              text: `"${choice}" is not valid. Pick a number between 1 and ${displayedChoices.length}.`,
             }],
           };
         }
-        selectedAgent = agents[num - 1];
+        const selected = displayedChoices[num - 1];
+        selectedAgent = selected?.agent;
+        selectedValue = selected?.value;
       } else {
+        const displayedChoice = displayedChoices.find((candidate) =>
+          normalizeChoiceText(candidate.label) === normalizedChoice
+        );
+        selectedAgent = displayedChoice?.agent;
+        selectedValue = displayedChoice?.value;
         // 1. Try matching agent ID directly
-        selectedAgent = agents.find((agent) => {
+        selectedAgent ??= agents.find((agent) => {
           const normalizedAgent = normalizeChoiceText(agent);
           return normalizedAgent === normalizedChoice;
         });
@@ -147,8 +160,17 @@ export function createSelectButtonTool(deps: {
         }
       }
 
+      const parsedSelection = selectedValue ? parseButtonValue(selectedValue) : null;
+      const selectedResumeDesignButton = buttons.find((button) =>
+        button?.enabled !== false &&
+        button?.action === "resume_design" &&
+        (
+          normalizeChoiceText(String(button.label ?? "")) === normalizedChoice ||
+          (parsedSelection?.action === "continue" && selectedAgent === "continue")
+        )
+      );
       if (!selectedAgent || !activeProjectId) {
-        const validRangeText = agents.length > 0 ? `between 1 and ${agents.length}` : "";
+        const validRangeText = displayedChoices.length > 0 ? `between 1 and ${displayedChoices.length}` : "";
         return {
           content: [{
             type: "text",
@@ -164,19 +186,26 @@ export function createSelectButtonTool(deps: {
         suggestions: agents,
       });
 
-      if (selectedAgent === "continue") {
+      if (parsedSelection?.action === "continue" || isContinueActionAgent(selectedAgent)) {
         const tool = createContinueProjectTool({
           stateDir: deps.stateDir,
+        siteUrl: deps.siteUrl,
           apiBaseUrl: deps.apiBaseUrl,
           sessionId: deps.sessionId,
         });
-        return tool.execute(_id, { projectId: activeProjectId }, signal, onUpdate);
+        return tool.execute(_id, {
+          projectId: activeProjectId,
+          timeoutMs: params.timeoutMs,
+          // Preserve the action from the backend button the user selected.
+          selectedAction: selectedResumeDesignButton ? "resume_design" : undefined,
+          selectedPhase: typeof selectedResumeDesignButton?.payload?.phase === "string" ? selectedResumeDesignButton.payload.phase : undefined,
+        }, signal, onUpdate);
       }
 
       if (selectedAgent === "review") {
         const tool = createReviewProjectTool({
           stateDir: deps.stateDir,
-          siteUrl: deps.siteUrl,
+        siteUrl: deps.siteUrl,
           apiBaseUrl: deps.apiBaseUrl,
           sessionId: deps.sessionId,
         });
@@ -188,10 +217,11 @@ export function createSelectButtonTool(deps: {
         : [selectedAgent];
       const tool = createTriggerAgentsTool({
         stateDir: deps.stateDir,
+        siteUrl: deps.siteUrl,
         apiBaseUrl: deps.apiBaseUrl,
         sessionId: deps.sessionId,
       });
-      return tool.execute(_id, { projectId: activeProjectId, agents: triggerAgents }, signal, onUpdate);
+      return tool.execute(_id, { projectId: activeProjectId, agents: triggerAgents, timeoutMs: params.timeoutMs }, signal, onUpdate);
     },
   };
 }

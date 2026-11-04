@@ -1,8 +1,11 @@
-import { type ChatMessage, checkGenerateFirstPageCondition, determineContinueButtonLabel } from "./api-client.ts";
-import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
+import { buildSuggestedAgentsTextWithShares } from "./artifact-shares.ts";
+import { type BuildPhaseExecutionState, type ChatMessage, type PlanningStatus, checkGenerateFirstPageCondition, determineContinueButtonLabel } from "./api-client.ts";
+import { buildSuggestedAgentsPresentation } from "./review-continue.ts";
 import { writeLatestSuggestions } from "./suggestions-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { log } from "../logger.ts";
+import { getBuildTasksReadiness } from "./build-readiness.ts";
+import { readActiveModel } from "./model-state.ts";
 
 const FIRST_PAGE_RE = /page design and user flow are ready for review|review the user flow and the .+ page design/i;
 const ALL_PAGES_RE = /All \d+ page designs are ready|Please review them.*click \*\*Continue\*\*/i;
@@ -10,13 +13,15 @@ const USER_FLOW_RE = /user flows are ready for review|Click \*\*Continue\*\* to 
 const REVIEW_BUILD_RE = /Review the design and architecture and start building/i;
 const INSUFFICIENT_CREDITS_RE = /Insufficient credits|cannot afford/i;
 
-type ActivationClient = {
+type ActivationClient = Partial<import("./artifact-shares.ts").ArtifactShareClient> & {
   getProjectStatus(projectId: string): Promise<{ pending_suggested_agents?: unknown; messages?: ChatMessage[] } | null>;
   getChatMessages(projectId: string): Promise<ChatMessage[]>;
   getProjectChatMessages(projectId: string, chatSessionId: string): Promise<ChatMessage[]>;
   getTasks(projectId: string): Promise<unknown>;
   getArchitecture(projectId: string): Promise<unknown>;
   getAgentLogs(projectId: string): Promise<any[]>;
+  getPlanningStatus(projectId: string): Promise<PlanningStatus>;
+  getBuildPhaseExecutionState(projectId: string, modelTier: string): Promise<BuildPhaseExecutionState>;
 };
 
 type ActivationResult = {
@@ -175,6 +180,7 @@ async function activationAgents(
 
 export async function buildProjectActivationResult(params: {
   client: ActivationClient;
+  siteUrl?: string;
   projectId: string;
   projectTitle: string;
   stateDir: string;
@@ -186,7 +192,17 @@ export async function buildProjectActivationResult(params: {
   const chatSessionId = pending.sessionId || openClawSessionId;
   const messages = await fetchActivationMessages(client, projectId, status, chatSessionId);
   const message = latestActivationMessage(messages);
-  const agents = await activationAgents(client, projectId, message, pending.agents);
+  const activeModel = await readActiveModel(stateDir);
+  const buildReadiness = await getBuildTasksReadiness(client, projectId, activeModel).catch((err) => {
+    log.info("project_activation build execution-state check failed", {
+      projectId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  });
+  const agents = buildReadiness?.canStart
+    ? ["start_building", "review"]
+    : await activationAgents(client, projectId, message, pending.agents);
   const messageId = message?.id || pending.messageId || "";
 
   await writeLatestSuggestions(stateDir, openClawSessionId, {
@@ -201,7 +217,7 @@ export async function buildProjectActivationResult(params: {
     ? `\n\n### Latest Message\n\n**${messageLabel(message.author)}:** ${message.content}`
     : "";
   const suggestionText = agents.length > 0
-    ? `\n\n${buildSuggestedAgentsText(projectId, agents, "", continueButtonLabel, pending.buttons)}` +
+    ? `\n\n${await buildSuggestedAgentsTextWithShares(client, params.siteUrl, projectId, agents, "", continueButtonLabel, pending.buttons)}` +
       `\nType \`/ai8080 select-button <number>\` to proceed.`
     : "";
   const text =

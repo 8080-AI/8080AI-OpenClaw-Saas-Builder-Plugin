@@ -150,10 +150,10 @@ export function formatInsufficientCreditsMessage(
 
   return [
     "💳 **Add Credits**",
-    "You do not have enough credits to start building this project.",
+    "You do not have enough credits to build this project's tasks.",
     required !== undefined ? `Required credits: **${required}**` : "",
     available !== undefined ? `Available credits: **${available}**` : "",
-    `Add credits on 8080.ai, then click **Start Building** again: ${siteUrl.replace(/\/$/, "")}`,
+    `Add credits on 8080.ai, then click **Build Tasks** again: ${siteUrl.replace(/\/$/, "")}`,
   ].filter(Boolean).join("\n");
 }
 

@@ -1,14 +1,16 @@
+import { getResumeDesignPhase } from "./suggested-agents.ts";
+import { waitForProjectResponse } from "./workflow-response.ts";
 import { Type } from "@sinclair/typebox";
-import { AuthError, requireAuthenticatedClient, isPauseForReviewText, type ProjectStatus, determineContinueButtonLabel } from "./api-client.ts";
-import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
-import { groupAgents, hasGeneratedData } from "./command.ts";
+import { AuthError, requireAuthenticatedClient, isPauseForReviewText, type ProjectStatus } from "./api-client.ts";
+import { isContinueActionAgent } from "./review-continue.ts";
 import { readActiveModel } from "./model-state.ts";
-import { extractPendingSuggestion, type PendingSuggestion } from "./suggested-agents.ts";
+import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { readLatestSuggestionsForProject, writeLatestSuggestions } from "./suggestions-state.ts";
 import { silentToolResult } from "./exact-response.ts";
 import { formatStartBuildingTasks } from "./task-summary.ts";
 import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
-import { getDesignPreviewText } from "./design-preview.ts";
+import { getArtifactShareText } from "./artifact-shares.ts";
+import { buildTasksUnavailableMessage, getBuildTasksReadiness } from "./build-readiness.ts";
 import { log } from "../logger.ts";
 
 function statusHasReviewCheckpoint(status: ProjectStatus): boolean {
@@ -17,11 +19,7 @@ function statusHasReviewCheckpoint(status: ProjectStatus): boolean {
 }
 
 function statusHasBackendContinue(status: ProjectStatus): boolean {
-  return extractPendingSuggestion(status.pending_suggested_agents).agents.includes("continue");
-}
-
-function hasSameAgents(left: string[], right: string[]): boolean {
-  return left.length === right.length && left.every((agent) => right.includes(agent));
+  return extractPendingSuggestion(status.pending_suggested_agents).agents.some(isContinueActionAgent);
 }
 
 function isPlanningActivityLog(entry: { action?: string | null; agent_type?: string | null; summary?: string | null }): boolean {
@@ -40,23 +38,7 @@ function isPlanningActivityLog(entry: { action?: string | null; agent_type?: str
   );
 }
 
-async function waitForReviewCheckpoint(
-  client: Awaited<ReturnType<typeof requireAuthenticatedClient>>,
-  projectId: string,
-  options: { timeoutMs: number; intervalMs: number }
-): Promise<ProjectStatus> {
-  const deadline = Date.now() + options.timeoutMs;
-  let latestStatus = await client.getProjectStatus(projectId);
-
-  while (!statusHasReviewCheckpoint(latestStatus) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, options.intervalMs));
-    latestStatus = await client.getProjectStatus(projectId);
-  }
-
-  return latestStatus;
-}
-
-async function waitForReviewActions(
+export async function waitForReviewActions(
   client: Awaited<ReturnType<typeof requireAuthenticatedClient>>,
   projectId: string,
   options: { pausedForReview: boolean; timeoutMs: number; intervalMs: number }
@@ -74,7 +56,7 @@ async function waitForReviewActions(
   let backendHasContinue = statusHasBackendContinue(latestStatus);
   let hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(projectId);
 
-  while (!(pausedForReview && hasLatestCompletedAgentLog) && Date.now() < deadline) {
+  while (extractPendingSuggestion(latestStatus.pending_suggested_agents).agents.length === 0 && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, options.intervalMs));
     latestStatus = await client.getProjectStatus(projectId);
     hasReviewCheckpoint = statusHasReviewCheckpoint(latestStatus);
@@ -95,15 +77,18 @@ async function waitForReviewActions(
 export function createTriggerAgentsTool(deps: {
   stateDir: () => string;
   apiBaseUrl: string;
+  siteUrl?: string;
   sessionId: string;
 }) {
   return {
     name: "ai8080_trigger_agents",
     description:
+      "When the result supplies nextTool, call it automatically to continue observation without submitting work. Do not ask the user to refresh. " +
       "Trigger specific AI agents on 8080.ai. " +
       "If the user sends a raw button payload like '8080_trigger_agents_<projectId>_<agentsJsonArray>', you MUST use this tool. Extract the projectId and parse the JSON array of agents to pass as arguments. This starts the suggested agents working on the project. " +
       "After Start is triggered for the plan-all action, do not summarize, announce, or confirm that agents started. If this tool returns no visible content, remain silent. Only show the user the returned Continue/Review actions when the tool returns visible content. " +
-      "For long-running 8080.ai actions, always pass timeoutMs=600000 so OpenClaw allows the tool call to wait for agent completion.",
+      "This call observes the same run until the next checkpoint; await its native wait handle and never resubmit generation to poll. " +
+      "For long-running 8080.ai actions, always pass timeoutMs=600000 so OpenClaw allows the tool call to wait for agent completion. A running result is not final: immediately call its nextTool with observeOnly=true until actual suggested actions are returned. If exec yields a pending cell, keep waiting for that same cell; do not end the turn or recreate the project.",
     parameters: Type.Object({
       projectId: Type.String({
         description: "The 8080.ai project ID to trigger agents for.",
@@ -122,37 +107,38 @@ export function createTriggerAgentsTool(deps: {
     async execute(
       _id: string,
       params: { projectId: string; agents: string[]; timeoutMs?: number },
-      
+
       _signal: AbortSignal | undefined,
       onUpdate: (partial: { content: { type: "text"; text: string }[]; details: any; presentation?: any }) => void
     ) {
+      const actionStartedAt = Date.now();
       const stateDir = deps.stateDir();
       const { apiBaseUrl, sessionId } = deps;
 
       try {
         const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
         const activeModel = await readActiveModel(stateDir);
-        if (params.agents.includes("start_building")) {
+        if (params.agents.some((agent) => agent === "start_building" || agent === "start_build")) {
           log.info("trigger_agents received start_building", {
             projectId: params.projectId,
             agents: params.agents,
             activeModel,
           });
-          const [tasksForBuild, archForBuild] = await Promise.all([
+          const [tasksForBuild, buildReadiness] = await Promise.all([
             client.getTasks(params.projectId).catch(() => null),
-            client.getArchitecture(params.projectId).catch(() => null),
+            getBuildTasksReadiness(client, params.projectId, activeModel),
           ]);
-          const canStartBuilding = hasGeneratedData(tasksForBuild) && hasGeneratedData(archForBuild);
           log.info("start_building selected readiness decision", {
             projectId: params.projectId,
-            hasTasks: hasGeneratedData(tasksForBuild),
-            hasArchitecture: hasGeneratedData(archForBuild),
-            canStartBuilding,
+            canStartBuilding: buildReadiness.canStart,
+            phaseId: buildReadiness.phaseId,
+            blockingReason: buildReadiness.state.blocking_reason,
+            runnableTaskCount: buildReadiness.state.runnable_tasks?.length ?? 0,
           });
-          if (!canStartBuilding) {
+          if (!buildReadiness.canStart) {
             return {
-              content: [{ type: "text", text: "Start Building is not available yet. Architecture and tasks must be generated first." }],
-              details: { projectId: params.projectId, action: "build", blocked: true },
+              content: [{ type: "text", text: buildTasksUnavailableMessage(buildReadiness) }],
+              details: { projectId: params.projectId, action: "build", blocked: true, reason: buildReadiness.state.blocking_reason },
             };
           }
           const creditCheck = await precheckStartBuildingCredits(client, params.projectId, tasksForBuild, activeModel);
@@ -185,7 +171,7 @@ export function createTriggerAgentsTool(deps: {
             activeModel,
           });
           try {
-            await client.startBuilding(params.projectId, activeModel);
+            await client.startBuilding(params.projectId, activeModel, buildReadiness.phaseId);
           } catch (err) {
             const insufficientCreditsText = getInsufficientCreditsMessageFromError(err);
             if (insufficientCreditsText) {
@@ -196,7 +182,7 @@ export function createTriggerAgentsTool(deps: {
             }
             throw err;
           }
-          const designPreviewText = await getDesignPreviewText(client, params.projectId);
+          const artifactLinks = await getArtifactShareText(client, params.projectId, deps.siteUrl);
           log.info("start_building selected build api completed", {
             projectId: params.projectId,
             activeModel,
@@ -208,7 +194,7 @@ export function createTriggerAgentsTool(deps: {
               text:
                 `✅ **Building Started!** Agents are now writing your software.` +
                 (taskSummaryText ? `\n\n${taskSummaryText}` : "") +
-                designPreviewText,
+                (artifactLinks ? `\n\n${artifactLinks}` : ""),
             }],
             details: { projectId: params.projectId, action: "build", status: "started" },
           };
@@ -216,8 +202,8 @@ export function createTriggerAgentsTool(deps: {
 
         const latestSuggestions = await readLatestSuggestionsForProject(stateDir, sessionId, params.projectId).catch(() => null);
         let messageId = latestSuggestions?.messageId ?? "";
-        if (params.agents.includes('continue')) {
-          if (!latestSuggestions?.agents.includes("continue")) {
+        if (params.agents.some(isContinueActionAgent)) {
+          if (!latestSuggestions?.agents.some(isContinueActionAgent)) {
             log.info("trigger_agents blocked continue without continue suggestion", {
               projectId: params.projectId,
               agents: params.agents,
@@ -238,7 +224,7 @@ export function createTriggerAgentsTool(deps: {
             projectId: params.projectId,
             messageId: latestSuggestions.messageId,
           });
-          await client.resumeDesign(params.projectId);
+          await client.resumeDesign(params.projectId, getResumeDesignPhase(latestSuggestions?.buttons));
         } else {
           try {
             const status = await client.getProjectStatus(params.projectId);
@@ -269,193 +255,21 @@ export function createTriggerAgentsTool(deps: {
             if (!hasPlanningActivity) throw err;
           }
         }
-        
+
         log.info("trigger_agents started polling for review gate", {
           projectId: params.projectId,
           agents: params.agents,
         });
 
-        // Stream events live to the dashboard until the planning checkpoint or idle timeout.
-        const eventIdleTimeoutMs = 120_000;
-        const eventProgressTimeoutMs = 300_000;
-        const eventMaxTimeoutMs = 480_000;
-        let pausedForReview = false;
-        let hasCompletedAgent = false;
-        const suggestedAgentsFromEvents: string[] = [];
-        let suggestedAgentsMessageId = "";
-        let suggestedAgentsButtons: any[] | undefined;
-
-        const captureEventSuggestions = (suggestion: PendingSuggestion) => {
-          for (const agent of suggestion.agents) {
-            if (!suggestedAgentsFromEvents.includes(agent)) {
-              suggestedAgentsFromEvents.push(agent);
-            }
-          }
-          if (suggestion.messageId) suggestedAgentsMessageId = suggestion.messageId;
-          if (suggestion.buttons) suggestedAgentsButtons = suggestion.buttons;
-          log.info("trigger_agents event suggested_agents", {
-            projectId: params.projectId,
-            agents: suggestion.agents,
-            messageId: suggestion.messageId,
-            hasButtons: Boolean(suggestion.buttons?.length),
-          });
-        };
-
-        try {
-          await client.streamProjectEvents(params.projectId, {
-            onSuggestedAgents: captureEventSuggestions,
-            onAgentLog: (agentLog) => {
-              if (agentLog.action === "completed") {
-                hasCompletedAgent = true;
-              }
-              log.info("trigger_agents event agent_log", {
-                projectId: params.projectId,
-                action: agentLog.action,
-                agentType: agentLog.agent_type,
-                summary: agentLog.summary,
-              });
-            },
-            onChatMessage: (msg) => {
-              if (isPauseForReviewText(msg.content)) {
-                pausedForReview = true;
-              }
-              log.info("trigger_agents event chat_message", {
-                projectId: params.projectId,
-                isPauseForReview: isPauseForReviewText(msg.content),
-              });
-            },
-            onSrdChunk: undefined,
-            onPlanningComplete: (data) => {
-              if (data.status === "paused_for_review") {
-                pausedForReview = true;
-              }
-            },
-            idleTimeoutMs: eventIdleTimeoutMs,
-            progressTimeoutMs: eventProgressTimeoutMs,
-            maxTimeoutMs: eventMaxTimeoutMs,
-          });
-        } catch (err) {
-          log.info("trigger_agents event stream failed; continuing with project polling", {
-            projectId: params.projectId,
-            agents: params.agents,
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-
-        if (
-          suggestedAgentsFromEvents.length > 0 &&
-          !hasSameAgents(suggestedAgentsFromEvents, params.agents)
-        ) {
-          const eventAgents = groupAgents(suggestedAgentsFromEvents);
-          const eventMessageId = suggestedAgentsMessageId || messageId;
-          await writeLatestSuggestions(stateDir, sessionId, {
-            projectId: params.projectId,
-            agents: eventAgents,
-            messageId: eventMessageId,
-            buttons: suggestedAgentsButtons,
-          });
-          log.info("trigger_agents showing event suggested agents", {
-            projectId: params.projectId,
-            triggeredAgents: params.agents,
-            eventAgents,
-            messageId: eventMessageId,
-            hasButtons: Boolean(suggestedAgentsButtons?.length),
-          });
-          const continueButtonLabel = eventAgents.some((agent) =>
-            agent === "continue" ||
-            agent === "generate_first_page" ||
-            agent === "generate_all_pages" ||
-            agent === "generate_architecture"
-          )
-            ? await determineContinueButtonLabel(client, params.projectId)
-            : undefined;
-          const text = buildSuggestedAgentsText(params.projectId, eventAgents, "", continueButtonLabel, suggestedAgentsButtons);
-          const presentation = buildSuggestedAgentsPresentation(params.projectId, eventAgents, "", continueButtonLabel, suggestedAgentsButtons);
-          onUpdate?.({ content: [{ type: "text", text }], details: null, presentation });
-          return {
-            content: [{ type: "text", text }],
-            details: {
-              status: "suggested_agents",
-              suggestions: eventAgents,
-            },
-            presentation,
-          };
-        }
-
-        let projectStatusAfter = await waitForReviewCheckpoint(client, params.projectId, {
-          timeoutMs: params.agents.includes("plan_all") ? 30_000 : 20_000,
-          intervalMs: 5_000,
+        return await waitForProjectResponse(client, {
+          siteUrl: deps.siteUrl,
+          onUpdate,
+          stateDir, sessionId, projectId: params.projectId, modelTier: activeModel,
+          signal: _signal, timeoutMs: params.timeoutMs,
+          toolDeadlineAt: actionStartedAt + Math.min(params.timeoutMs ?? 600_000, 600_000),
+          consumed: { agents: params.agents, buttons: latestSuggestions?.buttons, messageId, sessionId: "" },
+          startedAt: actionStartedAt,
         });
-        const reviewGate = await waitForReviewActions(client, params.projectId, {
-          pausedForReview: pausedForReview || statusHasReviewCheckpoint(projectStatusAfter),
-          timeoutMs: params.agents.includes("plan_all") ? 60_000 : 45_000,
-          intervalMs: 5_000,
-        });
-        projectStatusAfter = reviewGate.status;
-        pausedForReview = reviewGate.pausedForReview;
-        const { hasReviewCheckpoint, backendHasContinue, hasLatestCompletedAgentLog } = reviewGate;
-        const reviewReady = pausedForReview && hasLatestCompletedAgentLog;
-        if (reviewReady) {
-          log.info("trigger_agents detected review checkpoint from project status", {
-            projectId: params.projectId,
-            agents: params.agents,
-            hasReviewCheckpoint,
-            pausedForReview,
-            hasCompletedAgent,
-            backendHasContinue,
-            hasLatestCompletedAgentLog,
-          });
-        } else {
-          log.info("trigger_agents review checkpoint not ready in backend suggestions", {
-            projectId: params.projectId,
-            agents: params.agents,
-            hasReviewText: hasReviewCheckpoint,
-            backendHasContinue,
-            hasLatestCompletedAgentLog,
-            pendingSuggestions: extractPendingSuggestion(projectStatusAfter.pending_suggested_agents).agents,
-          });
-        }
-
-        if (!reviewReady) {
-          await writeLatestSuggestions(stateDir, sessionId, {
-            projectId: params.projectId,
-            agents: [],
-            messageId,
-          });
-          return silentToolResult({
-            status: "waiting_for_review_actions",
-            suggestions: [],
-            projectId: params.projectId,
-          });
-        }
-
-        const reviewAgents = groupAgents(["continue", "review"]);
-        const pending = extractPendingSuggestion(projectStatusAfter.pending_suggested_agents);
-        if (pending.messageId) messageId = pending.messageId;
-        log.info("trigger_agents showing review actions", {
-          projectId: params.projectId,
-          agents: reviewAgents,
-          messageId,
-          backendSessionId: pending.sessionId,
-        });
-        await writeLatestSuggestions(stateDir, sessionId, {
-          projectId: params.projectId,
-          agents: reviewAgents,
-          messageId,
-          buttons: pending.buttons,
-        });
-        const continueButtonLabel = reviewAgents.includes("continue") ? await determineContinueButtonLabel(client, params.projectId) : undefined;
-        const reviewText = buildSuggestedAgentsText(params.projectId, reviewAgents, "", continueButtonLabel, pending.buttons);
-        const presentation = buildSuggestedAgentsPresentation(params.projectId, reviewAgents, "", continueButtonLabel, pending.buttons);
-        onUpdate?.({ content: [{ type: "text", text: reviewText }], details: null, presentation });
-        return {
-          content: [{ type: "text", text: reviewText }],
-          details: {
-            status: "paused_for_review",
-            suggestions: reviewAgents,
-          },
-          presentation,
-        };
       } catch (err) {
         if (err instanceof AuthError) {
           return { content: [{ type: "text", text: (err as Error).message }], details: null };

@@ -6,6 +6,7 @@ import { buildProjectActivationResult } from "./project-activation.ts";
 export function createSelectProjectTool(deps: {
   stateDir: () => string;
   apiBaseUrl: string;
+  siteUrl?: string;
   sessionId: string;
 }) {
   return {
@@ -45,6 +46,7 @@ export function createSelectProjectTool(deps: {
 
         await writeActiveProject(stateDir, selected.id, sessionId);
         const activation = await buildProjectActivationResult({
+          siteUrl: deps.siteUrl,
           client,
           projectId: selected.id,
           projectTitle: selected.title,

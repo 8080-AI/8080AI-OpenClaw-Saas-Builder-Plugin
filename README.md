@@ -26,6 +26,7 @@ The plugin lets an OpenClaw agent authenticate with [8080.ai](https://8080.ai), 
 ## Capabilities
 
 - Start a new [8080.ai](https://8080.ai) project from an OpenClaw prompt.
+- Show the current `/tasks` result alongside Tech Lead responses throughout the project workflow.
 - List and select existing [8080.ai](https://8080.ai) projects.
 - Review requirements, design, architecture, and task checkpoints.
 - Continue planning agents and start building when the project is ready.
@@ -160,7 +161,7 @@ These requests are handled through the registered OpenClaw tools:
 | review my [8080.ai](https://8080.ai) project requirements | `ai8080_open_project_requirements` |
 | continue my [8080.ai](https://8080.ai) project | `ai8080_continue_project` |
 | run the [8080.ai](https://8080.ai) planning agents | `ai8080_trigger_agents` |
-| `start building this project` | `ai8080_select_button` or `ai8080_send_message` |
+| `build tasks` or `start building this project` | `ai8080_select_button` or `ai8080_send_message` |
 
 ## Registered Tools
 
@@ -170,14 +171,28 @@ These requests are handled through the registered OpenClaw tools:
 | `ai8080_start_project` | Starts a new [8080.ai](https://8080.ai) project from the user's requirements. |
 | `ai8080_send_message` | Sends follow-up instructions or changes to the active project. |
 | `ai8080_get_credits_balance` | Checks the user's current plan and available credits. |
-| `ai8080_get_project_status` | Shows status, progress, and current phase for a project. |
+| `ai8080_get_project_status` | Shows current status, the latest Tech Lead message, valid actions, and public links for ready artifacts. |
 | `ai8080_open_project_requirements` | Opens or reviews the generated requirements document for a project. |
 | `ai8080_continue_project` | Resumes planning or building after a review checkpoint. |
 | `ai8080_trigger_agents` | Runs selected planning or build agents for a project. |
 | `ai8080_list_projects` | Lists available projects and shows project-selection UI. |
 | `ai8080_select_project` | Sets an existing project as the active project for the session. |
-| `ai8080_select_button` | Resolves numbered suggested actions such as Continue, Review, or Start Building. |
+| `ai8080_select_button` | Resolves numbered suggested actions such as Continue, Review, or Build Tasks. |
 | `ai8080_task_list` | Fetches and summarizes the task list for the active project. |
+
+## Project status
+
+Use `/ai8080 status` for the active project, `/ai8080 status <project_id>` for a specific project, or ask “What is the status of my 8080 project?” Both paths fetch project-scoped messages and display the latest Tech Lead reply, currently valid action buttons, and public links for ready artifacts. Checking status does not start or resume generation.
+
+## Public artifact links
+
+Checkpoint responses include public links for available SRD documents, user flows, designs, architecture, and tasks. For example, Generate First Page includes the ready SRD and user flow; Build Tasks includes all ready categories.
+
+The plugin checks saved content and completion evidence before creating or retrieving category-wide links through the Artifact Share API. New links are public by default and display the latest saved content. Existing private shares stay private and are omitted. Missing artifacts, permissions, or share failures do not prevent the next workflow action from appearing. Links use the configured `siteUrl` origin.
+
+## Tests
+
+Development tests live in [`tests/`](tests/README.md). Run them with `npm test` after installing dependencies with `npm install`.
 
 ## Notes
 

@@ -7,6 +7,8 @@ export type ProjectSuggestions = {
   messageId: string;
   agents: string[];
   buttons?: any[];
+  observation?: { consumed?: import("./suggested-agents.ts").PendingSuggestion; startedAt: number;
+    progress?: import("./workflow-progress.ts").WorkflowProgressState };
 };
 
 /**
