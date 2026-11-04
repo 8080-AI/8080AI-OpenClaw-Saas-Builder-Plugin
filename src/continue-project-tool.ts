@@ -1,8 +1,9 @@
+import { buildSuggestedAgentsTextWithShares, getArtifactShareText } from "./artifact-shares.ts";
 import { getResumeDesignPhase } from "./suggested-agents.ts";
 import { waitForProjectResponse } from "./workflow-response.ts";
 import { Type } from "@sinclair/typebox";
 import { AuthError, requireAuthenticatedClient } from "./api-client.ts";
-import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
+import { buildSuggestedAgentsPresentation } from "./review-continue.ts";
 import { readLatestSuggestionsForProject, writeLatestSuggestions } from "./suggestions-state.ts";
 import { exactToolResult, silentToolResult } from "./exact-response.ts";
 import { log } from "../logger.ts";
@@ -10,12 +11,12 @@ import { readActiveModel } from "./model-state.ts";
 import { formatStartBuildingTasks } from "./task-summary.ts";
 import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
-import { getDesignPreviewText } from "./design-preview.ts";
 import { buildTasksUnavailableMessage, getBuildTasksReadiness } from "./build-readiness.ts";
 
 function createContinueProjectToolInternal(deps: {
   stateDir: () => string;
   apiBaseUrl: string;
+  siteUrl?: string;
   sessionId: string;
 }) {
   return {
@@ -68,7 +69,7 @@ function createContinueProjectToolInternal(deps: {
       try {
         const { readActiveProject } = await import("./project-state.ts");
         activeProjectId = activeProjectId || await readActiveProject(stateDir, sessionId) || undefined;
-        
+
         if (!activeProjectId) {
           return {
             content: [{ type: "text", text: "No active project found. Please select a project first." }],
@@ -79,6 +80,7 @@ function createContinueProjectToolInternal(deps: {
         latestSuggestions = await readLatestSuggestionsForProject(stateDir, sessionId, activeProjectId);
         if (params.observeOnly) {
           return await waitForProjectResponse(client, {
+            siteUrl: deps.siteUrl,
             stateDir, sessionId, projectId: activeProjectId,
             modelTier: await readActiveModel(stateDir), signal: toolAbortController.signal,
             timeoutMs: params.timeoutMs, toolDeadlineAt, onUpdate,
@@ -135,7 +137,7 @@ function createContinueProjectToolInternal(deps: {
               type: "text",
               text:
                 "8080.ai is ready to run the planning agents.\n\n" +
-                buildSuggestedAgentsText(activeProjectId, suggestedAgents, "", false, latestSuggestions?.buttons),
+                await buildSuggestedAgentsTextWithShares(client, deps.siteUrl, activeProjectId, suggestedAgents, "", false, latestSuggestions?.buttons),
             }],
             details: {
               status: "waiting_for_run_plan_all",
@@ -170,6 +172,7 @@ function createContinueProjectToolInternal(deps: {
           const startedAt = Date.now();
           await client.triggerAgents(activeProjectId, agentsToTrigger, latestSuggestions?.messageId ?? "", activeModel);
           return await waitForProjectResponse(client, {
+            siteUrl: deps.siteUrl,
             stateDir, sessionId, projectId: activeProjectId, modelTier: activeModel,
             signal: toolAbortController.signal, timeoutMs: params.timeoutMs, toolDeadlineAt, onUpdate, startedAt,
             consumed: { agents: suggestedAgents, buttons: latestSuggestions?.buttons,
@@ -240,7 +243,7 @@ function createContinueProjectToolInternal(deps: {
             }
             throw err;
           }
-          const designPreviewText = await getDesignPreviewText(client, activeProjectId);
+          const artifactLinks = await getArtifactShareText(client, activeProjectId, deps.siteUrl);
           log.info("start_building selected build api completed", {
             projectId: activeProjectId,
             source: "continue_project_tool_fallback",
@@ -253,7 +256,7 @@ function createContinueProjectToolInternal(deps: {
               text:
                 `✅ **Building Started!** Agents are now writing your software.` +
                 (taskSummaryText ? `\n\n${taskSummaryText}` : "") +
-                designPreviewText,
+                (artifactLinks ? `\n\n${artifactLinks}` : ""),
             }],
             details: {
               status: "building_started",
@@ -316,6 +319,7 @@ function createContinueProjectToolInternal(deps: {
         }
 
         return await waitForProjectResponse(client, {
+          siteUrl: deps.siteUrl,
           onUpdate,
           stateDir, sessionId, projectId: activeProjectId,
           modelTier: await readActiveModel(stateDir), signal: toolAbortController.signal,

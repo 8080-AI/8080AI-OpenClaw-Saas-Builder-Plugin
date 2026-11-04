@@ -1,21 +1,20 @@
 import { Type } from "@sinclair/typebox";
-import { requireAuthenticatedClient, AuthError, checkGenerateFirstPageCondition, determineContinueButtonLabel, getDesignPageRecords, hasCompletedDesignPages } from "./api-client.ts";
-import { extractPendingSuggestion } from "./suggested-agents.ts";
-import { writeLatestSuggestions } from "./suggestions-state.ts";
-import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
-import { log } from "../logger.ts";
-import { getBuildTasksReadiness } from "./build-readiness.ts";
+import { requireAuthenticatedClient, AuthError } from "./api-client.ts";
+import { buildProjectStatusResponse } from "./project-status-response.ts";
+import { exactToolResult } from "./exact-response.ts";
 import { readActiveModel } from "./model-state.ts";
 
 export function createProjectStatusTool(deps: {
   stateDir: () => string;
   apiBaseUrl: string;
+  siteUrl?: string;
+  sessionId?: string;
 }) {
   return {
     name: "ai8080_get_project_status",
     description:
       "Get the current status of an 8080.ai project by its ID. " +
-      "Shows the active agent, current phase, and requirement doc URL if available. " +
+      "Fetches the latest Tech Lead reply from messages, current valid action buttons, and public links for ready artifacts. " +
       "Use when the user asks about the status, phase, or progress of a specific 8080.ai project.",
     parameters: Type.Object({
       projectId: Type.Optional(
@@ -52,94 +51,13 @@ export function createProjectStatusTool(deps: {
         onUpdate?.({ content: [{ type: "text", text: `🔄 Fetching status for project ${projectId}...` }] });
 
         const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
-        const status = await client.getProjectStatus(projectId);
-        const lines = [
-          `### 📊 Project Status`,
-        ];
-        if (status.title) lines.push(`**Project:** ${status.title}`);
-        lines.push(`**ID:** ${projectId}`);
-        lines.push(`**Phase:** ${status.phase ?? status.status ?? "unknown"}`);
-        if (status.activeAgent) lines.push(`**Agent:** ${status.activeAgent}`);
-        if (status.agentMessage) lines.push(`**Message:** ${status.agentMessage}`);
-        if (status.progress !== undefined) lines.push(`**Progress:** ${status.progress}%`);
-
-        // Show steps if available
-        if (status.steps && Array.isArray(status.steps) && status.steps.length > 0) {
-          lines.push("");
-          lines.push("**Build Steps:**");
-          for (const step of status.steps) {
-            const icon =
-              step.status === "completed" ? "✅" :
-              step.status === "in_progress" ? "🔄" :
-              step.status === "failed" ? "❌" : "⏳";
-            lines.push(`  ${icon} ${step.name}`);
-          }
-        } else if (status.current_step) {
-          lines.push("");
-          lines.push(`**Current Step:** 🔄 ${status.current_step}`);
-        }
-
-        if (status.requirementDocUrl)
-          lines.push(`\n**Req Doc:** ${status.requirementDocUrl}`);
-        if (status.error) lines.push(`\n❌ **Error:** ${status.error}`);
-
-        // Show extra fields from API for discovery
-        const knownKeys = new Set(["id", "phase", "status", "title", "activeAgent", "agentMessage", "requirementDocUrl", "error", "current_step", "steps", "progress"]);
-        const extraKeys = Object.keys(status).filter(k => !knownKeys.has(k) && status[k] !== undefined && status[k] !== null);
-        if (extraKeys.length > 0) {
-          lines.push("");
-          lines.push("**Other fields:**");
-          for (const k of extraKeys) {
-            const val = typeof status[k] === "object" ? JSON.stringify(status[k]) : String(status[k]);
-            lines.push(`  ${k}: ${val.length > 100 ? val.slice(0, 100) + "…" : val}`);
-          }
-        }
-
-        const pending = extractPendingSuggestion(status.pending_suggested_agents);
-        let agents = pending.agents;
-        let presentation: unknown;
-
-        const activeModel = await readActiveModel(stateDir);
-        const buildReadiness = await getBuildTasksReadiness(
-          client,
-          projectId,
-          activeModel
-        ).catch((err) => {
-          log.info("project_status build execution-state check failed", {
-            projectId,
-            error: err instanceof Error ? err.message : String(err),
-          });
-          return null;
+        const response = await buildProjectStatusResponse(client, {
+          projectId, stateDir, sessionId: sessionId ?? "default", siteUrl: deps.siteUrl,
+          modelTier: await readActiveModel(stateDir),
         });
-        if (buildReadiness?.canStart) {
-          agents = ["start_building", "review"];
-          log.info("project_status replaced planning suggestions with Build Tasks", {
-            projectId,
-            phaseId: buildReadiness.phaseId,
-            runnableTaskCount: buildReadiness.state.runnable_tasks?.length ?? 0,
-          });
-        }
-
-        if (agents && agents.length > 0) {
-          await writeLatestSuggestions(stateDir, sessionId, {
-            projectId,
-            agents,
-            messageId: pending.messageId,
-            buttons: pending.buttons,
-          });
-
-          const continueButtonLabel = agents.includes("continue") ? await determineContinueButtonLabel(client, projectId) : undefined;
-          const suggestionText = buildSuggestedAgentsText(projectId, agents, "", continueButtonLabel, pending.buttons);
-          lines.push("");
-          lines.push(suggestionText);
-
-          presentation = buildSuggestedAgentsPresentation(projectId, agents, "", continueButtonLabel, pending.buttons);
-        }
-
-        return {
-          content: [{ type: "text", text: lines.join("\n") }],
-          presentation,
-        };
+        return exactToolResult(response.text, {
+          projectId, messageId: response.messageId, suggestions: response.suggestions,
+        }, response.presentation);
       } catch (err) {
         if (err instanceof AuthError) {
           return { content: [{ type: "text", text: (err as Error).message }] };

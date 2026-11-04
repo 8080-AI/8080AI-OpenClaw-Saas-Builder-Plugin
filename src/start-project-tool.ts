@@ -1,6 +1,7 @@
+import { buildSuggestedAgentsTextWithShares } from "./artifact-shares.ts";
 import { Type } from "@sinclair/typebox";
 import { requireAuthenticatedClient, AuthError, filterStartBuildingAgents } from "./api-client.ts";
-import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
+import { buildSuggestedAgentsPresentation } from "./review-continue.ts";
 import { readActiveModel } from "./model-state.ts";
 import { stripA2UI, groupAgents } from "./command.ts";
 import { writeActiveProject } from "./project-state.ts";
@@ -50,6 +51,7 @@ function planningHasStarted(status: Record<string, unknown> | null): boolean {
 export function createStartProjectTool(deps: {
   stateDir: () => string;
   apiBaseUrl: string;
+  siteUrl?: string;
   pollingTimeoutMs: number;
   sessionId: string;
   terminateAfterResponse?: boolean;
@@ -90,7 +92,7 @@ export function createStartProjectTool(deps: {
       const observationStartedAt = Date.now();
       const stateDir = deps.stateDir();
       const { apiBaseUrl, pollingTimeoutMs, sessionId } = deps;
-     
+
       const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
       log.info("start_project execute entered", {
         prompt: params.user_raw_prompt,
@@ -243,6 +245,7 @@ export function createStartProjectTool(deps: {
         // automatic pipeline used after a click, without firing Start ourselves.
         if (!isQuestion && observePlanning) {
           return await waitForProjectResponse(client, {
+            siteUrl: deps.siteUrl,
             stateDir, sessionId, projectId, modelTier: activeModel,
             signal: _signal, timeoutMs: params.timeoutMs, startedAt: observationStartedAt,
             toolDeadlineAt: observationStartedAt + Math.min(params.timeoutMs ?? 600_000, 600_000),
@@ -260,7 +263,7 @@ export function createStartProjectTool(deps: {
         }
         if (autoRunNotice) finalResponse += `\n\n${autoRunNotice}`;
         const suggestionText = !isQuestion && groupedAgents.length > 0
-          ? buildSuggestedAgentsText(projectId, groupedAgents, "", undefined, pendingButtons)
+          ? await buildSuggestedAgentsTextWithShares(client, deps.siteUrl, projectId, groupedAgents, "", undefined, pendingButtons)
           : "";
         if (suggestionText) finalResponse += `\n\n${suggestionText}`;
         const presentation = !isQuestion && groupedAgents.length > 0

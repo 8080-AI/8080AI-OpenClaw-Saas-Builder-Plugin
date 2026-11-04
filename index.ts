@@ -67,17 +67,17 @@ export default definePluginEntry({
     // message; registerExactResponseHooks then replaces that message with the
     // exact 8080.ai response and preserves its interactive presentation.
     api.registerTool(
-      createStartProjectTool({ stateDir, apiBaseUrl, pollingTimeoutMs, sessionId })
+      createStartProjectTool({ stateDir, siteUrl, apiBaseUrl, pollingTimeoutMs, sessionId })
     );
     api.registerTool(createLoginTool({ stateDir, siteUrl, apiBaseUrl }));
-    api.registerTool(createProjectStatusTool({ stateDir, apiBaseUrl, sessionId }));
+    api.registerTool(createProjectStatusTool({ stateDir, siteUrl, apiBaseUrl, sessionId }));
     api.registerTool(createCreditsTool({ stateDir, apiBaseUrl }));
     api.registerTool(createReviewProjectTool({ stateDir, siteUrl, apiBaseUrl, sessionId }));
-    api.registerTool(createContinueProjectTool({ stateDir, apiBaseUrl, sessionId }));
+    api.registerTool(createContinueProjectTool({ stateDir, siteUrl, apiBaseUrl, sessionId }));
     api.registerTool(createSendMessageTool({ stateDir, siteUrl, apiBaseUrl, sessionId }));
-    api.registerTool(createTriggerAgentsTool({ stateDir, apiBaseUrl, sessionId }));
+    api.registerTool(createTriggerAgentsTool({ stateDir, siteUrl, apiBaseUrl, sessionId }));
     api.registerTool(createListProjectsTool({ stateDir, apiBaseUrl }));
-    api.registerTool(createSelectProjectTool({ stateDir, apiBaseUrl, sessionId }));
+    api.registerTool(createSelectProjectTool({ stateDir, siteUrl, apiBaseUrl, sessionId }));
     api.registerTool(createSelectButtonTool({ stateDir, siteUrl, apiBaseUrl, sessionId }));
     api.registerTool(createTaskListTool({ stateDir, apiBaseUrl, sessionId }));
   },

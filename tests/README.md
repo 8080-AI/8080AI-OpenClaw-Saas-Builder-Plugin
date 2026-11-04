@@ -1,6 +1,6 @@
 # Tests
 
-This folder contains the plugin’s automated development tests. Source code lives in `src/`; each `*.test.ts` file checks the corresponding feature, including API responses, workflow progress, suggested actions, and exact response rendering.
+This folder contains the plugin’s automated development tests. Source code lives in `src/`; each `*.test.ts` file checks the corresponding feature, including API responses, workflow progress, suggested actions, artifact share readiness and links, and exact response rendering.
 
 These files belong in version control so contributors can verify changes. They are not included in the published plugin package or its runtime bundle.
 

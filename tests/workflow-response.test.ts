@@ -89,7 +89,16 @@ test("an untimed backend reply displays manual buttons even with null pending ag
   const { readLatestSuggestions } = await import("../src/suggestions-state.ts");
   const stateDir = await mkdtemp(join(tmpdir(), "8080-manual-checkpoint-"));
   t.after(() => rm(stateDir, { recursive: true, force: true }));
+  const shared: string[] = [];
   const result = await waitForProjectResponse({
+    getArtifactShareSnapshot: async () => ({
+      requirements: { content: "# SRD" }, flows: [{ mermaid_content: "graph TD; A-->B" }],
+      pages: [{ id: "home", has_compiled_html: true, sections_total: 1, sections_done: 1 }], logs: [],
+    }),
+    createArtifactShare: async (_id: string, type: string) => {
+      shared.push(type);
+      return { share_id: `link-${type}`, is_public: true };
+    },
     getProjectStatus: async () => ({ id: "project", pending_suggested_agents: null, messages: [{
       author: "assistant", id: "all-pages", agents: ["continue", "review"], buttons: [
         { key: "continue", action: "resume_design", label: "Generate All Pages", payload: { phase: "first_page" } },
@@ -100,8 +109,12 @@ test("an untimed backend reply displays manual buttons even with null pending ag
     getPlanningStatus: async () => ({ is_active: false, pm_step_status: "pending", pipeline_run_status: "paused_review" }),
     getBuildPhaseExecutionState: async () => ({ can_start: false, all_completed: false, runnable_tasks: [] }),
     streamProjectEvents: async (_id, cb) => new Promise<void>(resolve => cb.signal?.addEventListener("abort", () => resolve(), { once: true })),
-  } as any, { stateDir, sessionId: "session", projectId: "project", modelTier: "super_large", timeoutMs: 15000 });
+  } as any, { stateDir, sessionId: "session", projectId: "project", siteUrl: "https://custom.example", modelTier: "super_large", timeoutMs: 15000 });
   assert.equal(result.details.status, "checkpoint");
+  assert.deepEqual(shared, ["requirements", "user-flow", "design"]);
+  assert.match(result.content[0].text, /https:\/\/custom.example\/shared\/artifacts\/link-design/);
+  assert.equal(result.details.exactUserResponse, result.content[0].text);
+  assert.deepEqual(result.presentation?.blocks.find((block: any) => block.type === "buttons")?.buttons.map((button: any) => button.label), ["Generate All Pages", "Review"]);
   assert.match(result.content[0].text, /Generation paused for your action/);
   assert.match(result.content[0].text, /1\. Generate All Pages\n2\. Review/);
   assert.doesNotMatch(result.content[0].text, /Generation complete|No further generation clicks|Build Tasks/);

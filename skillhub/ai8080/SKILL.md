@@ -76,3 +76,9 @@ The 8080.ai plugin uses the OpenClaw Dashboard v2 features:
   - Do not otherwise summarize away meaningful content; the goal is safe relay, not softening the answer.
 - After `start_project`, `send_message`, `trigger_agents`, or `continue_project`, the 8080.ai response may include numbered next steps — use `ai8080_select_button` when the user selects a numbered 8080.ai next step.
 - After the user selects `Start` or `Continue`, do not add assistant-written progress, success, or confirmation text. If `ai8080_trigger_agents`, `ai8080_continue_project`, or a selection handled by `ai8080_send_message` returns empty visible content with `silent` or `suppressUserResponse`, stay silent. Show only the visible Continue/Review or Build Tasks actions returned by the tool, after applying the safety filtering rules above.
+
+### Artifact links
+
+- Preserve public artifact links returned alongside checkpoint actions. These links cover only ready, saved artifacts; do not invent links or claim that an omitted artifact is complete. Existing private shares remain private.
+
+- For status requests, use `ai8080_get_project_status`. Preserve its latest Tech Lead reply, current action buttons, and artifact links. `/ai8080 status [project_id]` provides the same response. Do not trigger or resume generation merely to check status.

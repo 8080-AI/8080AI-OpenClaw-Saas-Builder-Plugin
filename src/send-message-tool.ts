@@ -1,3 +1,4 @@
+import { buildSuggestedAgentsTextWithShares, getArtifactShareText } from "./artifact-shares.ts";
 import { getResumeDesignPhase } from "./suggested-agents.ts";
 import { Type } from "@sinclair/typebox";
 import { requireAuthenticatedClient, AuthError, filterStartBuildingAgents, isPauseForReviewText, isReviewArchitectureStartBuildingChatMessage, checkGenerateFirstPageCondition, determineContinueButtonLabel } from "./api-client.ts";
@@ -5,7 +6,6 @@ import {
   buildRequirementsUrl,
   buildSuggestedAgentsPresentation,
   buildSuggestedAgentsJsonl,
-  buildSuggestedAgentsText,
   isContinueActionAgent,
 } from "./review-continue.ts";
 import { groupAgents, hasGeneratedData } from "./command.ts";
@@ -13,7 +13,6 @@ import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { formatProjectTasks, formatStartBuildingTasks } from "./task-summary.ts";
 import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
-import { getDesignPreviewText } from "./design-preview.ts";
 import { silentToolResult } from "./exact-response.ts";
 import { log } from "../logger.ts";
 import { buildTasksUnavailableMessage, getBuildTasksReadiness } from "./build-readiness.ts";
@@ -228,7 +227,7 @@ export function createSendMessageTool(deps: {
               }
               throw err;
             }
-            const designPreviewText = await getDesignPreviewText(client, activeProjectId, siteUrl);
+            const artifactLinks = await getArtifactShareText(client, activeProjectId, siteUrl);
             log.info("start_building selected build api completed", {
               projectId: activeProjectId,
               activeModel: model,
@@ -240,7 +239,7 @@ export function createSendMessageTool(deps: {
                 text:
                   `✅ **Building Started!** Agents are now writing your software.` +
                   (taskSummaryText ? `\n\n${taskSummaryText}` : "") +
-                  designPreviewText,
+                  (artifactLinks ? `\n\n${artifactLinks}` : ""),
               }],
               details: { projectId: activeProjectId, action: "build", status: "started" },
             };
@@ -451,11 +450,7 @@ export function createSendMessageTool(deps: {
             });
 
             if (buildReadiness.canStart) {
-              const share = await client.createDesignShare(activeProjectId).catch(() => null);
               readinessText = `\n\n🎉 **Project Ready for Building!**\n`;
-              if (share?.share_url) {
-                readinessText += `🎨 **Design Preview:** [${share.share_url}](${share.share_url})\n`;
-              }
               canBuildForPlan = buildReadiness.canStart;
               log.info("start_building show decision", {
                 projectId: activeProjectId,
@@ -544,7 +539,7 @@ export function createSendMessageTool(deps: {
           }
           accumulatedText += readinessText;
           const continueButtonLabel = finalGroupedAgents.includes("continue") ? await determineContinueButtonLabel(client, activeProjectId) : undefined;
-          accumulatedText += `\n\n${buildSuggestedAgentsText(activeProjectId, finalGroupedAgents, "", continueButtonLabel, pendingButtons)}`;
+          accumulatedText += `\n\n${await buildSuggestedAgentsTextWithShares(client, siteUrl, activeProjectId, finalGroupedAgents, "", continueButtonLabel, pendingButtons)}`;
           const presentation = buildSuggestedAgentsPresentation(activeProjectId, finalGroupedAgents, "", continueButtonLabel, pendingButtons);
 
           // Update saved suggestions for the next selection
@@ -695,7 +690,7 @@ export function createSendMessageTool(deps: {
         const presentation = groupedAgents.length > 0
           ? buildSuggestedAgentsPresentation(activeProjectId, groupedAgents, cleanText, continueButtonLabel, finalPendingButtons)
           : undefined;
-        const agentText = groupedAgents.length > 0 ? buildSuggestedAgentsText(activeProjectId, groupedAgents, cleanText, continueButtonLabel, finalPendingButtons) : "";
+        const agentText = groupedAgents.length > 0 ? await buildSuggestedAgentsTextWithShares(client, siteUrl, activeProjectId, groupedAgents, cleanText, continueButtonLabel, finalPendingButtons) : "";
 
         let taskListText = "";
         try {

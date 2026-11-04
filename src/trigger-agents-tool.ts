@@ -9,7 +9,7 @@ import { readLatestSuggestionsForProject, writeLatestSuggestions } from "./sugge
 import { silentToolResult } from "./exact-response.ts";
 import { formatStartBuildingTasks } from "./task-summary.ts";
 import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
-import { getDesignPreviewText } from "./design-preview.ts";
+import { getArtifactShareText } from "./artifact-shares.ts";
 import { buildTasksUnavailableMessage, getBuildTasksReadiness } from "./build-readiness.ts";
 import { log } from "../logger.ts";
 
@@ -77,6 +77,7 @@ export async function waitForReviewActions(
 export function createTriggerAgentsTool(deps: {
   stateDir: () => string;
   apiBaseUrl: string;
+  siteUrl?: string;
   sessionId: string;
 }) {
   return {
@@ -106,7 +107,7 @@ export function createTriggerAgentsTool(deps: {
     async execute(
       _id: string,
       params: { projectId: string; agents: string[]; timeoutMs?: number },
-      
+
       _signal: AbortSignal | undefined,
       onUpdate: (partial: { content: { type: "text"; text: string }[]; details: any; presentation?: any }) => void
     ) {
@@ -181,7 +182,7 @@ export function createTriggerAgentsTool(deps: {
             }
             throw err;
           }
-          const designPreviewText = await getDesignPreviewText(client, params.projectId);
+          const artifactLinks = await getArtifactShareText(client, params.projectId, deps.siteUrl);
           log.info("start_building selected build api completed", {
             projectId: params.projectId,
             activeModel,
@@ -193,7 +194,7 @@ export function createTriggerAgentsTool(deps: {
               text:
                 `✅ **Building Started!** Agents are now writing your software.` +
                 (taskSummaryText ? `\n\n${taskSummaryText}` : "") +
-                designPreviewText,
+                (artifactLinks ? `\n\n${artifactLinks}` : ""),
             }],
             details: { projectId: params.projectId, action: "build", status: "started" },
           };
@@ -254,13 +255,14 @@ export function createTriggerAgentsTool(deps: {
             if (!hasPlanningActivity) throw err;
           }
         }
-        
+
         log.info("trigger_agents started polling for review gate", {
           projectId: params.projectId,
           agents: params.agents,
         });
 
         return await waitForProjectResponse(client, {
+          siteUrl: deps.siteUrl,
           onUpdate,
           stateDir, sessionId, projectId: params.projectId, modelTier: activeModel,
           signal: _signal, timeoutMs: params.timeoutMs,

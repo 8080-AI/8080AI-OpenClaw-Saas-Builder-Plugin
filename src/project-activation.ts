@@ -1,5 +1,6 @@
+import { buildSuggestedAgentsTextWithShares } from "./artifact-shares.ts";
 import { type BuildPhaseExecutionState, type ChatMessage, type PlanningStatus, checkGenerateFirstPageCondition, determineContinueButtonLabel } from "./api-client.ts";
-import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
+import { buildSuggestedAgentsPresentation } from "./review-continue.ts";
 import { writeLatestSuggestions } from "./suggestions-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { log } from "../logger.ts";
@@ -12,7 +13,7 @@ const USER_FLOW_RE = /user flows are ready for review|Click \*\*Continue\*\* to 
 const REVIEW_BUILD_RE = /Review the design and architecture and start building/i;
 const INSUFFICIENT_CREDITS_RE = /Insufficient credits|cannot afford/i;
 
-type ActivationClient = {
+type ActivationClient = Partial<import("./artifact-shares.ts").ArtifactShareClient> & {
   getProjectStatus(projectId: string): Promise<{ pending_suggested_agents?: unknown; messages?: ChatMessage[] } | null>;
   getChatMessages(projectId: string): Promise<ChatMessage[]>;
   getProjectChatMessages(projectId: string, chatSessionId: string): Promise<ChatMessage[]>;
@@ -179,6 +180,7 @@ async function activationAgents(
 
 export async function buildProjectActivationResult(params: {
   client: ActivationClient;
+  siteUrl?: string;
   projectId: string;
   projectTitle: string;
   stateDir: string;
@@ -215,7 +217,7 @@ export async function buildProjectActivationResult(params: {
     ? `\n\n### Latest Message\n\n**${messageLabel(message.author)}:** ${message.content}`
     : "";
   const suggestionText = agents.length > 0
-    ? `\n\n${buildSuggestedAgentsText(projectId, agents, "", continueButtonLabel, pending.buttons)}` +
+    ? `\n\n${await buildSuggestedAgentsTextWithShares(client, params.siteUrl, projectId, agents, "", continueButtonLabel, pending.buttons)}` +
       `\nType \`/ai8080 select-button <number>\` to proceed.`
     : "";
   const text =

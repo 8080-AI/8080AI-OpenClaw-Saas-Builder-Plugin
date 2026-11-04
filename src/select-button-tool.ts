@@ -189,6 +189,7 @@ export function createSelectButtonTool(deps: {
       if (parsedSelection?.action === "continue" || isContinueActionAgent(selectedAgent)) {
         const tool = createContinueProjectTool({
           stateDir: deps.stateDir,
+        siteUrl: deps.siteUrl,
           apiBaseUrl: deps.apiBaseUrl,
           sessionId: deps.sessionId,
         });
@@ -204,7 +205,7 @@ export function createSelectButtonTool(deps: {
       if (selectedAgent === "review") {
         const tool = createReviewProjectTool({
           stateDir: deps.stateDir,
-          siteUrl: deps.siteUrl,
+        siteUrl: deps.siteUrl,
           apiBaseUrl: deps.apiBaseUrl,
           sessionId: deps.sessionId,
         });
@@ -216,6 +217,7 @@ export function createSelectButtonTool(deps: {
         : [selectedAgent];
       const tool = createTriggerAgentsTool({
         stateDir: deps.stateDir,
+        siteUrl: deps.siteUrl,
         apiBaseUrl: deps.apiBaseUrl,
         sessionId: deps.sessionId,
       });

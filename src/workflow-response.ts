@@ -1,6 +1,7 @@
+import { buildSuggestedAgentsTextWithShares } from "./artifact-shares.ts";
 import { waitForWorkflowCheckpoint, type WorkflowSyncClient } from "./workflow-sync.ts";
 import { writeLatestSuggestions } from "./suggestions-state.ts";
-import { buildSuggestedAgentsPresentation, buildSuggestedAgentsText } from "./review-continue.ts";
+import { buildSuggestedAgentsPresentation } from "./review-continue.ts";
 import { formatProjectTasks } from "./task-summary.ts";
 import { exactToolResult } from "./exact-response.ts";
 import type { PendingSuggestion } from "./suggested-agents.ts";
@@ -9,6 +10,7 @@ import { getLabelForAgent } from "./review-continue.ts";
 import { log } from "../logger.ts";
 
 export async function waitForProjectResponse(client: WorkflowSyncClient, options: {
+  siteUrl?: string;
   stateDir: string; sessionId: string; projectId: string; modelTier: string;
   signal?: AbortSignal; timeoutMs?: number; consumed?: PendingSuggestion; startedAt?: number;
   onUpdate?: (result: ReturnType<typeof exactToolResult>) => void;
@@ -97,9 +99,9 @@ export async function waitForProjectResponse(client: WorkflowSyncClient, options
     result.content[0].text += `\n\n[Tool continuation instruction: generation is not finished. Call ai8080_continue_project with ${JSON.stringify({ projectId: options.projectId, observeOnly: true, timeoutMs: 600000 })} now. Do not submit generation again or call project status. Return buttons only for an untimed backend checkpoint or Build Tasks.]`;
     return result;
   }
-  // Use only already-fetched tasks: a countdown must never wait for another API call.
+  // Reuse fetched tasks; sharing uses separate bounded, optional lookups.
   const tasks = checkpoint.tasks ? formatProjectTasks(options.projectId, checkpoint.tasks).text : "";
-  const text = `${progress.render(Date.now(), undefined, checkpoint.status === "ready_to_build", checkpoint.status === "checkpoint")}\n\n` + (tasks ? `${tasks}\n\n` : "") + buildSuggestedAgentsText(options.projectId, suggestion.agents, "", undefined, suggestion.buttons);
+  const text = `${progress.render(Date.now(), undefined, checkpoint.status === "ready_to_build", checkpoint.status === "checkpoint")}\n\n` + (tasks ? `${tasks}\n\n` : "") + await buildSuggestedAgentsTextWithShares(client, options.siteUrl, options.projectId, suggestion.agents, "", undefined, suggestion.buttons);
   const result = exactToolResult(text, { status: checkpoint.status, suggestions: suggestion.agents, projectId: options.projectId,
     phaseId: checkpoint.phaseId, protectFromStatusLookup: true },
     buildSuggestedAgentsPresentation(options.projectId, suggestion.agents, "", undefined, suggestion.buttons));

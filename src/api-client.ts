@@ -1,3 +1,4 @@
+import type { ArtifactType, ArtifactShareSnapshot } from "./artifact-shares.ts";
 // ---------------------------------------------------------------------------
 // 8080.ai API Client
 
@@ -413,6 +414,14 @@ export type ChatMessage = {
   project_id?: string;
   content: string;
   author: "user" | "assistant" | "system";
+  session_id?: string;
+  agent_type?: string;
+  agent_name?: string;
+  phase?: string;
+  buttons?: any[];
+  allowed_buttons?: string[] | null;
+  clicked_button?: string | null;
+  clicked_buttons?: string[] | null;
   created_at: string;
 };
 
@@ -967,12 +976,12 @@ export function createApiClient(opts: ClientOpts) {
       return messages;
     },
 
-    async getProjectChatMessages(projectId: string, chatSessionId: string): Promise<ChatMessage[]> {
+    async getProjectChatMessages(projectId: string, chatSessionId?: string): Promise<ChatMessage[]> {
       const query = new URLSearchParams({
         limit: "100",
         offset: "0",
         project_id: projectId,
-        session_id: chatSessionId,
+        ...(chatSessionId ? { session_id: chatSessionId } : {}),
       });
       const path = `/chat/messages?${query.toString()}`;
       const data = await get(path);
@@ -1042,11 +1051,31 @@ export function createApiClient(opts: ClientOpts) {
       log.info("start_building build api response", { projectId, path, response });
     },
 
-    // Create or get a public design share link for a project
-    async createDesignShare(projectId: string): Promise<{ share_id: string; is_public: boolean; share_url?: string;[key: string]: unknown }> {
-      const res = await post(`/projects/${projectId}/design-share`) as Record<string, unknown>;
-      log.info("design-share response ", res);
-      return res as { share_id: string; is_public: boolean; share_url?: string;[key: string]: unknown };
+    async getArtifactShareSnapshot(projectId: string): Promise<ArtifactShareSnapshot> {
+      const projectPath = `/projects/${encodeURIComponent(projectId)}`;
+      const paths = {
+        requirements: `${projectPath}/requirements`, flows: `${projectPath}/user-flows`,
+        pages: `${projectPath}/design-pages`, diagrams: `${projectPath}/architecture`,
+        tasks: `${projectPath}/tasks`, logs: `${projectPath}/agent-logs`,
+        planning: `/chat/planning-status?project_id=${encodeURIComponent(projectId)}`,
+        timeline: `${projectPath}/ai-overview`,
+      };
+      const results = await Promise.allSettled(Object.values(paths).map(path =>
+        apiFetch(opts, "GET", path, undefined, { timeoutMs: 3_000 })));
+      const snapshot: Record<string, unknown> = {};
+      Object.keys(paths).forEach((key, index) => {
+        const result = results[index];
+        if (result.status === "fulfilled") snapshot[key] = result.value;
+      });
+      const detail = snapshot.timeline as Record<string, unknown> | undefined;
+      snapshot.timeline = detail?.logs;
+      return snapshot;
+    },
+
+    async createArtifactShare(projectId: string, artifactType: ArtifactType): Promise<{ share_id: string; is_public: boolean }> {
+      return await apiFetch(opts, "POST", `/projects/${encodeURIComponent(projectId)}/artifact-shares`, {
+        artifact_type: artifactType, item_id: null, subview: null,
+      }, { jsonContentType: true, timeoutMs: 3_000 }) as { share_id: string; is_public: boolean };
     },
 
     // Send follow-up message to AI and stream the response

@@ -1,3 +1,5 @@
+import { buildProjectStatusResponse } from "./project-status-response.ts";
+import { buildSuggestedAgentsTextWithShares, getArtifactShareText } from "./artifact-shares.ts";
 import { getResumeDesignPhase } from "./suggested-agents.ts";
 import { cleanApiKey, validateApiKey, writeApiKey } from "./api-key.ts";
 import { AuthError, AGENT_DISPLAY_NAMES, type BuildStep, requireAuthenticatedClient, filterStartBuildingAgents, isReviewArchitectureStartBuildingChatMessage, isPauseForReviewText, determineContinueButtonLabel } from "./api-client.ts";
@@ -9,7 +11,6 @@ import {
   buildSuggestedAgentChoices,
   buildSuggestedAgentsJsonl,
   buildSuggestedAgentsPresentation,
-  buildSuggestedAgentsText,
   isContinueActionAgent,
 } from "./review-continue.ts";
 import { writeLatestSuggestions, readLatestSuggestions } from "./suggestions-state.ts";
@@ -17,7 +18,6 @@ import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
 import { formatProjectTasks, formatStartBuildingTasks } from "./task-summary.ts";
 import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
-import { getDesignPreviewText } from "./design-preview.ts";
 import { log } from "../logger.ts";
 import { buildProjectActivationResult } from "./project-activation.ts";
 import { buildTasksUnavailableMessage, getBuildTasksReadiness } from "./build-readiness.ts";
@@ -32,6 +32,7 @@ const HELP_TEXT = `8080.ai plugin commands:
   /ai8080 login                  Open 8080.ai and show API-key setup steps
   /ai8080 set api-key <api-key>  Validate and save an 8080.ai API key
   /ai8080 credits                Show your remaining 8080.ai credits
+  /ai8080 status [project_id]    Show the latest Tech Lead reply, actions, and artifact links
   /ai8080 list                   List your projects
   /ai8080 select <number>        Select a project by its number from the list
   /ai8080 task-list              Show active project tasks grouped by status
@@ -225,7 +226,7 @@ export function create8080Command(
               });
             }
             const agentList = groupedAgents.length > 0
-              ? `\n\n${buildSuggestedAgentsText(projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)}`
+              ? `\n\n${await buildSuggestedAgentsTextWithShares(client, siteUrl, projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)}`
               : "";
             const presentation = groupedAgents.length > 0
               ? buildSuggestedAgentsPresentation(projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)
@@ -322,6 +323,20 @@ export function create8080Command(
         }
 
         // ------------------------------------------------------------------
+        case "status": {
+          const projectId = rest[0]?.trim() || await readActiveProject(stateDir, sessionId);
+          if (!projectId) return { text: "No active project found. Provide `/ai8080 status <project_id>` or select a project first." };
+          try {
+            const client = await requireAuthenticatedClient(stateDir, apiBaseUrl);
+            const response = await buildProjectStatusResponse(client, {
+              projectId, stateDir, sessionId, siteUrl, modelTier: await readActiveModel(stateDir),
+            });
+            return { text: response.text, presentation: response.presentation };
+          } catch (err) {
+            return { text: err instanceof AuthError ? err.message : `8080.ai error: ${err instanceof Error ? err.message : String(err)}` };
+          }
+        }
+
         case "task-list": {
           const requestedProjectId = rest[0]?.trim();
           const activeProjectId = requestedProjectId || await readActiveProject(stateDir, sessionId);
@@ -442,6 +457,7 @@ export function create8080Command(
             const selected = projects[num - 1];
             await writeActiveProject(stateDir, selected.id, sessionId);
             const activation = await buildProjectActivationResult({
+              siteUrl,
               client,
               projectId: selected.id,
               projectTitle: selected.title,
@@ -535,7 +551,7 @@ export function create8080Command(
               });
             }
             const agentList = groupedAgents.length > 0
-              ? `\n\n${buildSuggestedAgentsText(projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)}`
+              ? `\n\n${await buildSuggestedAgentsTextWithShares(client, siteUrl, projectId, groupedAgents, cleanText, continueButtonLabel, pendingButtons)}`
               : "";
 
             const presentation = groupedAgents.length > 0
@@ -687,7 +703,7 @@ export function create8080Command(
                 }
                 throw err;
               }
-              const designPreviewText = await getDesignPreviewText(client, suggestions.projectId, siteUrl);
+              const artifactLinks = await getArtifactShareText(client, suggestions.projectId, siteUrl);
               log.info("start_building selected build api completed", {
                 projectId: suggestions.projectId,
                 activeModel,
@@ -697,11 +713,11 @@ export function create8080Command(
                 text:
                   `✅ **Building Started!** Agents are now writing your software.` +
                   (taskSummaryText ? `\n\n${taskSummaryText}` : "") +
-                  designPreviewText,
+                  (artifactLinks ? `\n\n${artifactLinks}` : ""),
               };
             }
 
-            if (parsedSelection?.action === "continue" || isContinueActionAgent(selectedAgent)) {
+            if (isContinueActionAgent(selectedAgent)) {
               try {
                 await writeLatestSuggestions(stateDir, sessionId, {
                   projectId: suggestions.projectId,
@@ -828,7 +844,7 @@ export function create8080Command(
                   runnableTaskCount: buildReadiness.state.runnable_tasks?.length ?? 0,
                 });
                 return {
-                  text: buildSuggestedAgentsText(
+                  text: await buildSuggestedAgentsTextWithShares(client, siteUrl,
                     suggestions.projectId,
                     buildAgents,
                     "",
@@ -888,7 +904,7 @@ export function create8080Command(
                 const continueButtonLabel = reviewAgents.includes("continue") ? await determineContinueButtonLabel(client, suggestions.projectId) : undefined;
                 return {
                   text:
-                    buildSuggestedAgentsText(suggestions.projectId, reviewAgents, "", continueButtonLabel, pendingAfterPause.buttons),
+                    await buildSuggestedAgentsTextWithShares(client, siteUrl, suggestions.projectId, reviewAgents, "", continueButtonLabel, pendingAfterPause.buttons),
                   presentation: buildSuggestedAgentsPresentation(suggestions.projectId, reviewAgents, "", continueButtonLabel, pendingAfterPause.buttons),
                 };
               }
@@ -902,8 +918,6 @@ export function create8080Command(
               });
 
               if (hasTasks && hasArchitecture) {
-                // Create a public design share link
-                let shareUrl = "";
                 const canBuildForPlan = true;
                 log.info("start_building show decision", {
                   projectId: suggestions.projectId,
@@ -967,30 +981,16 @@ export function create8080Command(
                   });
                 }
                 const buildActionText = canShowStartBuilding
-                  ? buildSuggestedAgentsText(suggestions.projectId, startBuildingAgents)
+                  ? await buildSuggestedAgentsTextWithShares(client, siteUrl, suggestions.projectId, startBuildingAgents)
                   : canBuildForPlan
                     ? eventEndedWithStartBuildingMessage
-                      ? `8080.ai is still finishing the latest agent step. I will show Continue only after 8080.ai exposes it.${startBuildingAgents.length > 0 ? `\n\n${buildSuggestedAgentsText(suggestions.projectId, startBuildingAgents)}` : ""}`
-                      : `8080.ai has not emitted the final /events review/start-building message yet. I will show Continue only after 8080.ai exposes it.${startBuildingAgents.length > 0 ? `\n\n${buildSuggestedAgentsText(suggestions.projectId, startBuildingAgents)}` : ""}`
+                      ? `8080.ai is still finishing the latest agent step. I will show Continue only after 8080.ai exposes it.${startBuildingAgents.length > 0 ? `\n\n${await buildSuggestedAgentsTextWithShares(client, siteUrl, suggestions.projectId, startBuildingAgents)}` : ""}`
+                      : `8080.ai has not emitted the final /events review/start-building message yet. I will show Continue only after 8080.ai exposes it.${startBuildingAgents.length > 0 ? `\n\n${await buildSuggestedAgentsTextWithShares(client, siteUrl, suggestions.projectId, startBuildingAgents)}` : ""}`
                     : `The design, tasks, and architecture are available.`;
-                try {
-                  const share = await client.createDesignShare(suggestions.projectId);
-                  // Build the public share URL, prioritizing the design-specific format with share_id
-                  if (share && (share.share_id || share.id)) {
-                    shareUrl = `${siteUrl}/design/${suggestions.projectId}/${share.share_id || share.id}`;
-                  } else {
-                    shareUrl = share.share_url || `${siteUrl}/projects/${suggestions.projectId}`;
-                  }
-                } catch (shareErr) {
-                  log.info("Failed to create design share", shareErr);
-                  shareUrl = `${siteUrl}/projects/${suggestions.projectId}`;
-                }
 
                 return {
                   text:
                     `✅ **Design generation complete!**\n${logsText}\n\n` +
-                    `🔗 **Your Design Share Link:**\n${shareUrl}\n\n` +
-                    `Share this link with anyone to preview the generated design, architecture, and requirements.\n\n` +
                     buildActionText +
                     `Type \`/ai8080 list\` to see your projects anytime.`,
                   presentation: startBuildingAgents.length > 0
@@ -1028,7 +1028,7 @@ export function create8080Command(
                 return {
                   text:
                     `✅ **Checkpoint reached.**\n${logsText}\n\n` +
-                    buildSuggestedAgentsText(suggestions.projectId, continueAgents, "", continueButtonLabel, pendingAfterNoOutputs.buttons),
+                    await buildSuggestedAgentsTextWithShares(client, siteUrl, suggestions.projectId, continueAgents, "", continueButtonLabel, pendingAfterNoOutputs.buttons),
                   presentation: buildSuggestedAgentsPresentation(suggestions.projectId, continueAgents, "", continueButtonLabel, pendingAfterNoOutputs.buttons),
                 };
               }
@@ -1096,7 +1096,7 @@ export function create8080Command(
                 runnableTaskCount: buildReadinessAfterRun.state.runnable_tasks?.length ?? 0,
               });
               return {
-                text: buildSuggestedAgentsText(
+                text: await buildSuggestedAgentsTextWithShares(client, siteUrl,
                   suggestions.projectId,
                   buildAgents,
                   "",
@@ -1152,7 +1152,7 @@ export function create8080Command(
               const continueButtonLabel = reviewAgents.includes("continue") ? await determineContinueButtonLabel(client, suggestions.projectId) : undefined;
               return {
                 text:
-                  buildSuggestedAgentsText(suggestions.projectId, reviewAgents, "", continueButtonLabel, pendingAfterPause.buttons),
+                  await buildSuggestedAgentsTextWithShares(client, siteUrl, suggestions.projectId, reviewAgents, "", continueButtonLabel, pendingAfterPause.buttons),
                 presentation: buildSuggestedAgentsPresentation(suggestions.projectId, reviewAgents, "", continueButtonLabel, pendingAfterPause.buttons),
               };
             }
@@ -1247,7 +1247,7 @@ export function create8080Command(
 
             const continueButtonLabel = groupedAgentsAfter.includes("continue") ? await determineContinueButtonLabel(client, suggestions.projectId) : undefined;
             const agentList = groupedAgentsAfter.length > 0
-              ? buildSuggestedAgentsText(suggestions.projectId, groupedAgentsAfter, "", continueButtonLabel, pendingSuggestionAfter.buttons)
+              ? await buildSuggestedAgentsTextWithShares(client, siteUrl, suggestions.projectId, groupedAgentsAfter, "", continueButtonLabel, pendingSuggestionAfter.buttons)
               : "";
 
             return {

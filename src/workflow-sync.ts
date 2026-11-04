@@ -5,7 +5,7 @@ import { buildSuggestedAgentChoices } from "./review-continue.ts";
 import { log } from "../logger.ts";
 
 type Client = ReturnType<typeof createApiClient>;
-export type WorkflowSyncClient = Pick<Client, "getProjectStatus" | "getAutoRuns" | "getAgentLogs" | "getPlanningStatus" | "getBuildPhaseExecutionState" | "getTasks" | "streamProjectEvents">;
+export type WorkflowSyncClient = Partial<import("./artifact-shares.ts").ArtifactShareClient> & Pick<Client, "getProjectStatus" | "getAutoRuns" | "getAgentLogs" | "getPlanningStatus" | "getBuildPhaseExecutionState" | "getTasks" | "streamProjectEvents">;
 export type WorkflowCheckpoint = {
   status: "checkpoint" | "ready_to_build" | "running" | "aborted";
   suggestion: PendingSuggestion;
