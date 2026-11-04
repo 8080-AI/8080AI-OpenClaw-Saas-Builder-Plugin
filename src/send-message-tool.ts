@@ -1,3 +1,4 @@
+import { getResumeDesignPhase } from "./suggested-agents.ts";
 import { Type } from "@sinclair/typebox";
 import { requireAuthenticatedClient, AuthError, filterStartBuildingAgents, isPauseForReviewText, isReviewArchitectureStartBuildingChatMessage, checkGenerateFirstPageCondition, determineContinueButtonLabel } from "./api-client.ts";
 import {
@@ -5,15 +6,17 @@ import {
   buildSuggestedAgentsPresentation,
   buildSuggestedAgentsJsonl,
   buildSuggestedAgentsText,
+  isContinueActionAgent,
 } from "./review-continue.ts";
 import { groupAgents, hasGeneratedData } from "./command.ts";
 import { readActiveModel } from "./model-state.ts";
 import { extractPendingSuggestion } from "./suggested-agents.ts";
-import { formatStartBuildingTasks } from "./task-summary.ts";
+import { formatProjectTasks, formatStartBuildingTasks } from "./task-summary.ts";
 import { getInsufficientCreditsMessageFromError, precheckStartBuildingCredits } from "./start-building-credits.ts";
 import { getDesignPreviewText } from "./design-preview.ts";
 import { silentToolResult } from "./exact-response.ts";
 import { log } from "../logger.ts";
+import { buildTasksUnavailableMessage, getBuildTasksReadiness } from "./build-readiness.ts";
 
 // AgentToolResult shape required by the OpenClaw SDK's onUpdate callback.
 type ToolContent = { type: "text"; text: string };
@@ -93,7 +96,7 @@ export function createSendMessageTool(deps: {
       const trimmedContent = params.content.trim().toLowerCase();
       const isRunPlanAll = trimmedContent === "start" || /run\s+plan\s+all/i.test(trimmedContent);
       const numericSelection = trimmedContent.match(/^(?:select\s+)?(\d+)$/);
-      const isStartBuildingSelection = /^(?:start[\s_-]*building|start[\s_-]*build)$/i.test(trimmedContent);
+      const isStartBuildingSelection = /^(?:start[\s_-]*building|start[\s_-]*build|build[\s_-]*tasks?)$/i.test(trimmedContent);
 
       if (isRunPlanAll || numericSelection || isStartBuildingSelection) {
         try {
@@ -119,11 +122,11 @@ export function createSendMessageTool(deps: {
             const index = parseInt(numericSelection[1], 10) - 1;
             if (lastSuggestions && lastSuggestions.agents && lastSuggestions.agents[index]) {
               const selected = lastSuggestions.agents[index];
-              if (selected === "continue") {
+              if (isContinueActionAgent(selected)) {
                 action = "resume";
               } else if (selected === "review") {
                 action = "review";
-              } else if (selected === "start_building") {
+              } else if (selected === "start_building" || selected === "start_build") {
                 action = "build";
               } else {
                 agents = selected.startsWith("GROUP:") ? selected.slice(6).split('|') : [selected];
@@ -177,24 +180,24 @@ export function createSendMessageTool(deps: {
           
           let accumulatedText = "";
           if (action === "build") {
-            const [tasksForBuild, archForBuild] = await Promise.all([
+            const model = await readActiveModel(stateDir);
+            const [tasksForBuild, buildReadiness] = await Promise.all([
               client.getTasks(activeProjectId).catch(() => null),
-              client.getArchitecture(activeProjectId).catch(() => null),
+              getBuildTasksReadiness(client, activeProjectId, model),
             ]);
-            const canStartBuilding = hasGeneratedData(tasksForBuild) && hasGeneratedData(archForBuild);
             log.info("start_building selected readiness decision", {
               projectId: activeProjectId,
-              hasTasks: hasGeneratedData(tasksForBuild),
-              hasArchitecture: hasGeneratedData(archForBuild),
-              canStartBuilding,
+              canStartBuilding: buildReadiness.canStart,
+              phaseId: buildReadiness.phaseId,
+              blockingReason: buildReadiness.state.blocking_reason,
+              runnableTaskCount: buildReadiness.state.runnable_tasks?.length ?? 0,
             });
-            if (!canStartBuilding) {
+            if (!buildReadiness.canStart) {
               return {
-                content: [{ type: "text", text: "Start Building is not available yet. Architecture and tasks must be generated first." }],
-                details: { projectId: activeProjectId, action: "build", blocked: true },
+                content: [{ type: "text", text: buildTasksUnavailableMessage(buildReadiness) }],
+                details: { projectId: activeProjectId, action: "build", blocked: true, reason: buildReadiness.state.blocking_reason },
               };
             }
-            const model = await readActiveModel(stateDir);
             const creditCheck = await precheckStartBuildingCredits(client, activeProjectId, tasksForBuild, model, [], siteUrl);
             if (!creditCheck.allowed) {
               return {
@@ -214,7 +217,7 @@ export function createSendMessageTool(deps: {
               activeModel: model,
             });
             try {
-              await client.startBuilding(activeProjectId, model);
+              await client.startBuilding(activeProjectId, model, buildReadiness.phaseId);
             } catch (err) {
               const insufficientCreditsText = getInsufficientCreditsMessageFromError(err, siteUrl);
               if (insufficientCreditsText) {
@@ -252,10 +255,10 @@ export function createSendMessageTool(deps: {
                 projectId: activeProjectId,
                 messageId,
               });
-              await client.resumeDesign(activeProjectId);
+              await client.resumeDesign(activeProjectId, getResumeDesignPhase(lastSuggestions?.buttons));
             } catch (err) {
               if (err instanceof AuthError) {
-                const finalAgents = ["continue", "review"];
+                const finalAgents = agents;
                 await writeLatestSuggestions(stateDir, sessionId, {
                   projectId: activeProjectId,
                   agents: finalAgents,
@@ -384,7 +387,7 @@ export function createSendMessageTool(deps: {
             const statusAfter = await client.getProjectStatus(activeProjectId);
             const pending = extractPendingSuggestion(statusAfter.pending_suggested_agents);
             pendingButtons = pending.buttons;
-            const backendResumeSuggestions = pending.agents.filter((agent) => agent === "continue" || agent === "review");
+            const backendResumeSuggestions = pending.agents.filter((agent) => isContinueActionAgent(agent) || agent === "review");
             const hasBackendContinue = backendResumeSuggestions.includes("continue");
             const hasLatestCompletedAgentLog = await client.hasLatestCompletedAgentLog(activeProjectId);
             if (pending.messageId) finalMessageId = pending.messageId;
@@ -397,7 +400,7 @@ export function createSendMessageTool(deps: {
               hasLatestCompletedAgentLog,
             });
             finalAgents = hasLatestCompletedAgentLog
-              ? (hasBackendContinue ? backendResumeSuggestions : ["continue", "review"])
+              ? backendResumeSuggestions
               : [];
           } else {
             const statusAfter = await client.getProjectStatus(activeProjectId);
@@ -423,10 +426,12 @@ export function createSendMessageTool(deps: {
           let hasArchitectureAndTasks = false;
           let canBuildForPlan = false;
           try {
-            const [arch, tasks, hasReviewBuildSystemMessage] = await Promise.all([
+            const activeModelForReadiness = await readActiveModel(stateDir);
+            const [arch, tasks, hasReviewBuildSystemMessage, buildReadiness] = await Promise.all([
               client.getArchitecture(activeProjectId).catch(() => null),
               client.getTasks(activeProjectId).catch(() => null),
               client.hasReviewBuildSystemMessage(activeProjectId).catch(() => false),
+              getBuildTasksReadiness(client, activeProjectId, activeModelForReadiness, 2),
             ]);
 
             const hasArchitecture = hasGeneratedData(arch);
@@ -439,25 +444,28 @@ export function createSendMessageTool(deps: {
               hasTasks,
               hasReviewBuildSystemMessage,
               hasReviewBuildPhase,
-              willShow: hasArchitectureAndTasks && hasReviewBuildPhase,
+              executionStateCanStart: buildReadiness.canStart,
+              phaseId: buildReadiness.phaseId,
+              blockingReason: buildReadiness.state.blocking_reason,
+              willShow: hasArchitectureAndTasks && buildReadiness.canStart,
             });
 
-            if (hasArchitectureAndTasks) {
+            if (buildReadiness.canStart) {
               const share = await client.createDesignShare(activeProjectId).catch(() => null);
               readinessText = `\n\n🎉 **Project Ready for Building!**\n`;
               if (share?.share_url) {
                 readinessText += `🎨 **Design Preview:** [${share.share_url}](${share.share_url})\n`;
               }
-              canBuildForPlan = true;
+              canBuildForPlan = buildReadiness.canStart;
               log.info("start_building show decision", {
                 projectId: activeProjectId,
                 canBuildForPlan,
               });
 
-              // Add "Start Building" to the agents if not already there
+              // The execution-state endpoint is authoritative for Build Tasks.
               if (canBuildForPlan) {
-                const canShowStartBuilding = hasReviewBuildPhase;
-                const backendResumeSuggestions = finalAgents.filter((agent) => agent === "continue" || agent === "review");
+                const canShowStartBuilding = buildReadiness.canStart;
+                const backendResumeSuggestions = finalAgents.filter((agent) => isContinueActionAgent(agent) || agent === "review");
                 const hasBackendContinue = backendResumeSuggestions.includes("continue");
                 log.info("agent_logs continue override decision", {
                   projectId: activeProjectId,
@@ -485,7 +493,7 @@ export function createSendMessageTool(deps: {
                       ? "resume_completed_with_architecture_tasks_and_review_build_signal"
                       : "architecture_tasks_and_review_build_signal",
                   });
-                  finalAgents = ["start_building"];
+                  finalAgents = ["start_building", "review"];
                 } else {
                   readinessText += hasReviewBuildPhase
                     ? `\n8080.ai is still finishing the latest agent step. I will show Continue only after 8080.ai exposes it.`
@@ -512,7 +520,7 @@ export function createSendMessageTool(deps: {
             log.info("Readiness check error", err);
           }
 
-          finalAgents = filterStartBuildingAgents(finalAgents, hasArchitectureAndTasks && canBuildForPlan);
+          finalAgents = filterStartBuildingAgents(finalAgents, canBuildForPlan);
           if (action === "resume" && finalAgents.length === 0 && !hasArchitectureAndTasks) {
             log.info("resume ended before generated checkpoint; no review actions exposed yet", {
               projectId: activeProjectId,
@@ -654,7 +662,7 @@ export function createSendMessageTool(deps: {
         // Fetch pending agents from project status if none found in stream
         // ----------------------------------------------------------------
         let finalPendingButtons: any[] | undefined = undefined;
-        if ((suggestedAgents.length === 0 || !suggestionMessageId) && !isQuestion && cleanText) {
+        if (!isQuestion && cleanText) {
           try {
             const status = await client.getProjectStatus(activeProjectId);
             const pending = extractPendingSuggestion(status.pending_suggested_agents);
@@ -689,9 +697,29 @@ export function createSendMessageTool(deps: {
           : undefined;
         const agentText = groupedAgents.length > 0 ? buildSuggestedAgentsText(activeProjectId, groupedAgents, cleanText, continueButtonLabel, finalPendingButtons) : "";
 
+        let taskListText = "";
+        try {
+          const tasksResponse = await client.getTasks(activeProjectId);
+          const formattedTasks = formatProjectTasks(activeProjectId, tasksResponse);
+          taskListText = formattedTasks.text;
+          log.info("send_message tasks attached to Tech Lead response", {
+            projectId: activeProjectId,
+            totalTasks: formattedTasks.totalTasks,
+            statusCounts: formattedTasks.statusCounts,
+          });
+        } catch (taskErr) {
+          log.info("send_message task fetch failed; returning Tech Lead response without tasks", {
+            projectId: activeProjectId,
+            error: taskErr instanceof Error ? taskErr.message : String(taskErr),
+          });
+        }
+
         let finalResponse = cleanText;
+        if (taskListText && cleanText) {
+          finalResponse += `${finalResponse.trim() ? "\n\n" : ""}${taskListText}`;
+        }
         if (!isQuestion && groupedAgents.length > 0) {
-          finalResponse += agentText;
+          finalResponse += `${finalResponse.trim() ? "\n\n" : ""}${agentText}`;
         }
 
         // SAVE the suggestions so they can be picked up by a subsequent numeric selection (e.g. typing "1")

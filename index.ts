@@ -37,7 +37,6 @@ export default definePluginEntry({
   register(api) {
     configureLogger(api.logger);
     log.info("🚀 [LOCAL DEV] Registering plugin from LOCAL source", { pluginId: api.pluginId });
-    registerExactResponseHooks(api);
     const config = (api.pluginConfig ?? {}) as PluginConfig;
     const siteUrl = resolveStringConfig(config.siteUrl, DEFAULT_SITE_URL).replace(/\/$/, "");
     const apiBaseUrl = resolveStringConfig(config.apiBaseUrl, DEFAULT_API_BASE_URL).replace(/\/$/, "");
@@ -45,6 +44,7 @@ export default definePluginEntry({
 
     const stateDir = () => api.runtime.state.resolveStateDir();
     const sessionId = generateSessionId();
+    registerExactResponseHooks(api);
 
     // -----------------------------------------------------------------------
     // 1. Slash command — /ai8080 login | set api-key | credits | status | review | continue
@@ -62,6 +62,10 @@ export default definePluginEntry({
     //    Each factory captures stateDir/apiBaseUrl in a closure.
     // -----------------------------------------------------------------------
     // -----------------------------------------------------------------------
+    // Third-party plugins cannot call the privileged `chat.inject` Gateway
+    // method. Keep this as a normal tool result so OpenClaw writes an assistant
+    // message; registerExactResponseHooks then replaces that message with the
+    // exact 8080.ai response and preserves its interactive presentation.
     api.registerTool(
       createStartProjectTool({ stateDir, apiBaseUrl, pollingTimeoutMs, sessionId })
     );

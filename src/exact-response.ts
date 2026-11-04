@@ -3,6 +3,12 @@ type ToolContent = { type: "text"; text: string };
 type ExactToolDetails = Record<string, unknown> & {
   responseMode: "exact";
   exactUserResponse: string;
+  turnComplete?: true;
+};
+
+type ExactToolOptions = {
+  /** End the OpenClaw agent turn after this tool result is displayed. */
+  terminate?: boolean;
 };
 
 type SilentToolDetails = Record<string, unknown> & {
@@ -14,12 +20,14 @@ type SilentToolDetails = Record<string, unknown> & {
 export function exactToolResult(
   text: string,
   details: Record<string, unknown> = {},
-  presentation?: unknown
+  presentation?: unknown,
+  options: ExactToolOptions = {}
 ) {
   const result: {
     content: ToolContent[];
     details: ExactToolDetails;
     presentation?: unknown;
+    terminate?: true;
   } = {
     content: [{ type: "text", text }],
     details: {
@@ -28,10 +36,13 @@ export function exactToolResult(
       // the exact tool text.
       responseMode: "exact",
       exactUserResponse: text,
+      ...(presentation !== undefined ? { presentation } : {}),
+      ...(options.terminate ? { turnComplete: true as const } : {}),
     },
   };
 
   if (presentation !== undefined) result.presentation = presentation;
+  if (options.terminate) result.terminate = true;
   return result;
 }
 

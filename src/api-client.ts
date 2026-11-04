@@ -4,8 +4,99 @@
 // ---------------------------------------------------------------------------
 import { createParser } from "eventsource-parser";
 import { ApiKeyExpiredError, readApiKey } from "./api-key.ts";
-import { extractEventSuggestion, type PendingSuggestion } from "./suggested-agents.ts";
+import { extractEventSuggestion, extractPendingSuggestion, type PendingSuggestion } from "./suggested-agents.ts";
 import { log } from "../logger.ts";
+
+export type AutoRunEntry = {
+  entry_id: string;
+  session_id?: string;
+  kind?: string;
+  button_key: string;
+  label: string;
+  status: string;
+  fire_at: string;
+  reason?: string | null;
+};
+
+export type AutoRunsResponse = {
+  server_now?: string;
+  auto_runs: AutoRunEntry[];
+  lookup_failed?: boolean;
+};
+
+export type BuildPhaseExecutionState = {
+  can_start: boolean;
+  blocking_reason?: string | null;
+  all_completed: boolean;
+  current_phase?: ({ id?: string; [key: string]: unknown }) | null;
+  runnable_tasks?: unknown[];
+  [key: string]: unknown;
+};
+
+export type PlanningStatus = {
+  is_active: boolean;
+  pm_step_status?: string | null;
+  run_status?: string | null;
+  pipeline_run_status?: string | null;
+  cancelled_phase?: string | null;
+  [key: string]: unknown;
+};
+
+function normalizeAutoRuns(data: unknown): AutoRunsResponse {
+  if (!data || typeof data !== "object") return { auto_runs: [] };
+  const record = data as Record<string, unknown>;
+  const autoRuns = Array.isArray(record.auto_runs)
+    ? record.auto_runs.filter((entry): entry is AutoRunEntry => {
+      if (!entry || typeof entry !== "object") return false;
+      const candidate = entry as Record<string, unknown>;
+      return (
+        typeof candidate.entry_id === "string" &&
+        typeof candidate.button_key === "string" &&
+        typeof candidate.label === "string" &&
+        candidate.status === "scheduled" &&
+        typeof candidate.fire_at === "string" &&
+        Number.isFinite(Date.parse(candidate.fire_at))
+      );
+    })
+    : [];
+
+  return {
+    server_now: typeof record.server_now === "string" ? record.server_now : undefined,
+    auto_runs: autoRuns,
+  };
+}
+
+function attachAutoRunsToPendingSuggestions(pending: unknown, data: AutoRunsResponse): Record<string, unknown> | null {
+  const record = pending && typeof pending === "object"
+    ? pending as Record<string, unknown>
+    : {};
+  const existingButtons = Array.isArray(record.buttons)
+    ? record.buttons.filter((button) => {
+      return !button || typeof button !== "object" || (button as Record<string, unknown>).kind !== "auto_run";
+    })
+    : [];
+  const autoRunButtons = data.auto_runs.map((entry) => ({
+    key: entry.button_key,
+    kind: "auto_run",
+    label: "Wait",
+    action: "wait_auto_run",
+    payload: {
+      ...entry,
+      server_now: data.server_now,
+    },
+  }));
+
+  if (Object.keys(record).length === 0 && autoRunButtons.length === 0) return null;
+
+  return {
+    ...record,
+    buttons: [...existingButtons, ...autoRunButtons],
+  };
+}
+
+const AUTO_RUN_LOOKUP_ATTEMPTS = 2;
+const AUTO_RUN_LOOKUP_TIMEOUT_MS = 5_000;
+const AUTO_RUN_RETRY_DELAY_MS = 150;
 
 export function isStartBuildingAgent(agent: string): boolean {
   return agent === "start_building" || agent === "start_build";
@@ -168,7 +259,7 @@ export function getDesignPageRecords(data: unknown): Record<string, unknown>[] {
 }
 
 function isCompletedDesignPageRecord(page: Record<string, unknown>): boolean {
-  if (page.generation_failed === true || page.credit_blocked === true) return false;
+  if (page.generation_failed === true || page.credit_blocked === true || page.generation_in_progress === true) return false;
 
   const sectionsDone = typeof page.sections_done === "number" ? page.sections_done : undefined;
   const sectionsTotal = typeof page.sections_total === "number" ? page.sections_total : undefined;
@@ -209,78 +300,9 @@ export async function determineContinueButtonLabel(
   },
   projectId: string
 ): Promise<string> {
-  try {
-    const [logs, tasks, architecture] = await Promise.all([
-      client.getAgentLogs(projectId).catch(() => []),
-      typeof client.getTasks === "function" ? client.getTasks(projectId).catch(() => null) : Promise.resolve(null),
-      typeof client.getArchitecture === "function" ? client.getArchitecture(projectId).catch(() => null) : Promise.resolve(null),
-    ]);
-    if (hasGeneratedData(tasks) && hasGeneratedData(architecture)) {
-      return "Continue";
-    }
-
-    let pages: Record<string, unknown>[] = [];
-    let anyDesignPageCompleted = false;
-    let allKnownDesignPagesCompleted = false;
-
-    if (typeof client.getDesignPages === "function") {
-      const designPages = await client.getDesignPages(projectId).catch(() => null);
-      pages = getDesignPageRecords(designPages);
-      anyDesignPageCompleted = pages.some(isCompletedDesignPageRecord);
-      allKnownDesignPagesCompleted = pages.length > 0 && pages.every(isCompletedDesignPageRecord);
-    }
-
-    if (!Array.isArray(logs) || logs.length === 0) {
-      return anyDesignPageCompleted ? "Generate All Pages" : "Continue";
-    }
-
-    const designAgentCompleted = logs.some((log) => {
-      return isDesignAgentLog(log) && isCompletedAgentLog(log);
-    });
-    const expectedDesignPageCount = inferExpectedDesignPageCount(logs);
-    const allExpectedDesignPagesCompleted = allKnownDesignPagesCompleted &&
-      (!expectedDesignPageCount || pages.length >= expectedDesignPageCount);
-
-    if (designAgentCompleted) {
-      if (allExpectedDesignPagesCompleted) {
-        return "Generate Architecture";
-      } else {
-        return "Generate All Pages";
-      }
-    }
-
-    if (anyDesignPageCompleted) {
-      return expectedDesignPageCount && allExpectedDesignPagesCompleted
-        ? "Generate Architecture"
-        : "Generate All Pages";
-    }
-
-    const hasDesignStartedOrCompleted = logs.some((log) => {
-      return isDesignAgentLog(log) && (log.action === "started" || isCompletedAgentLog(log));
-    });
-
-    if (hasDesignStartedOrCompleted) {
-      return "Continue";
-    }
-
-    const hasSrdCompleted = logs.some((log) => {
-      const isSrdAgent = log.agent_type === "System Requirements Agent" || log.agent_type === "System Requirements";
-      return isSrdAgent && isCompletedAgentLog(log);
-    });
-
-    const hasUserFlowCompleted = logs.some((log) => {
-      const isUserFlowAgent = log.agent_type === "User Flow Planner Agent" || log.agent_type === "User Flow Planner";
-      return isUserFlowAgent && isCompletedAgentLog(log);
-    });
-
-    if (hasSrdCompleted && hasUserFlowCompleted) {
-      return "Generate First Page";
-    }
-
-    return "Continue";
-  } catch {
-    return "Continue";
-  }
+  // Workflow labels belong to backend buttons supplied by the stream/status.
+  // Historical logs and artifacts cannot authorize or name the next action.
+  return "Continue";
 }
 
 
@@ -361,8 +383,8 @@ export const AGENT_DISPLAY_NAMES: Record<string, string> = {
   'User Flow Planner Agent': '🔀 User Flows',
   'User Flow Planner': '🔀 User Flows',
   'plan_all': 'Start',
-  'start_build': '🛠️ Start Building',
-  'start_building': '🛠️ Start Building',
+  'start_build': 'Build Tasks',
+  'start_building': 'Build Tasks',
   'continue': '▶️ Continue',
   'review': '🔍 Review',
 };
@@ -420,6 +442,7 @@ export type ProjectStatus = {
   progress?: number;
   // Suggested next agents from API (from ProjectDetailResponse)
   pending_suggested_agents?: Record<string, unknown> | null;
+  auto_runs_lookup_failed?: boolean;
   // Raw fields that might come from API
   [key: string]: unknown;
 };
@@ -427,6 +450,8 @@ export type ProjectStatus = {
 type ClientOpts = {
   apiBaseUrl: string;
   apiKey: string;
+  signal?: AbortSignal;
+  readTimeoutMs?: number;
 };
 
 function authHeaders(opts: ClientOpts): Record<string, string> {
@@ -445,7 +470,8 @@ async function apiFetch(
   opts: ClientOpts,
   method: string,
   path: string,
-  body?: unknown
+  body?: unknown,
+  requestOptions?: { jsonContentType?: boolean; timeoutMs?: number }
 ): Promise<unknown> {
   const url = `${opts.apiBaseUrl.replace(/\/$/, "")}${path}`;
   log.info("api_client request", {
@@ -454,13 +480,19 @@ async function apiFetch(
     hasBody: body !== undefined,
     sendsOpenClawApiKeyHeader: true,
   });
+  const requestTimeout = requestOptions?.timeoutMs ?? (method === "GET" ? opts.readTimeoutMs : undefined);
+  const signals = [opts.signal, requestTimeout ? AbortSignal.timeout(requestTimeout) : undefined]
+    .filter((signal): signal is AbortSignal => Boolean(signal));
   const res = await fetch(url, {
     method,
     headers: {
       ...authHeaders(opts),
-      ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
+      ...(body !== undefined || requestOptions?.jsonContentType
+        ? { "Content-Type": "application/json" }
+        : {}),
     },
     ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    ...(signals.length ? { signal: AbortSignal.any(signals) } : {}),
   });
   log.info("api_client response", {
     method,
@@ -564,6 +596,38 @@ export function createApiClient(opts: ClientOpts) {
   const get = (path: string) => apiFetch(opts, "GET", path);
   const post = (path: string, body?: unknown) =>
     apiFetch(opts, "POST", path, body);
+  const fetchAutoRunsWithRetry = async (projectId: string): Promise<AutoRunsResponse> => {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= AUTO_RUN_LOOKUP_ATTEMPTS; attempt += 1) {
+      try {
+        return normalizeAutoRuns(await apiFetch(
+          opts,
+          "GET",
+          `/projects/${projectId}/auto-runs`,
+          undefined,
+          { timeoutMs: AUTO_RUN_LOOKUP_TIMEOUT_MS }
+        ));
+      } catch (err) {
+        if (opts.signal?.aborted) throw err;
+        lastError = err;
+        log.info("project_auto_runs fetch attempt failed", {
+          projectId,
+          attempt,
+          maxAttempts: AUTO_RUN_LOOKUP_ATTEMPTS,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        if (attempt < AUTO_RUN_LOOKUP_ATTEMPTS) {
+          await new Promise((resolve) => setTimeout(resolve, AUTO_RUN_RETRY_DELAY_MS));
+        }
+      }
+    }
+    log.info("project_auto_runs fetch failed", {
+      projectId,
+      attempts: AUTO_RUN_LOOKUP_ATTEMPTS,
+      error: lastError instanceof Error ? lastError.message : String(lastError),
+    });
+    return { auto_runs: [], lookup_failed: true };
+  };
   const fetchWithAuth = async (url: string, init: RequestInit): Promise<Response> => {
     const headers = new Headers(init.headers);
     // Security: streaming requests use the same scoped OpenClaw API-key header
@@ -575,7 +639,8 @@ export function createApiClient(opts: ClientOpts) {
       sendsOpenClawApiKeyHeader: true,
       apiKeyLength: opts.apiKey.length,
     });
-    const res = await fetch(url, { ...init, headers });
+    const signals = [opts.signal, init.signal].filter((signal): signal is AbortSignal => Boolean(signal));
+    const res = await fetch(url, { ...init, headers, ...(signals.length ? { signal: AbortSignal.any(signals) } : {}) });
     log.info("api_client fetch_with_auth response", {
       method: init.method ?? "GET",
       url,
@@ -750,8 +815,31 @@ export function createApiClient(opts: ClientOpts) {
 
     // 8080.ai uses /projects/{id} (no slash) for detail
     // API returns ProjectDetailResponse: { project: {...}, messages: [...], pending_suggested_agents: {...} }
-    async getProjectStatus(projectId: string): Promise<ProjectStatus> {
-      const raw = await get(`/projects/${projectId}`) as Record<string, unknown>;
+    withSignal(signal: AbortSignal) {
+      return createApiClient({ ...opts, signal, readTimeoutMs: 8_000 });
+    },
+
+    async getProjectStatus(projectId: string, options?: { includeAutoRuns?: boolean }): Promise<ProjectStatus> {
+      const [raw, initialAutoRuns] = await Promise.all([
+        get(`/projects/${projectId}`) as Promise<Record<string, unknown>>,
+        options?.includeAutoRuns === false ? Promise.resolve({ auto_runs: [] } as AutoRunsResponse) : fetchAutoRunsWithRetry(projectId),
+      ]);
+
+      // The schedule can be committed just after the suggestion event. Refresh
+      // once before rendering so a newly-created Wait action is not missed.
+      let autoRuns = initialAutoRuns;
+      const pending = extractPendingSuggestion(raw.pending_suggested_agents);
+      const expectsTimedAction = pending.agents.some((agent) =>
+        agent === "plan_all" ||
+        agent === "continue" ||
+        agent === "generate_first_page" ||
+        agent === "generate_all_pages" ||
+        agent === "generate_architecture"
+      );
+      if (options?.includeAutoRuns !== false && !autoRuns.lookup_failed && autoRuns.auto_runs.length === 0 && expectsTimedAction) {
+        await new Promise((resolve) => setTimeout(resolve, AUTO_RUN_RETRY_DELAY_MS));
+        autoRuns = await fetchAutoRunsWithRetry(projectId);
+      }
 
       // The API wraps project data inside a `project` field (ProjectDetailResponse).
       // Fall back to raw itself if the wrapper isn't present.
@@ -771,19 +859,61 @@ export function createApiClient(opts: ClientOpts) {
         current_step: (projectData.current_step ?? projectData.currentStep ?? projectData.step) as string | undefined,
         steps: projectData.steps as BuildStep[] | undefined,
         progress: projectData.progress as number | undefined,
+        auto_runs_lookup_failed: autoRuns.lookup_failed === true,
         // Extract pending_suggested_agents from the top-level response
-        pending_suggested_agents: raw.pending_suggested_agents as Record<string, unknown> | null ?? null,
+        pending_suggested_agents: options?.includeAutoRuns === false
+          ? (raw.pending_suggested_agents as Record<string, unknown> | null | undefined)
+          : attachAutoRunsToPendingSuggestions(raw.pending_suggested_agents, autoRuns),
       };
       return status;
     },
 
+    async getAutoRuns(projectId: string): Promise<AutoRunsResponse> {
+      return fetchAutoRunsWithRetry(projectId);
+    },
+
+    async getBuildPhaseExecutionState(
+      projectId: string,
+      modelTier: string = "super_large"
+    ): Promise<BuildPhaseExecutionState> {
+      const path =
+        `/projects/${encodeURIComponent(projectId)}/build-phases/execution-state` +
+        `?model_tier=${encodeURIComponent(modelTier)}`;
+      log.info("build_phase_execution_state api request", { projectId, modelTier, path });
+      const response = await get(path) as BuildPhaseExecutionState;
+      log.info("build_phase_execution_state api response", {
+        projectId,
+        modelTier,
+        canStart: response?.can_start,
+        blockingReason: response?.blocking_reason,
+        allCompleted: response?.all_completed,
+        currentPhaseId: response?.current_phase?.id,
+        runnableTaskCount: Array.isArray(response?.runnable_tasks) ? response.runnable_tasks.length : 0,
+      });
+      return response;
+    },
+
+    async getPlanningStatus(projectId: string, timeoutMs?: number): Promise<PlanningStatus> {
+      const path = `/chat/planning-status?project_id=${encodeURIComponent(projectId)}`;
+      log.info("planning_status api request", { projectId, path });
+      const response = await apiFetch(opts, "GET", path, undefined, { timeoutMs }) as PlanningStatus;
+      log.info("planning_status api response", {
+        projectId,
+        isActive: response?.is_active,
+        pmStepStatus: response?.pm_step_status,
+        runStatus: response?.run_status,
+        pipelineRunStatus: response?.pipeline_run_status,
+      });
+      return response;
+    },
+
     // Resume the design pipeline after user review gate
     // POST /chat/resume-design with { project_id, phase }
-    async resumeDesign(projectId: string): Promise<void> {
+    async resumeDesign(projectId: string, phase?: string): Promise<void> {
       const path = `/chat/resume-design`;
       const body = {
         project_id: projectId,
-        // phase,
+        ...(phase ? { phase } : {}),
       };
       log.info("resume_design api request", { projectId, path, body });
       const response = await post(path, body);
@@ -796,8 +926,8 @@ export function createApiClient(opts: ClientOpts) {
 
     async getTasks(projectId: string): Promise<unknown> {
       const data = await get(`/projects/${projectId}/tasks`);
-      log.info("start_building readiness tasks", { projectId, summary: debugResponseSummary("tasks", data) });
-      log.info("start_building tasks response", {
+      log.info("project_tasks api response summary", { projectId, summary: debugResponseSummary("tasks", data) });
+      log.info("project_tasks api response", {
         projectId,
         count: Array.isArray(data) ? data.length : 0,
         latestFive: Array.isArray(data)
@@ -900,13 +1030,14 @@ export function createApiClient(opts: ClientOpts) {
     },
 
     // 8080.ai uses /projects/{id}/build (no slash) to start/continue building
-    async startBuilding(projectId: string, activeModel: string): Promise<void> {
+    async startBuilding(projectId: string, activeModel: string, phaseId?: string): Promise<void> {
       const path = `/projects/${projectId}/build`;
       const body = {
         default_model: activeModel || "super_large",
         force_execution_task_ids: [],
+        phase_id: phaseId ?? null,
       };
-      log.info("start_building build api request", { projectId, path, activeModel, body });
+      log.info("start_building build api request", { projectId, path, activeModel, phaseId, body });
       const response = await post(path, body);
       log.info("start_building build api response", { projectId, path, response });
     },
@@ -1095,14 +1226,11 @@ export function createApiClient(opts: ClientOpts) {
       }
     ): Promise<void> {
       const controller = new AbortController();
-      let externalAbort = false;
-      if (callbacks.signal) {
-        callbacks.signal.addEventListener("abort", () => {
-          externalAbort = true;
-          log.info("streamProjectEvents received external abort signal", { projectId });
-          controller.abort();
-        });
-      }
+      const streamSignals = [controller.signal, callbacks.signal,
+        callbacks.maxTimeoutMs ? AbortSignal.timeout(callbacks.maxTimeoutMs) : undefined]
+        .filter((signal): signal is AbortSignal => Boolean(signal));
+      const streamSignal = AbortSignal.any(streamSignals);
+      streamSignal.throwIfAborted();
       const url = `${opts.apiBaseUrl.replace(/\/$/, "")}/projects/${projectId}/events`;
       log.info("project_events api request", {
         projectId,
@@ -1118,7 +1246,7 @@ export function createApiClient(opts: ClientOpts) {
         headers: {
           Accept: "text/event-stream",
         },
-        signal: controller.signal,
+        signal: streamSignal,
       });
       log.info("project_events api response", {
         projectId,
@@ -1246,7 +1374,7 @@ export function createApiClient(opts: ClientOpts) {
           log.info("Stream stopped after max timeout", { projectId });
         } else if (progressTimedOut) {
           log.info("Stream stopped after progress timeout", { projectId });
-        } else if (externalAbort) {
+        } else if (callbacks.signal?.aborted || opts.signal?.aborted) {
           log.info("Stream stopped after external abort", { projectId });
         } else {
           log.info("Stream error", err);

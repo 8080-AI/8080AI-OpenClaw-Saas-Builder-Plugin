@@ -1,5 +1,6 @@
 type OpenClawLogger = {
   info: (message: string) => void;
+  error?: (message: string) => void;
 };
 
 let openClawLogger: OpenClawLogger | undefined;
@@ -14,12 +15,15 @@ function formatArg(value: unknown): string {
   }
 }
 
-function write(args: unknown[]): void {
+function write(level: "info" | "error", args: unknown[]): void {
   const message = args.map(formatArg).join(" ");
   const formatted = `[8080.ai] ${message}`;
 
   if (openClawLogger) {
-    openClawLogger.info(formatted);
+    const logger = level === "error"
+      ? (openClawLogger.error ?? openClawLogger.info)
+      : openClawLogger.info;
+    logger(formatted);
     return;
   }
 }
@@ -29,5 +33,6 @@ export function configureLogger(logger: OpenClawLogger): void {
 }
 
 export const log = {
-  info: (...args: unknown[]) => write(args),
+  info: (...args: unknown[]) => write("info", args),
+  error: (...args: unknown[]) => write("error", args),
 };

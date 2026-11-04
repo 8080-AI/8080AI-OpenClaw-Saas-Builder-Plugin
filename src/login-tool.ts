@@ -34,9 +34,12 @@ export function createLoginTool(deps: {
   return {
     name: "ai8080_login",
     description:
-      "Securely save a validated 8080.ai OpenClaw API key. " +
-      "Use this whenever the user provides an API key or asks to authenticate. " +
-      "This tool is the ONLY secure way to handle 8080.ai credentials.",
+      "Show the 8080.ai OpenClaw API-key setup instructions or securely save a validated key. " +
+      "Always use this tool when the user asks to log in, connect, or authenticate with " +
+      "8080.ai, including aliases such as '8080ai' and '8080 AI'. Treat '8089.ai' in a login " +
+      "request as a likely typo for 8080.ai. Do not use browser automation, web search, or URL " +
+      "navigation for these requests: action 'login' returns the instructions and a user-clickable " +
+      "link without opening a browser. This tool is the ONLY secure way to handle 8080.ai credentials.",
     parameters: Type.Object({
       action: Type.Union(
         [
@@ -45,7 +48,7 @@ export function createLoginTool(deps: {
         ],
         {
           description:
-            "'login' opens 8080.ai and shows API-key setup steps. " +
+            "'login' shows API-key setup steps and a user-clickable 8080.ai link; it does not open a browser. " +
             "'set-api-key' saves a validated 8080.ai API key.",
         }
       ),
@@ -107,14 +110,17 @@ export function createLoginTool(deps: {
         loginInstructions,
         { action: "login" },
         {
-          type: "buttons",
-          buttons: [
-            {
-              label: "Open 8080.ai Login",
-              url: siteUrl,
-              style: "primary",
-            },
-          ],
+          title: "8080.ai",
+          blocks: [{
+            type: "buttons",
+            buttons: [
+              {
+                label: "Open 8080.ai Login",
+                url: siteUrl,
+                style: "primary",
+              },
+            ],
+          }],
         }
       );
     },

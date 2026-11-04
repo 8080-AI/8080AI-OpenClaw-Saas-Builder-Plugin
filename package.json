@@ -50,18 +50,18 @@
       ]
     },
     "compat": {
-      "pluginApi": ">=2026.5.7",
-      "minGatewayVersion": "2026.5.7"
+      "pluginApi": ">=2026.10.5",
+      "minGatewayVersion": "2026.10.5"
     },
     "build": {
-      "openclawVersion": "2026.6.10",
-      "pluginSdkVersion": "2026.6.10"
+      "openclawVersion": "2026.10.5",
+      "pluginSdkVersion": "2026.10.5"
     }
   },
   "dependencies": {
     "@sinclair/typebox": "^0.34.0",
     "eventsource-parser": "^3.0.8",
-    "openclaw": "^2026.6.9"
+    "openclaw": "^2026.10.5"
   },
   "devDependencies": {
     "@types/node": "^25.7.0",
@@ -70,6 +70,7 @@
     "typescript": "^6.0.3"
   },
   "scripts": {
+    "test": "node --import tsx --test tests/*.test.ts",
     "build": "esbuild index.ts --bundle --platform=node --format=esm --outfile=dist/index.js --external:openclaw",
     "prepack": "npm run build",
     "dev": "tsx watch index.ts",
